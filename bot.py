@@ -174,6 +174,14 @@ def get_message_content(message) -> str:
     return ""
 
 
+def is_forwarded_message(message) -> bool:
+    """Check if message is forwarded (works with PTB v21+)."""
+    if not message:
+        return False
+    # PTB v21+ uses forward_origin instead of forward_date
+    return message.forward_origin is not None
+
+
 def is_content_message(message) -> bool:
     """Check if message has analyzable content (forwarded, has links, etc.)."""
     if not message:
@@ -183,7 +191,7 @@ def is_content_message(message) -> bool:
     if extract_urls(content):
         return True
     # Is forwarded
-    if message.forward_date:
+    if is_forwarded_message(message):
         return True
     # Has substantial text (more than just a few words)
     if len(content) > 100:
@@ -307,7 +315,7 @@ def should_respond(update: Update, bot_username: str) -> bool:
         return False
 
     # Must have some content
-    if not message.text and not message.forward_date:
+    if not message.text and not is_forwarded_message(message):
         return False
 
     # In private chats, always respond to messages with text
@@ -440,7 +448,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply_content = get_message_content(reply_msg)
         if reply_content:
             # Check if replied message is forwarded
-            if reply_msg.forward_date:
+            if is_forwarded_message(reply_msg):
                 referenced_content = f"[Forwarded post]: {reply_content}"
             # Check if replied message has URLs
             elif extract_urls(reply_content):
@@ -450,7 +458,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 referenced_content = f"[Referenced message]: {reply_content}"
 
     # Case 2: Current message is forwarded (user forwarded + asked in same message or separately)
-    if message.forward_date and not referenced_content:
+    if is_forwarded_message(message) and not referenced_content:
         content = get_message_content(message)
         if content:
             referenced_content = f"[Forwarded post]: {content}"
