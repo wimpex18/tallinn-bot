@@ -274,7 +274,8 @@ When user shares content (forwarded messages, links, articles) and asks about it
             )
             response.raise_for_status()
             data = response.json()
-            return data["choices"][0]["message"]["content"]
+            answer = data["choices"][0]["message"]["content"]
+            return clean_response(answer)
     except httpx.TimeoutException:
         return "Таймаут, попробуй ещё раз("
     except httpx.HTTPStatusError as e:
@@ -283,6 +284,24 @@ When user shares content (forwarded messages, links, articles) and asks about it
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         return "Что-то пошло не так("
+
+
+def clean_response(text: str) -> str:
+    """Clean up response: remove citations [1][2] and fix emoticon spacing."""
+    if not text:
+        return text
+
+    # Remove citation brackets like [1], [2], [6], etc.
+    text = re.sub(r'\[\d+\]', '', text)
+
+    # Fix emoticon spacing: " ))" or " (" should be "word))" or "word("
+    # Match space followed by emoticons and move emoticons to previous word
+    text = re.sub(r'\s+(\)+|\(+)', r'\1', text)
+
+    # Clean up any double spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    return text
 
 
 async def extract_facts_from_response(question: str, answer: str, user_name: str) -> list[str]:
