@@ -236,6 +236,13 @@ async def query_perplexity(
 - "правда?" → фактчек
 - "что думаешь?" → твоё мнение
 - Конкретные вопросы → конкретные ответы
+- Reply на сообщение в чате → анализируй это сообщение + контекст разговора
+
+ВАЖНО: Когда пользователь делает reply на чьё-то сообщение:
+- Читай само сообщение
+- Смотри контекст разговора (предыдущие сообщения)
+- Понимай о чём вообще идёт речь
+- Отвечай с учётом всего контекста, не только одного сообщения
 
 Понимай вопрос из контекста, не требуй точных слов."""
 
@@ -399,11 +406,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Анализ постов/ссылок:\n"
         "1. Перешли пост или скинь ссылку\n"
         "2. Ответь на него и спроси что хочешь\n\n"
-        "Примеры вопросов:\n"
-        "- 'о чём это?'\n"
-        "- 'какой фильм из списка лучше?'\n"
+        "Анализ сообщений из чата:\n"
+        "1. Сделай reply на любое сообщение\n"
+        "2. Тэгни меня и спроси\n"
+        "3. Я прочитаю сообщение + контекст разговора\n\n"
+        "Примеры:\n"
         "- 'это правда?'\n"
-        "- 'что думаешь?'\n\n"
+        "- 'подробнее про это'\n"
+        "- 'какой вариант лучше?'\n\n"
         "Память:\n"
         "/remember <факт> - запомнить\n"
         "/forget - забыть всё"
@@ -482,19 +492,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     referenced_content = None
     reply_msg = message.reply_to_message
 
-    # Case 1: User replies to another message (forwarded or with content)
-    if reply_msg:
+    # Case 1: User replies to another message
+    # When bot is tagged in a reply, ALWAYS analyze the replied message
+    if reply_msg and message.text and f"@{BOT_USERNAME}" in message.text:
         reply_content = get_message_content(reply_msg)
         if reply_content:
+            # Get author info if available
+            reply_author = "unknown"
+            if reply_msg.from_user and reply_msg.from_user.username:
+                reply_username = reply_msg.from_user.username
+                reply_author = USERNAME_TO_NAME.get(reply_username, reply_username)
+
             # Check if replied message is forwarded
             if is_forwarded_message(reply_msg):
                 referenced_content = f"[Forwarded post]: {reply_content}"
             # Check if replied message has URLs
             elif extract_urls(reply_content):
                 referenced_content = f"[Message with links]: {reply_content}"
-            # Otherwise just include it as context
-            elif len(reply_content) > 50:
-                referenced_content = f"[Referenced message]: {reply_content}"
+            # ANY other message - include it with author
+            else:
+                referenced_content = f"[Message from {reply_author}]: {reply_content}"
 
     # Case 2: Current message is forwarded (user forwarded + asked in same message or separately)
     if is_forwarded_message(message) and not referenced_content:
