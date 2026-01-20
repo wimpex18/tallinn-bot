@@ -31,7 +31,7 @@ PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REDIS_URL = os.getenv("REDIS_URL")
 
-# Rate limiting
+# Rate limiting - only track AFTER successful query
 user_last_query: dict[int, float] = defaultdict(float)
 RATE_LIMIT_SECONDS = 60
 
@@ -69,7 +69,6 @@ def save_user_fact(user_id: int, fact: str) -> None:
     try:
         key = f"user:{user_id}:facts"
         redis_client.sadd(key, fact)
-        # Keep only last 20 facts per user
         if redis_client.scard(key) > 20:
             facts = list(redis_client.smembers(key))
             redis_client.delete(key)
@@ -124,10 +123,9 @@ def add_to_context(chat_id: int, role: str, name: str, content: str) -> None:
     chat_context[chat_id].append({
         "role": role,
         "name": name,
-        "content": content[:500],  # Limit message size
+        "content": content[:500],
         "time": time.time()
     })
-    # Keep only last N messages
     if len(chat_context[chat_id]) > CONTEXT_SIZE:
         chat_context[chat_id] = chat_context[chat_id][-CONTEXT_SIZE:]
 
@@ -136,33 +134,29 @@ def get_context_string(chat_id: int) -> str:
     """Get recent conversation context as a string."""
     if not chat_context[chat_id]:
         return ""
-
     context_lines = []
-    for msg in chat_context[chat_id][-5:]:  # Last 5 messages for prompt
+    for msg in chat_context[chat_id][-5:]:
         name = msg.get("name", "user")
         content = msg["content"]
         context_lines.append(f"{name}: {content}")
-
     return "\n".join(context_lines)
 
 
 # ============ UTILITY FUNCTIONS ============
 
-def is_rate_limited(user_id: int) -> bool:
-    """Check if user is rate limited."""
+def check_rate_limit(user_id: int) -> tuple[bool, int]:
+    """Check if user is rate limited. Returns (is_limited, seconds_remaining)."""
     now = time.time()
     last_query = user_last_query[user_id]
-    if now - last_query < RATE_LIMIT_SECONDS:
-        return True
-    user_last_query[user_id] = now
-    return False
+    if last_query and now - last_query < RATE_LIMIT_SECONDS:
+        remaining = int(RATE_LIMIT_SECONDS - (now - last_query))
+        return True, remaining
+    return False, 0
 
 
-def get_remaining_cooldown(user_id: int) -> int:
-    """Get remaining seconds until user can query again."""
-    now = time.time()
-    last_query = user_last_query[user_id]
-    return max(0, int(RATE_LIMIT_SECONDS - (now - last_query)))
+def set_rate_limit(user_id: int) -> None:
+    """Set rate limit timestamp after successful query."""
+    user_last_query[user_id] = time.time()
 
 
 def extract_urls(text: str) -> list[str]:
@@ -171,35 +165,45 @@ def extract_urls(text: str) -> list[str]:
     return re.findall(url_pattern, text)
 
 
-def detect_intent(text: str) -> str:
-    """Detect user intent for forwarded/link analysis."""
-    text_lower = text.lower()
+def get_message_content(message) -> str:
+    """Extract text content from a message."""
+    if message.text:
+        return message.text
+    if message.caption:
+        return message.caption
+    return ""
 
-    if any(word in text_lower for word in ["кратко", "резюме", "summarize", "summary", "суть", "о чём", "о чем"]):
-        return "summarize"
-    if any(word in text_lower for word in ["правда", "true", "факт", "fact", "верно", "врёт", "врет", "ложь"]):
-        return "factcheck"
-    if any(word in text_lower for word in ["перевод", "translate", "переведи"]):
-        return "translate"
-    if any(word in text_lower for word in ["что думаешь", "мнение", "opinion", "анализ", "analyze"]):
-        return "analyze"
 
-    return "general"
+def is_content_message(message) -> bool:
+    """Check if message has analyzable content (forwarded, has links, etc.)."""
+    if not message:
+        return False
+    content = get_message_content(message)
+    # Has URLs
+    if extract_urls(content):
+        return True
+    # Is forwarded
+    if message.forward_date:
+        return True
+    # Has substantial text (more than just a few words)
+    if len(content) > 100:
+        return True
+    return False
 
 
 # ============ PERPLEXITY API ============
 
 async def query_perplexity(
     question: str,
+    referenced_content: str = None,
     user_name: str = None,
     context: str = None,
     user_facts: list[str] = None,
     group_facts: list[str] = None,
-    mode: str = "general"
 ) -> str:
     """Query Perplexity API with context and memory."""
 
-    base_prompt = """You are a casual friend helping out your buddies in Tallinn, Estonia.
+    system_prompt = """You are a casual friend helping out your buddies in Tallinn, Estonia.
 When they ask about events, bars, restaurants, cinema, weather, or activities without specifying a location, assume they mean Tallinn.
 
 Music/event preferences: your friends are into DIY, punk, rock, metal, hip-hop, trip-hop, underground stuff, and arthouse cinema - NOT mainstream pop, disco, or commercial events.
@@ -207,42 +211,39 @@ Music/event preferences: your friends are into DIY, punk, rock, metal, hip-hop, 
 Keep responses VERY SHORT and casual - 1-2 sentences max. Write like texting a friend.
 Use informal "ты" in Russian (never "вы"). Respond in the same language the user writes in.
 
-IMPORTANT: NEVER use emojis. Instead use text emoticons: ) or )) for happy/funny things, ( or (( for sad things. Place emoticons directly after words WITHOUT space."""
+IMPORTANT: NEVER use emojis. Instead use text emoticons: ) or )) for happy/funny things, ( or (( for sad things. Place emoticons directly after words WITHOUT space.
 
-    # Add mode-specific instructions
-    mode_instructions = {
-        "summarize": "\n\nYour task: Summarize the provided content in 2-3 short sentences. Be concise.",
-        "factcheck": "\n\nYour task: Fact-check the claims in the provided content. Be direct about what's true, questionable, or false.",
-        "translate": "\n\nYour task: Translate the provided content. If it's in Russian, translate to English. If in English, translate to Russian.",
-        "analyze": "\n\nYour task: Give your brief opinion/analysis of the provided content. Be honest and direct.",
-        "link": "\n\nYour task: Summarize what this link/article is about in 2-3 sentences.",
-        "general": ""
-    }
-
-    system_prompt = base_prompt + mode_instructions.get(mode, "")
+When user shares content (forwarded messages, links, articles) and asks about it:
+- Answer their specific question about that content
+- If they ask "кратко" or "о чём" - summarize briefly
+- If they ask "правда?" or about facts - evaluate truthfulness
+- If they ask "что думаешь?" - give your opinion
+- If they ask about specific things in the content - answer specifically
+- Understand the question from context, don't require exact keywords"""
 
     # Add memory context
-    memory_context = ""
     if user_facts:
-        memory_context += f"\n\nYou remember about this person: {', '.join(user_facts[:5])}"
+        system_prompt += f"\n\nYou remember about this person: {', '.join(user_facts[:5])}"
     if group_facts:
-        memory_context += f"\n\nYou remember about this group: {', '.join(group_facts[:5])}"
+        system_prompt += f"\n\nYou remember about this group: {', '.join(group_facts[:5])}"
 
-    if memory_context:
-        system_prompt += memory_context
+    # Build the user message
+    user_message = ""
 
-    # Build messages
-    messages = [{"role": "system", "content": system_prompt}]
+    if referenced_content:
+        user_message += f"[Content being discussed]:\n{referenced_content}\n\n"
 
-    # Add conversation context if available
     if context:
-        messages.append({
-            "role": "user",
-            "content": f"Recent conversation for context:\n{context}\n\n---\nCurrent question: {question}"
-        })
-    else:
-        user_context = f" (from {user_name})" if user_name else ""
-        messages.append({"role": "user", "content": f"{question}{user_context}"})
+        user_message += f"[Recent conversation]:\n{context}\n\n"
+
+    user_message += f"[User's question]: {question}"
+    if user_name:
+        user_message += f" (from {user_name})"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message}
+    ]
 
     headers = {
         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
@@ -277,11 +278,8 @@ IMPORTANT: NEVER use emojis. Instead use text emoticons: ) or )) for happy/funny
 
 
 async def extract_facts_from_response(question: str, answer: str, user_name: str) -> list[str]:
-    """Extract memorable facts from a conversation using AI."""
-    # Simple heuristic extraction - could be enhanced with AI
+    """Extract memorable facts from a conversation."""
     facts = []
-
-    # Look for preference patterns
     patterns = [
         (r"люблю\s+(\w+)", "любит {}"),
         (r"нравится\s+(\w+)", "нравится {}"),
@@ -290,7 +288,6 @@ async def extract_facts_from_response(question: str, answer: str, user_name: str
         (r"работаю\s+(.+?)(?:\.|$)", "работает {}"),
         (r"живу\s+(.+?)(?:\.|$)", "живёт {}"),
     ]
-
     for pattern, fact_template in patterns:
         match = re.search(pattern, question.lower())
         if match:
@@ -298,7 +295,6 @@ async def extract_facts_from_response(question: str, answer: str, user_name: str
             if user_name:
                 fact = f"{user_name} {fact}"
             facts.append(fact)
-
     return facts
 
 
@@ -310,10 +306,13 @@ def should_respond(update: Update, bot_username: str) -> bool:
     if not message:
         return False
 
-    # Check for text or forwarded content
-    has_content = message.text or message.forward_date
-    if not has_content:
+    # Must have some content
+    if not message.text and not message.forward_date:
         return False
+
+    # In private chats, always respond to messages with text
+    if message.chat.type == "private" and message.text:
+        return True
 
     # Respond if replying to bot's message
     if message.reply_to_message and message.reply_to_message.from_user:
@@ -322,10 +321,6 @@ def should_respond(update: Update, bot_username: str) -> bool:
 
     # Respond if @mentioned
     if message.text and f"@{bot_username}" in message.text:
-        return True
-
-    # In private chats, always respond
-    if message.chat.type == "private":
         return True
 
     return False
@@ -342,7 +337,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Handle /start command."""
     await update.message.reply_text(
         "Привет! Спрашивай про ивенты, бары, кино, погоду - что угодно по Таллинну.\n\n"
-        "Можешь пересылать посты - я их проанализирую, скажу что думаю или кратко перескажу.\n\n"
+        "Можешь пересылать посты или ссылки - ответь на них и спроси что угодно:\n"
+        "- 'о чём это?'\n"
+        "- 'какой фильм лучше?'\n"
+        "- 'это правда?'\n\n"
         "В группе тэгай меня или отвечай на мои сообщения."
     )
 
@@ -351,15 +349,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Handle /help command."""
     await update.message.reply_text(
         "Спрашивай что угодно про Таллинн!\n\n"
-        "Примеры:\n"
-        "- какая сегодня погода?\n"
-        "- где концерты на выходных?\n"
-        "- есть крутые бары в старом городе?\n\n"
-        "Анализ постов:\n"
-        "- перешли пост + 'кратко' = резюме\n"
-        "- перешли пост + 'правда?' = фактчек\n"
-        "- перешли пост + 'что думаешь?' = мнение\n\n"
-        "Скинь ссылку - расскажу о чём статья."
+        "Анализ постов/ссылок:\n"
+        "1. Перешли пост или скинь ссылку\n"
+        "2. Ответь на него и спроси что хочешь\n\n"
+        "Примеры вопросов:\n"
+        "- 'о чём это?'\n"
+        "- 'какой фильм из списка лучше?'\n"
+        "- 'это правда?'\n"
+        "- 'что думаешь?'\n\n"
+        "Память:\n"
+        "/remember <факт> - запомнить\n"
+        "/forget - забыть всё"
     )
 
 
@@ -410,12 +410,8 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming messages."""
-    if not should_respond(update, BOT_USERNAME):
-        # Still track context for group messages
-        if update.message and update.message.text and update.effective_chat.type != "private":
-            username = update.effective_user.username if update.effective_user else None
-            name = USERNAME_TO_NAME.get(username, username or "user")
-            add_to_context(update.effective_chat.id, "user", name, update.message.text)
+    message = update.message
+    if not message:
         return
 
     user_id = update.effective_user.id
@@ -423,55 +419,68 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     username = update.effective_user.username
     user_name = USERNAME_TO_NAME.get(username) if username else None
 
-    # Check rate limit
-    if is_rate_limited(user_id):
-        remaining = get_remaining_cooldown(user_id)
-        await update.message.reply_text(
-            f"Подожди {remaining} сек, не спеши)",
-            reply_to_message_id=update.message.message_id,
+    # Track context for all messages in groups (even if not responding)
+    if message.text and update.effective_chat.type != "private":
+        name = USERNAME_TO_NAME.get(username, username or "user")
+        add_to_context(chat_id, "user", name, message.text)
+
+    # Check if we should respond
+    if not should_respond(update, BOT_USERNAME):
+        return
+
+    # Get the user's question
+    question = extract_question(message.text or "", BOT_USERNAME)
+
+    # Check for referenced content (reply to forwarded message, message with links, etc.)
+    referenced_content = None
+    reply_msg = message.reply_to_message
+
+    # Case 1: User replies to another message (forwarded or with content)
+    if reply_msg:
+        reply_content = get_message_content(reply_msg)
+        if reply_content:
+            # Check if replied message is forwarded
+            if reply_msg.forward_date:
+                referenced_content = f"[Forwarded post]: {reply_content}"
+            # Check if replied message has URLs
+            elif extract_urls(reply_content):
+                referenced_content = f"[Message with links]: {reply_content}"
+            # Otherwise just include it as context
+            elif len(reply_content) > 50:
+                referenced_content = f"[Referenced message]: {reply_content}"
+
+    # Case 2: Current message is forwarded (user forwarded + asked in same message or separately)
+    if message.forward_date and not referenced_content:
+        content = get_message_content(message)
+        if content:
+            referenced_content = f"[Forwarded post]: {content}"
+            # If no explicit question, default to analysis
+            if not question:
+                question = "расскажи об этом"
+
+    # Case 3: Current message has URLs (no reply)
+    if not referenced_content and question:
+        urls = extract_urls(question)
+        if urls:
+            referenced_content = f"[Shared link]: {urls[0]}"
+
+    # If still no question, prompt user
+    if not question and not referenced_content:
+        await message.reply_text(
+            "Чё спросить хотел?",
+            reply_to_message_id=message.message_id,
         )
         return
 
-    message = update.message
-    question = extract_question(message.text or "", BOT_USERNAME)
+    # Default question if only content provided
+    if not question and referenced_content:
+        question = "о чём это?"
 
-    # Detect if this is a forwarded message
-    is_forwarded = message.forward_date is not None
-    forwarded_text = ""
-    if is_forwarded:
-        # Get forwarded content
-        if message.text:
-            forwarded_text = message.text
-        elif message.caption:
-            forwarded_text = message.caption
-
-        # Determine intent
-        intent = detect_intent(question) if question else "summarize"
-
-        if forwarded_text:
-            question = f"[Forwarded message]: {forwarded_text}\n\nUser request: {question or 'проанализируй'}"
-            mode = intent
-        else:
-            await update.message.reply_text(
-                "Не вижу текста в пересланном сообщении(",
-                reply_to_message_id=message.message_id,
-            )
-            return
-
-    # Detect URLs in message
-    urls = extract_urls(question) if question else []
-    mode = "general"
-
-    if urls and not is_forwarded:
-        mode = "link"
-        intent = detect_intent(question)
-        if intent != "general":
-            mode = intent
-        question = f"[Link shared]: {urls[0]}\n\nUser request: {question or 'о чём это?'}"
-
-    if not question:
-        await update.message.reply_text(
-            "Чё спросить хотел?",
+    # NOW check rate limit (after we know we will process)
+    is_limited, remaining = check_rate_limit(user_id)
+    if is_limited:
+        await message.reply_text(
+            f"Подожди {remaining} сек, не спеши)",
             reply_to_message_id=message.message_id,
         )
         return
@@ -485,22 +494,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     group_facts = get_group_facts(chat_id) if chat_id != user_id else []
 
     # Query Perplexity
-    logger.info(f"Query from {user_id} ({username}): {question[:50]}... [mode={mode}]")
+    logger.info(f"Query from {user_id} ({username}): {question[:50]}... [has_ref={referenced_content is not None}]")
+
     answer = await query_perplexity(
         question=question,
+        referenced_content=referenced_content,
         user_name=user_name,
         context=conv_context,
         user_facts=user_facts,
         group_facts=group_facts,
-        mode=mode
     )
+
+    # Set rate limit AFTER successful query
+    set_rate_limit(user_id)
 
     # Add to context
     add_to_context(chat_id, "user", user_name or "user", question)
     add_to_context(chat_id, "assistant", "bot", answer)
 
-    # Try to extract and save facts (simple heuristic)
-    if not is_forwarded and not urls:
+    # Try to extract and save facts
+    if not referenced_content:
         facts = await extract_facts_from_response(question, answer, user_name)
         for fact in facts:
             if chat_id == user_id:
@@ -528,7 +541,6 @@ def main() -> None:
     logger.info(f"Starting bot @{BOT_USERNAME}")
     logger.info(f"Redis connected: {redis_client is not None}")
 
-    # Build application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Add handlers
@@ -541,10 +553,8 @@ def main() -> None:
         handle_message
     ))
 
-    # Error handler
     application.add_error_handler(error_handler)
 
-    # Start bot
     if os.getenv("RENDER"):
         port = int(os.getenv("PORT", 10000))
         webhook_url = os.getenv("WEBHOOK_URL")
