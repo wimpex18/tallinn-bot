@@ -3,9 +3,11 @@ import re
 import time
 import json
 import logging
+import base64
 from collections import defaultdict
 from datetime import datetime
 from urllib.parse import urlparse
+from io import BytesIO
 
 import httpx
 import redis
@@ -199,6 +201,31 @@ def is_content_message(message) -> bool:
     return False
 
 
+async def download_photo_as_base64(photo, bot) -> str:
+    """Download a photo from Telegram and convert to base64."""
+    try:
+        # Get the file
+        file = await bot.get_file(photo.file_id)
+
+        # Download file bytes
+        photo_bytes = await file.download_as_bytearray()
+
+        # Convert to base64
+        base64_string = base64.b64encode(photo_bytes).decode('utf-8')
+
+        return f"data:image/jpeg;base64,{base64_string}"
+    except Exception as e:
+        logger.error(f"Failed to download photo: {e}")
+        return None
+
+
+def has_photo(message) -> bool:
+    """Check if message has photo attachments."""
+    if not message:
+        return False
+    return message.photo is not None and len(message.photo) > 0
+
+
 # ============ PERPLEXITY API ============
 
 async def query_perplexity(
@@ -208,8 +235,9 @@ async def query_perplexity(
     context: str = None,
     user_facts: list[str] = None,
     group_facts: list[str] = None,
+    photo_urls: list[str] = None,
 ) -> str:
-    """Query Perplexity API with context and memory."""
+    """Query Perplexity API with context, memory, and photos."""
 
     system_prompt = """Ты друг из Таллинна. Отвечаешь коротко, как в обычной переписке.
 
@@ -230,6 +258,13 @@ async def query_perplexity(
 - Открой и проанализируй ссылки из контента
 - Не выдумывай инфу, используй реальные данные со ссылок
 - Если список событий - посмотри детали каждого по ссылкам
+
+Если присылают фото:
+- Опиши что на фото коротко и по делу
+- Если спрашивают конкретно - отвечай конкретно
+- Можешь дать рекомендации если релевантно (бар, место, еда)
+- Фото меню - помоги выбрать что вкусное
+- Фото афиши - расскажи про события
 
 Типы вопросов:
 - "кратко" / "о чём" → краткое резюме
@@ -275,9 +310,22 @@ async def query_perplexity(
     if user_name:
         user_message += f" (from {user_name})"
 
+    # Build user message content (with photos if provided)
+    if photo_urls:
+        # Format with images according to Perplexity API docs
+        user_content = [{"type": "text", "text": user_message}]
+        for photo_url in photo_urls[:3]:  # Limit to 3 photos
+            user_content.append({
+                "type": "image_url",
+                "image_url": {"url": photo_url}
+            })
+        user_message_content = user_content
+    else:
+        user_message_content = user_message
+
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message}
+        {"role": "user", "content": user_message_content}
     ]
 
     headers = {
@@ -361,11 +409,11 @@ def should_respond(update: Update, bot_username: str) -> bool:
         return False
 
     # Must have some content
-    if not message.text and not is_forwarded_message(message):
+    if not message.text and not is_forwarded_message(message) and not has_photo(message):
         return False
 
-    # In private chats, always respond to messages with text
-    if message.chat.type == "private" and message.text:
+    # In private chats, always respond to messages with text or photos
+    if message.chat.type == "private" and (message.text or has_photo(message)):
         return True
 
     # Respond if replying to bot's message
@@ -391,10 +439,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Handle /start command."""
     await update.message.reply_text(
         "Привет! Спрашивай про ивенты, бары, кино, погоду - что угодно по Таллинну.\n\n"
-        "Можешь пересылать посты или ссылки - ответь на них и спроси что угодно:\n"
+        "Можешь пересылать посты, ссылки или фото:\n"
         "- 'о чём это?'\n"
         "- 'какой фильм лучше?'\n"
-        "- 'это правда?'\n\n"
+        "- 'это правда?'\n"
+        "- 'что на фото?'\n\n"
         "В группе тэгай меня или отвечай на мои сообщения."
     )
 
@@ -406,6 +455,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Анализ постов/ссылок:\n"
         "1. Перешли пост или скинь ссылку\n"
         "2. Ответь на него и спроси что хочешь\n\n"
+        "Анализ фото:\n"
+        "1. Скинь фото (меню, афиша, что угодно)\n"
+        "2. Спроси что хочешь или просто жди ответ\n\n"
         "Анализ сообщений из чата:\n"
         "1. Сделай reply на любое сообщение\n"
         "2. Тэгни меня и спроси\n"
@@ -413,7 +465,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Примеры:\n"
         "- 'это правда?'\n"
         "- 'подробнее про это'\n"
-        "- 'какой вариант лучше?'\n\n"
+        "- 'какой вариант лучше?'\n"
+        "- 'что посоветуешь из меню?'\n\n"
         "Память:\n"
         "/remember <факт> - запомнить\n"
         "/forget - забыть всё"
@@ -528,8 +581,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if urls:
             referenced_content = f"[Shared link]: {urls[0]}"
 
-    # If still no question, prompt user
-    if not question and not referenced_content:
+    # Check if photo without text
+    has_current_photo = has_photo(message)
+    has_reply_photo = reply_msg and has_photo(reply_msg)
+
+    # If still no question, prompt user (unless there's a photo)
+    if not question and not referenced_content and not has_current_photo and not has_reply_photo:
         await message.reply_text(
             "Чё спросить хотел?",
             reply_to_message_id=message.message_id,
@@ -539,6 +596,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Default question if only content provided
     if not question and referenced_content:
         question = "о чём это?"
+
+    # Default question if only photo provided
+    if not question and (has_current_photo or has_reply_photo):
+        question = "что на фото?"
 
     # NOW check rate limit (after we know we will process)
     is_limited, remaining = check_rate_limit(user_id)
@@ -557,8 +618,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_facts = get_user_facts(user_id)
     group_facts = get_group_facts(chat_id) if chat_id != user_id else []
 
+    # Check for photos to analyze
+    photo_urls = []
+
+    # Check current message for photos
+    if has_photo(message):
+        # Get the highest quality photo
+        photo = message.photo[-1]
+        photo_url = await download_photo_as_base64(photo, context.bot)
+        if photo_url:
+            photo_urls.append(photo_url)
+            logger.info(f"Added photo from current message")
+
+    # Check replied message for photos
+    if reply_msg and has_photo(reply_msg):
+        photo = reply_msg.photo[-1]
+        photo_url = await download_photo_as_base64(photo, context.bot)
+        if photo_url:
+            photo_urls.append(photo_url)
+            logger.info(f"Added photo from replied message")
+
     # Query Perplexity
-    logger.info(f"Query from {user_id} ({username}): {question[:50]}... [has_ref={referenced_content is not None}]")
+    logger.info(f"Query from {user_id} ({username}): {question[:50]}... [has_ref={referenced_content is not None}, photos={len(photo_urls)}]")
 
     answer = await query_perplexity(
         question=question,
@@ -567,6 +648,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context=conv_context,
         user_facts=user_facts,
         group_facts=group_facts,
+        photo_urls=photo_urls if photo_urls else None,
     )
 
     # Set rate limit AFTER successful query
@@ -613,7 +695,7 @@ def main() -> None:
     application.add_handler(CommandHandler("remember", remember_command))
     application.add_handler(CommandHandler("forget", forget_command))
     application.add_handler(MessageHandler(
-        (filters.TEXT | filters.FORWARDED) & ~filters.COMMAND,
+        (filters.TEXT | filters.FORWARDED | filters.PHOTO) & ~filters.COMMAND,
         handle_message
     ))
 
