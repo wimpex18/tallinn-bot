@@ -30,6 +30,15 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "")  # Without @, e.g., "tallinn_helper
 user_last_query: dict[int, float] = defaultdict(float)
 RATE_LIMIT_SECONDS = 60
 
+# Username to name mapping for friends
+USERNAME_TO_NAME = {
+    "Vitalina_Bohaichuk": "Виталина",
+    "hramus": "Миша",
+    "I_lovet": "Полина",
+    "Psychonauter": "Миша",
+    "wimpex18": "Сергей",
+}
+
 
 def is_rate_limited(user_id: int) -> bool:
     """Check if user is rate limited (1 query per minute)."""
@@ -48,27 +57,33 @@ def get_remaining_cooldown(user_id: int) -> int:
     return max(0, int(RATE_LIMIT_SECONDS - (now - last_query)))
 
 
-async def query_perplexity(question: str) -> str:
+async def query_perplexity(question: str, user_name: str = None) -> str:
     """Query Perplexity API with Tallinn context."""
 
-    system_prompt = """You are a helpful assistant for a group of friends in Tallinn, Estonia.
-When users ask about events, bars, restaurants, cinema, weather, or activities without specifying a location, assume they mean Tallinn.
-Keep responses SHORT - maximum 2-3 sentences. Be concise and actionable.
-Respond in the same language the user writes in (English or Russian).
-Focus on practical, up-to-date information."""
+    system_prompt = """You are a casual friend helping out your buddies in Tallinn, Estonia.
+When they ask about events, bars, restaurants, cinema, weather, or activities without specifying a location, assume they mean Tallinn.
+
+Music/event preferences: your friends are into DIY, punk, rock, metal, hip-hop, trip-hop, underground stuff, and arthouse cinema - NOT mainstream pop, disco, or commercial events.
+
+Keep responses VERY SHORT and casual - 1-2 sentences max. Write like texting a friend: "там прикольный крафт", "сегодня прям прохладно", "есть классный концерт".
+Use informal "ты" in Russian (never "вы"). Respond in the same language the user writes in (English or Russian).
+Be direct and helpful, no fluff."""
 
     headers = {
         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
         "Content-Type": "application/json",
     }
 
+    # Optionally include user name in the question context
+    user_context = f" (from {user_name})" if user_name else ""
+
     payload = {
         "model": "sonar",  # Most cost-effective model with web search
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question},
+            {"role": "user", "content": f"{question}{user_context}"},
         ],
-        "max_tokens": 300,  # Keep responses short
+        "max_tokens": 200,  # Keep responses even shorter
         "temperature": 0.3,  # More factual responses
     }
 
@@ -122,22 +137,21 @@ def extract_question(text: str, bot_username: str) -> str:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command."""
     await update.message.reply_text(
-        "Hey! I'm your Tallinn assistant. Ask me about events, bars, cinema, weather, or trip planning.\n\n"
-        "In group chats, @mention me or reply to my messages.\n"
-        "Rate limit: 1 query per minute per user."
+        "Привет! Спрашивай про ивенты, бары, кино, погоду - что угодно по Таллинну.\n\n"
+        "В группе тэгай меня или отвечай на мои сообщения."
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command."""
     await update.message.reply_text(
-        "Just ask me anything about Tallinn!\n\n"
-        "Examples:\n"
-        "- What's the weather like today?\n"
-        "- Any good bars in Old Town?\n"
-        "- What movies are showing this weekend?\n"
-        "- Какие события в Таллинне сегодня?\n\n"
-        "I support English and Russian."
+        "Спрашивай что угодно про Таллинн!\n\n"
+        "Примеры:\n"
+        "- какая сегодня погода?\n"
+        "- где концерты на выходных?\n"
+        "- есть крутые бары в старом городе?\n"
+        "- что в кино?\n\n"
+        "Пишу на русском и английском."
     )
 
 
@@ -147,12 +161,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user_id = update.effective_user.id
+    username = update.effective_user.username
+    user_name = USERNAME_TO_NAME.get(username) if username else None
 
     # Check rate limit
     if is_rate_limited(user_id):
         remaining = get_remaining_cooldown(user_id)
         await update.message.reply_text(
-            f"Please wait {remaining}s before your next query.",
+            f"Подожди {remaining} сек, не спеши 😅",
             reply_to_message_id=update.message.message_id,
         )
         return
@@ -161,7 +177,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not question:
         await update.message.reply_text(
-            "What would you like to know?",
+            "Чё спросить хотел?",
             reply_to_message_id=update.message.message_id,
         )
         return
@@ -173,8 +189,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     # Query Perplexity
-    logger.info(f"Query from {user_id}: {question[:50]}...")
-    answer = await query_perplexity(question)
+    logger.info(f"Query from {user_id} ({username}): {question[:50]}...")
+    answer = await query_perplexity(question, user_name)
 
     await update.message.reply_text(
         answer,
