@@ -468,6 +468,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- 'какой вариант лучше?'\n"
         "- 'что посоветуешь из меню?'\n\n"
         "Память:\n"
+        "/memory - посмотреть что помню\n"
         "/remember <факт> - запомнить\n"
         "/forget - забыть всё"
     )
@@ -516,6 +517,45 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("Не получилось забыть(")
     else:
         await update.message.reply_text("Память не подключена(")
+
+
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /memory command to view stored facts."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username
+    user_name = USERNAME_TO_NAME.get(username, username) if username else "Ты"
+
+    if not redis_client:
+        await update.message.reply_text("Память не подключена(")
+        return
+
+    if update.effective_chat.type == "private":
+        # Show user facts in private chat
+        facts = get_user_facts(user_id)
+        if facts:
+            facts_text = "\n".join([f"- {fact}" for fact in facts])
+            await update.message.reply_text(f"Что я помню про тебя:\n\n{facts_text}")
+        else:
+            await update.message.reply_text("Пока ничего не помню про тебя")
+    else:
+        # Show both user and group facts in group chat
+        user_facts = get_user_facts(user_id)
+        group_facts = get_group_facts(chat_id)
+
+        response = ""
+        if user_facts:
+            facts_text = "\n".join([f"- {fact}" for fact in user_facts])
+            response += f"Про {user_name}:\n{facts_text}\n\n"
+
+        if group_facts:
+            facts_text = "\n".join([f"- {fact}" for fact in group_facts])
+            response += f"Про группу:\n{facts_text}"
+
+        if not user_facts and not group_facts:
+            response = "Пока ничего не помню"
+
+        await update.message.reply_text(response.strip())
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -694,6 +734,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("remember", remember_command))
     application.add_handler(CommandHandler("forget", forget_command))
+    application.add_handler(CommandHandler("memory", memory_command))
     application.add_handler(MessageHandler(
         (filters.TEXT | filters.FORWARDED | filters.PHOTO) & ~filters.COMMAND,
         handle_message
