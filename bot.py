@@ -67,6 +67,8 @@ Music/event preferences: your friends are into DIY, punk, rock, metal, hip-hop, 
 
 Keep responses VERY SHORT and casual - 1-2 sentences max. Write like texting a friend: "там прикольный крафт", "сегодня прям прохладно", "есть классный концерт".
 Use informal "ты" in Russian (never "вы"). Respond in the same language the user writes in (English or Russian).
+
+IMPORTANT: NEVER use emojis (🎉😅👍 etc). Instead use text emoticons: ) or )) for happy/funny things, ( or (( for sad things. Place emoticons directly after words WITHOUT space. Examples: "классно))", "погода так себе(", "в итоге так день закончился)", "очень жаль(".
 Be direct and helpful, no fluff."""
 
     headers = {
@@ -168,7 +170,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if is_rate_limited(user_id):
         remaining = get_remaining_cooldown(user_id)
         await update.message.reply_text(
-            f"Подожди {remaining} сек, не спеши 😅",
+            f"Подожди {remaining} сек, не спеши)",
             reply_to_message_id=update.message.message_id,
         )
         return
