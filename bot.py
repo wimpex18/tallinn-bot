@@ -4,7 +4,6 @@ import time
 import json
 import logging
 import base64
-import asyncio
 from collections import defaultdict
 from datetime import datetime
 from urllib.parse import urlparse
@@ -234,14 +233,12 @@ def has_photo(message) -> bool:
     return message.photo is not None and len(message.photo) > 0
 
 
-async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event) -> None:
-    """Send typing action every 4 seconds until stopped."""
-    while not stop_event.is_set():
-        try:
-            await bot.send_chat_action(chat_id=chat_id, action="typing")
-        except Exception:
-            pass
-        await asyncio.sleep(4)
+async def send_typing(bot, chat_id: int) -> None:
+    """Send typing action once."""
+    try:
+        await bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        pass
 
 
 # ============ PERPLEXITY API ============
@@ -684,56 +681,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # Start continuous typing indicator
-    stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
+    # Send typing indicator
+    await send_typing(context.bot, chat_id)
 
-    try:
-        # Get context and memory
-        conv_context = get_context_string(chat_id)
-        user_facts = get_user_facts(user_id)
-        group_facts = get_group_facts(chat_id) if chat_id != user_id else []
+    # Get context and memory
+    conv_context = get_context_string(chat_id)
+    user_facts = get_user_facts(user_id)
+    group_facts = get_group_facts(chat_id) if chat_id != user_id else []
 
-        # Check for photos to analyze
-        photo_urls = []
+    # Check for photos to analyze
+    photo_urls = []
 
-        # Check current message for photos
-        if has_photo(message):
-            # Get the highest quality photo
-            photo = message.photo[-1]
-            photo_url = await download_photo_as_base64(photo, context.bot)
-            if photo_url:
-                photo_urls.append(photo_url)
-                logger.info(f"Added photo from current message")
+    # Check current message for photos
+    if has_photo(message):
+        # Get the highest quality photo
+        photo = message.photo[-1]
+        photo_url = await download_photo_as_base64(photo, context.bot)
+        if photo_url:
+            photo_urls.append(photo_url)
+            logger.info(f"Added photo from current message")
 
-        # Check replied message for photos
-        if reply_msg and has_photo(reply_msg):
-            photo = reply_msg.photo[-1]
-            photo_url = await download_photo_as_base64(photo, context.bot)
-            if photo_url:
-                photo_urls.append(photo_url)
-                logger.info(f"Added photo from replied message")
+    # Check replied message for photos
+    if reply_msg and has_photo(reply_msg):
+        photo = reply_msg.photo[-1]
+        photo_url = await download_photo_as_base64(photo, context.bot)
+        if photo_url:
+            photo_urls.append(photo_url)
+            logger.info(f"Added photo from replied message")
 
-        # Query Perplexity
-        logger.info(f"Query from {user_id} ({user_name}): {question[:50]}... [has_ref={referenced_content is not None}, photos={len(photo_urls)}]")
+    # Query Perplexity
+    logger.info(f"Query from {user_id} ({user_name}): {question[:50]}... [has_ref={referenced_content is not None}, photos={len(photo_urls)}]")
 
-        answer = await query_perplexity(
-            question=question,
-            referenced_content=referenced_content,
-            user_name=user_name,
-            context=conv_context,
-            user_facts=user_facts,
-            group_facts=group_facts,
-            photo_urls=photo_urls if photo_urls else None,
-        )
-    finally:
-        # Stop typing indicator
-        stop_typing.set()
-        typing_task.cancel()
-        try:
-            await typing_task
-        except asyncio.CancelledError:
-            pass
+    answer = await query_perplexity(
+        question=question,
+        referenced_content=referenced_content,
+        user_name=user_name,
+        context=conv_context,
+        user_facts=user_facts,
+        group_facts=group_facts,
+        photo_urls=photo_urls if photo_urls else None,
+    )
 
     # Set rate limit AFTER successful query
     set_rate_limit(user_id)
