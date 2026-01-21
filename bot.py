@@ -4,6 +4,7 @@ import time
 import json
 import logging
 import base64
+import asyncio
 from collections import defaultdict
 from datetime import datetime
 from urllib.parse import urlparse
@@ -213,7 +214,14 @@ async def download_photo_as_base64(photo, bot) -> str:
         # Convert to base64
         base64_string = base64.b64encode(photo_bytes).decode('utf-8')
 
-        return f"data:image/jpeg;base64,{base64_string}"
+        # Telegram photos are always JPEG, but check file path for PNG
+        mime_type = "image/jpeg"
+        if hasattr(file, 'file_path') and file.file_path:
+            if file.file_path.endswith('.png'):
+                mime_type = "image/png"
+            logger.info(f"Photo MIME type: {mime_type}")
+
+        return f"data:{mime_type};base64,{base64_string}"
     except Exception as e:
         logger.error(f"Failed to download photo: {e}")
         return None
@@ -224,6 +232,16 @@ def has_photo(message) -> bool:
     if not message:
         return False
     return message.photo is not None and len(message.photo) > 0
+
+
+async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event) -> None:
+    """Send typing action every 4 seconds until stopped."""
+    while not stop_event.is_set():
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception:
+            pass
+        await asyncio.sleep(4)
 
 
 # ============ PERPLEXITY API ============
@@ -239,27 +257,38 @@ async def query_perplexity(
 ) -> str:
     """Query Perplexity API with context, memory, and photos."""
 
-    system_prompt = """Ты друг в чате. Отвечаешь КОРОТКО - 1-2 предложения максимум.
+    system_prompt = """Ты друг в чате для русскоязычных в ТАЛЛИННЕ (Эстония). Отвечаешь КОРОТКО - 1-2 предложения.
+
+КРИТИЧНО - ТОЛЬКО ТАЛЛИНН:
+- ТЫ ЗНАЕШЬ ТОЛЬКО ПРО ТАЛЛИНН, ЭСТОНИЯ
+- НИКОГДА не рекомендуй места в других городах (Москва, Питер и т.д.)
+- Если спрашивают "куда сходить" - ТОЛЬКО места в Таллинне
+- Ищи актуальные события в Таллинне на эту неделю
+
+ВКУСЫ ГРУППЫ (учитывай при рекомендациях):
+- Музыка: панк, рок, метал, хип-хоп, андеграунд, инди (НЕ поп, НЕ диско, НЕ мейнстрим)
+- Бары: крафтовое пиво, коктейльные бары, dive bars (НЕ клубы, НЕ гламур)
+- Кино: артхаус, фестивальное, авторское (НЕ блокбастеры)
+- Общее: андеграунд, альтернатива, локальная сцена
+
+МЕСТА В ТАЛЛИННЕ которые знай:
+- Концерты: Sveta, Hall, Tapper, Kultuurikatel, Fotografiska
+- Бары: Porogen, Tops, Pudel, St. Vitus, Koht, Labor
+- Кино: Sõprus, Artis, Coca-Cola Plaza (для артхауса)
+- Районы: Telliskivi, Kalamaja, Rotermann, Noblessner
 
 СТРОГИЕ ПРАВИЛА:
-- Максимум 1-2 предложения в ответе
+- Максимум 1-2 предложения
 - Только "ты", никогда "вы"
 - Без эмодзи. Только ) или ( после слова
-- НЕ выдумывай информацию о людях на фото
-- НЕ ищи в интернете кто этот человек
-- НЕ придумывай биографии и истории
-- Отвечай только на то, что спросили
+- При рекомендации укажи название и район
 
 Фото:
-- Селфи/портрет: короткий комплимент, 3-5 слов
+- Селфи/портрет: короткий комплимент
 - Мем: короткая реакция
-- Вопрос про фото: ответь конкретно
+- Меню/афиша: ответь конкретно
 
-Места в Таллинне:
-- Музыка: панк, рок, метал, хип-хоп, андеграунд (не поп/диско)
-- Укажи название и район
-
-Если не знаешь - скажи что не знаешь. Не выдумывай."""
+Если не знаешь про конкретное место в Таллинне - скажи что не знаешь."""
 
     # Add memory context
     if user_facts:
@@ -329,13 +358,19 @@ async def query_perplexity(
             )
             response.raise_for_status()
             data = response.json()
-            answer = data["choices"][0]["message"]["content"]
+            try:
+                answer = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError):
+                logger.error(f"Unexpected API response format: {data}")
+                return "Не получил ответ от API("
             return clean_response(answer)
     except httpx.TimeoutException:
-        return "Таймаут, попробуй ещё раз("
+        return "Слишком долго думаю, попробуй ещё раз)"
     except httpx.HTTPStatusError as e:
         logger.error(f"Perplexity API error: {e.response.status_code} - {e.response.text}")
-        return "Ошибка API, попробуй позже("
+        if e.response.status_code == 429:
+            return "Много запросов, подожди минутку)"
+        return "Проблема с API, попробуй позже)"
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         return "Что-то пошло не так("
@@ -485,6 +520,13 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
+    # In group chats, check if user is admin
+    if update.effective_chat.type != "private":
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        if member.status not in ["creator", "administrator"]:
+            await update.message.reply_text("Только админ может это делать)")
+            return
+
     if redis_client:
         try:
             if update.effective_chat.type == "private":
@@ -546,13 +588,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    username = update.effective_user.username
-    user_name = USERNAME_TO_NAME.get(username) if username else None
+    user = update.effective_user
+
+    # Get display name with fallback: mapping -> first_name -> None
+    if user.username and user.username in USERNAME_TO_NAME:
+        user_name = USERNAME_TO_NAME[user.username]
+    elif user.first_name:
+        user_name = user.first_name
+    else:
+        user_name = None
 
     # Track context for all messages in groups (even if not responding)
     if message.text and update.effective_chat.type != "private":
-        name = USERNAME_TO_NAME.get(username, username or "user")
-        add_to_context(chat_id, "user", name, message.text)
+        context_name = user_name or "user"
+        add_to_context(chat_id, "user", context_name, message.text)
 
     # Check if we should respond
     if not should_respond(update, BOT_USERNAME):
@@ -572,9 +621,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if reply_content:
             # Get author info if available
             reply_author = "unknown"
-            if reply_msg.from_user and reply_msg.from_user.username:
-                reply_username = reply_msg.from_user.username
-                reply_author = USERNAME_TO_NAME.get(reply_username, reply_username)
+            if reply_msg.from_user:
+                reply_user = reply_msg.from_user
+                if reply_user.username and reply_user.username in USERNAME_TO_NAME:
+                    reply_author = USERNAME_TO_NAME[reply_user.username]
+                elif reply_user.first_name:
+                    reply_author = reply_user.first_name
+                elif reply_user.username:
+                    reply_author = reply_user.username
 
             # Check if replied message is forwarded
             if is_forwarded_message(reply_msg):
@@ -630,46 +684,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # Send typing indicator
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    # Start continuous typing indicator
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
-    # Get context and memory
-    conv_context = get_context_string(chat_id)
-    user_facts = get_user_facts(user_id)
-    group_facts = get_group_facts(chat_id) if chat_id != user_id else []
+    try:
+        # Get context and memory
+        conv_context = get_context_string(chat_id)
+        user_facts = get_user_facts(user_id)
+        group_facts = get_group_facts(chat_id) if chat_id != user_id else []
 
-    # Check for photos to analyze
-    photo_urls = []
+        # Check for photos to analyze
+        photo_urls = []
 
-    # Check current message for photos
-    if has_photo(message):
-        # Get the highest quality photo
-        photo = message.photo[-1]
-        photo_url = await download_photo_as_base64(photo, context.bot)
-        if photo_url:
-            photo_urls.append(photo_url)
-            logger.info(f"Added photo from current message")
+        # Check current message for photos
+        if has_photo(message):
+            # Get the highest quality photo
+            photo = message.photo[-1]
+            photo_url = await download_photo_as_base64(photo, context.bot)
+            if photo_url:
+                photo_urls.append(photo_url)
+                logger.info(f"Added photo from current message")
 
-    # Check replied message for photos
-    if reply_msg and has_photo(reply_msg):
-        photo = reply_msg.photo[-1]
-        photo_url = await download_photo_as_base64(photo, context.bot)
-        if photo_url:
-            photo_urls.append(photo_url)
-            logger.info(f"Added photo from replied message")
+        # Check replied message for photos
+        if reply_msg and has_photo(reply_msg):
+            photo = reply_msg.photo[-1]
+            photo_url = await download_photo_as_base64(photo, context.bot)
+            if photo_url:
+                photo_urls.append(photo_url)
+                logger.info(f"Added photo from replied message")
 
-    # Query Perplexity
-    logger.info(f"Query from {user_id} ({username}): {question[:50]}... [has_ref={referenced_content is not None}, photos={len(photo_urls)}]")
+        # Query Perplexity
+        logger.info(f"Query from {user_id} ({user_name}): {question[:50]}... [has_ref={referenced_content is not None}, photos={len(photo_urls)}]")
 
-    answer = await query_perplexity(
-        question=question,
-        referenced_content=referenced_content,
-        user_name=user_name,
-        context=conv_context,
-        user_facts=user_facts,
-        group_facts=group_facts,
-        photo_urls=photo_urls if photo_urls else None,
-    )
+        answer = await query_perplexity(
+            question=question,
+            referenced_content=referenced_content,
+            user_name=user_name,
+            context=conv_context,
+            user_facts=user_facts,
+            group_facts=group_facts,
+            photo_urls=photo_urls if photo_urls else None,
+        )
+    finally:
+        # Stop typing indicator
+        stop_typing.set()
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
 
     # Set rate limit AFTER successful query
     set_rate_limit(user_id)
