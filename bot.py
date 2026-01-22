@@ -268,10 +268,22 @@ async def query_perplexity(
 - Кино: артхаус, фестивальное, авторское (НЕ блокбастеры)
 - Общее: андеграунд, альтернатива, локальная сцена
 
-МЕСТА В ТАЛЛИННЕ которые знай:
+ПОИСК СОБЫТИЙ - ОБЯЗАТЕЛЬНО ищи на сайтах:
+- Концерты: sveta.ee, hall.ee, tfrec.com, kultuurikatel.ee, fotografiska.com/tallinn
+- События: facebook.com/events (Tallinn), residentadvisor.net/events/ee, piletilevi.ee
+- Кино: kinosoprus.ee, kino.artis.ee
+- Типы: концерты, DJ сеты, vinyl nights, настолки, артхаус кино, выставки, DIY ивенты
+
+Когда спрашивают "куда сходить" или "что делать":
+- ИЩИ конкретные события на указанную дату
+- Проверь сайты venue напрямую
+- Укажи название события, место, время
+- Если нашёл несколько - дай 2-3 варианта
+
+МЕСТА В ТАЛЛИННЕ:
 - Концерты: Sveta, Hall, Tapper, Kultuurikatel, Fotografiska
 - Бары: Porogen, Tops, Pudel, St. Vitus, Koht, Labor
-- Кино: Sõprus, Artis, Coca-Cola Plaza (для артхауса)
+- Кино: Sõprus, Artis
 - Районы: Telliskivi, Kalamaja, Rotermann, Noblessner
 
 СТРОГИЕ ПРАВИЛА:
