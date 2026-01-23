@@ -430,6 +430,80 @@ async def extract_facts_from_response(question: str, answer: str, user_name: str
     return facts
 
 
+async def smart_extract_facts(question: str, answer: str, user_name: str, chat_context: str = None) -> list[str]:
+    """Use LLM to extract important facts from conversation."""
+    if not question or len(question) < 10:
+        return []
+
+    prompt = f"""Извлеки важные факты о пользователе из этого диалога.
+Пользователь: {user_name or 'unknown'}
+
+Вопрос: {question}
+Ответ: {answer}
+
+{"Контекст чата: " + chat_context if chat_context else ""}
+
+Выдай ТОЛЬКО факты о человеке (интересы, предпочтения, планы, работа, и т.д.)
+Формат: один факт на строку, коротко (3-7 слов)
+Если фактов нет - напиши "НЕТ"
+Максимум 3 факта."""
+
+    headers = {
+        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": "sonar",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 100,
+        "temperature": 0.1,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "https://api.perplexity.ai/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+            result = data["choices"][0]["message"]["content"].strip()
+
+            if "НЕТ" in result.upper() or len(result) < 5:
+                return []
+
+            # Parse facts (one per line)
+            facts = []
+            for line in result.split("\n"):
+                line = line.strip().lstrip("-•").strip()
+                if line and len(line) > 3 and len(line) < 100:
+                    if user_name and not line.startswith(user_name):
+                        line = f"{user_name}: {line}"
+                    facts.append(line)
+
+            return facts[:3]  # Max 3 facts
+    except Exception as e:
+        logger.error(f"Failed to extract facts: {e}")
+        return []
+
+
+def save_user_interaction(user_id: int, user_name: str, username: str) -> None:
+    """Save info about user who interacted with the bot."""
+    if not redis_client or not user_name:
+        return
+    try:
+        key = f"user:{user_id}:profile"
+        redis_client.hset(key, mapping={
+            "name": user_name,
+            "username": username or "",
+            "last_seen": datetime.now().isoformat(),
+        })
+    except Exception as e:
+        logger.error(f"Failed to save user interaction: {e}")
+
+
 # ============ MESSAGE HANDLERS ============
 
 def should_respond(update: Update, bot_username: str) -> bool:
@@ -753,16 +827,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     add_to_context(chat_id, "user", user_name or "user", question)
     add_to_context(chat_id, "assistant", "bot", answer)
 
-    # Try to extract and save facts
-    if not referenced_content:
-        facts = await extract_facts_from_response(question, answer, user_name)
+    # Save user interaction (learn who talks to us)
+    save_user_interaction(user_id, user_name, user.username)
+
+    # Send response immediately, then learn in background
+    await message.reply_text(answer, reply_to_message_id=message.message_id)
+
+    # Smart fact extraction (runs after response sent)
+    try:
+        # Use LLM to extract facts from conversation
+        facts = await smart_extract_facts(
+            question=question,
+            answer=answer,
+            user_name=user_name,
+            chat_context=conv_context
+        )
+
+        # Fallback to regex if LLM fails
+        if not facts:
+            facts = await extract_facts_from_response(question, answer, user_name)
+
         for fact in facts:
             if chat_id == user_id:
                 save_user_fact(user_id, fact)
             else:
                 save_group_fact(chat_id, fact)
 
-    await message.reply_text(answer, reply_to_message_id=message.message_id)
+        if facts:
+            logger.info(f"Learned facts: {facts}")
+    except Exception as e:
+        logger.error(f"Learning failed: {e}")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
