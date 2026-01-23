@@ -167,6 +167,47 @@ def extract_urls(text: str) -> list[str]:
     return re.findall(url_pattern, text)
 
 
+def extract_urls_from_entities(message) -> list[str]:
+    """Extract URLs from message entities (hyperlinks)."""
+    urls = []
+    if not message:
+        return urls
+
+    # Get entities from text or caption
+    entities = message.entities or message.caption_entities or []
+    text = message.text or message.caption or ""
+
+    for entity in entities:
+        # TEXT_LINK: text that links to a URL (e.g., "click here" -> url)
+        if entity.type == "text_link" and entity.url:
+            urls.append(entity.url)
+        # URL: plain URL visible in text
+        elif entity.type == "url":
+            url = text[entity.offset:entity.offset + entity.length]
+            if url:
+                urls.append(url)
+
+    return urls
+
+
+def get_all_urls(message) -> list[str]:
+    """Get all URLs from message: plain text + hyperlink entities."""
+    urls = []
+
+    # URLs from entities (hyperlinks)
+    urls.extend(extract_urls_from_entities(message))
+
+    # URLs from plain text (fallback)
+    text = get_message_content(message)
+    if text:
+        text_urls = extract_urls(text)
+        for url in text_urls:
+            if url not in urls:
+                urls.append(url)
+
+    return urls
+
+
 def get_message_content(message) -> str:
     """Extract text content from a message."""
     if message.text:
@@ -725,12 +766,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 elif reply_user.username:
                     reply_author = reply_user.username
 
+            # Extract URLs from entities (hyperlinks) + plain text
+            reply_urls = get_all_urls(reply_msg)
+
             # Check if replied message is forwarded
             if is_forwarded_message(reply_msg):
                 referenced_content = f"[Forwarded post]: {reply_content}"
+                if reply_urls:
+                    referenced_content += f"\n[URLs in post]: {', '.join(reply_urls[:5])}"
             # Check if replied message has URLs
-            elif extract_urls(reply_content):
+            elif reply_urls:
                 referenced_content = f"[Message with links]: {reply_content}"
+                referenced_content += f"\n[URLs]: {', '.join(reply_urls[:5])}"
             # ANY other message - include it with author
             else:
                 referenced_content = f"[Message from {reply_author}]: {reply_content}"
@@ -739,14 +786,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if is_forwarded_message(message) and not referenced_content:
         content = get_message_content(message)
         if content:
+            msg_urls = get_all_urls(message)
             referenced_content = f"[Forwarded post]: {content}"
+            if msg_urls:
+                referenced_content += f"\n[URLs in post]: {', '.join(msg_urls[:5])}"
             # If no explicit question, default to analysis
             if not question:
                 question = "расскажи об этом"
 
-    # Case 3: Current message has URLs (no reply)
+    # Case 3: Current message has URLs (no reply) - check entities too
     if not referenced_content and question:
-        urls = extract_urls(question)
+        urls = get_all_urls(message) or extract_urls(question)
         if urls:
             referenced_content = f"[Shared link]: {urls[0]}"
 
