@@ -437,12 +437,15 @@ def should_respond(update: Update, bot_username: str) -> bool:
     if not message:
         return False
 
+    # Get text content (text or caption for photos)
+    content = get_message_content(message)
+
     # Must have some content
-    if not message.text and not is_forwarded_message(message) and not has_photo(message):
+    if not content and not is_forwarded_message(message) and not has_photo(message):
         return False
 
-    # In private chats, always respond to messages with text or photos
-    if message.chat.type == "private" and (message.text or has_photo(message)):
+    # In private chats, always respond to messages with text/caption or photos
+    if message.chat.type == "private" and (content or has_photo(message)):
         return True
 
     # Respond if replying to bot's message
@@ -450,8 +453,8 @@ def should_respond(update: Update, bot_username: str) -> bool:
         if message.reply_to_message.from_user.username == bot_username:
             return True
 
-    # Respond if @mentioned
-    if message.text and f"@{bot_username}" in message.text:
+    # Respond if @mentioned (check both text and caption)
+    if content and f"@{bot_username}" in content:
         return True
 
     return False
@@ -613,16 +616,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_name = None
 
     # Track context for all messages in groups (even if not responding)
-    if message.text and update.effective_chat.type != "private":
+    msg_content = get_message_content(message)
+    if msg_content and update.effective_chat.type != "private":
         context_name = user_name or "user"
-        add_to_context(chat_id, "user", context_name, message.text)
+        add_to_context(chat_id, "user", context_name, msg_content)
 
     # Check if we should respond
     if not should_respond(update, BOT_USERNAME):
         return
 
     # Get the user's question
-    question = extract_question(message.text or "", BOT_USERNAME)
+    # Get question from text OR caption (for photos with text)
+    question = extract_question(get_message_content(message), BOT_USERNAME)
 
     # Check for referenced content (reply to forwarded message, message with links, etc.)
     referenced_content = None
@@ -630,7 +635,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Case 1: User replies to another message
     # When bot is tagged in a reply, ALWAYS analyze the replied message
-    if reply_msg and message.text and f"@{BOT_USERNAME}" in message.text:
+    msg_text = get_message_content(message)
+    if reply_msg and msg_text and f"@{BOT_USERNAME}" in msg_text:
         reply_content = get_message_content(reply_msg)
         if reply_content:
             # Get author info if available
