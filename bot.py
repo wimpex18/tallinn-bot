@@ -217,6 +217,52 @@ def get_message_content(message) -> str:
     return ""
 
 
+async def fetch_url_content(url: str) -> str:
+    """Fetch webpage content and extract text."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5,ru;q=0.3",
+        }
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            html = response.text
+
+            # Simple HTML to text extraction
+            # Remove script and style elements
+            html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<nav[^>]*>.*?</nav>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<footer[^>]*>.*?</footer>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<header[^>]*>.*?</header>', '', html, flags=re.DOTALL | re.IGNORECASE)
+
+            # Remove all HTML tags
+            text = re.sub(r'<[^>]+>', ' ', html)
+
+            # Clean up whitespace
+            text = re.sub(r'\s+', ' ', text).strip()
+
+            # Decode HTML entities
+            text = text.replace('&nbsp;', ' ')
+            text = text.replace('&amp;', '&')
+            text = text.replace('&lt;', '<')
+            text = text.replace('&gt;', '>')
+            text = text.replace('&quot;', '"')
+            text = text.replace('&#39;', "'")
+
+            # Limit to first 3000 chars (enough for article summary)
+            if len(text) > 3000:
+                text = text[:3000] + "..."
+
+            logger.info(f"Fetched {len(text)} chars from {url}")
+            return text
+    except Exception as e:
+        logger.error(f"Failed to fetch URL {url}: {e}")
+        return ""
+
+
 def is_forwarded_message(message) -> bool:
     """Check if message is forwarded (works with PTB v21+)."""
     if not message:
@@ -799,6 +845,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         urls = get_all_urls(message) or extract_urls(question)
         if urls:
             referenced_content = f"[Shared link]: {urls[0]}"
+
+    # Fetch URL content if we have URLs (helps when Perplexity can't access the site)
+    urls_to_fetch = []
+    if reply_msg:
+        urls_to_fetch = get_all_urls(reply_msg)
+    if not urls_to_fetch:
+        urls_to_fetch = get_all_urls(message) or extract_urls(question or "")
+
+    if urls_to_fetch and referenced_content:
+        # Try to fetch the first URL's content
+        first_url = urls_to_fetch[0]
+        logger.info(f"Fetching URL content: {first_url}")
+        url_content = await fetch_url_content(first_url)
+        if url_content and len(url_content) > 100:
+            referenced_content += f"\n\n[Article content]:\n{url_content}"
 
     # Check if photo without text
     has_current_photo = has_photo(message)
