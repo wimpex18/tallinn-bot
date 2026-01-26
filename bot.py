@@ -138,32 +138,6 @@ def classify_intent(text: str) -> str:
 
 # ============ BRAVE SEARCH API ============
 
-def enhance_query_with_preferences(query: str) -> str:
-    """
-    Enhance search query with group taste preferences.
-    Adds relevant taste modifiers based on query type.
-    """
-    query_lower = query.lower()
-
-    # Detect query type and add taste-appropriate modifiers
-    if any(kw in query_lower for kw in ["bar", "бар", "пиво", "beer", "выпить", "drink"]):
-        return f"{query} craft beer local underground"
-    elif any(kw in query_lower for kw in ["concert", "концерт", "music", "музык", "gig"]):
-        return f"{query} underground indie punk alternative"
-    elif any(kw in query_lower for kw in ["кино", "cinema", "movie", "фильм", "screening", "показ"]):
-        return f"{query} arthouse independent film"
-    elif any(kw in query_lower for kw in ["книг", "book", "читать", "read"]):
-        return f"{query} independent bookstore local"
-    elif any(kw in query_lower for kw in ["винил", "vinyl", "record", "пластинк"]):
-        return f"{query} vinyl record shop"
-    elif any(kw in query_lower for kw in ["gallery", "галере", "art", "искусств", "выставк"]):
-        return f"{query} contemporary art independent gallery"
-    elif any(kw in query_lower for kw in ["куда", "где", "place", "место", "сходить"]):
-        return f"{query} local alternative underground"
-
-    return query
-
-
 async def query_brave_search(query: str) -> str:
     """
     Query Brave Search API for local/simple queries.
@@ -181,13 +155,12 @@ async def query_brave_search(query: str) -> str:
     if time_since_last < BRAVE_RATE_LIMIT_SECONDS:
         await asyncio.sleep(BRAVE_RATE_LIMIT_SECONDS - time_since_last)
 
-    # Enhance query with group taste preferences
-    query = enhance_query_with_preferences(query)
-
     # Add Tallinn context if not already present
     query_lower = query.lower()
     if "tallinn" not in query_lower and "таллинн" not in query_lower and "таллин" not in query_lower:
-        query = f"{query} Tallinn Estonia"
+        query = f"{query} Tallinn"
+
+    logger.info(f"Brave search query: {query}")
 
     headers = {
         "Accept": "application/json",
@@ -197,10 +170,10 @@ async def query_brave_search(query: str) -> str:
 
     params = {
         "q": query,
-        "count": 5,  # Get top 5 results
+        "count": 10,  # Get more results to filter
         "text_decorations": False,
-        "search_lang": "en",  # Mix of English and Russian results
         "country": "EE",  # Estonia
+        "freshness": "py",  # Past year only - avoid outdated info
     }
 
     try:
@@ -534,22 +507,12 @@ async def query_perplexity(
 - Если спрашивают "куда сходить" - ТОЛЬКО места в Таллинне
 - Ищи актуальные события в Таллинне на эту неделю
 
-ВКУСЫ ГРУППЫ - мы любим:
-- Андеграунд, контркультура, альтернатива, DIY сцена
-- Музыка: панк, хардкор, хип-хоп, техно, инди, пост-панк, экспериментальное
-- Винил, record shops, listening bars
-- Крафтовое пиво, dive bars, локальные бары с характером
-- Артхаус кино, авторское кино, документалки, кинопоказы с обсуждением
-- Независимые книжные, зины, комиксы
-- Галереи, выставки современного искусства, перформансы
-- Локальная сцена, небольшие площадки, intimate venues
+ВКУСЫ ГРУППЫ - мы любим андеграунд, контркультуру, DIY, крафт, винил, артхаус, локальную сцену. НЕ любим мейнстрим, гламур, туристическое.
 
-НЕ рекомендуй: мейнстрим клубы, гламурные места, сетевые заведения, туристические места
-
-ВАЖНО - НЕ ВЫДУМЫВАЙ МЕСТА:
-- Рекомендуй только реальные места которые точно существуют
-- Если не уверен что место существует - лучше скажи "поищи" или "не знаю"
-- Не придумывай названия баров, клубов, ресторанов
+ПРО МЕСТА - если спрашивают про бары/рестораны/места:
+- Ищи актуальную информацию в интернете
+- Проверяй что место существует и работает сейчас
+- Если не можешь найти актуальную инфу - скажи "загугли" или "не знаю что сейчас работает"
 
 СТРОГИЕ ПРАВИЛА:
 - Максимум 1-2 предложения
