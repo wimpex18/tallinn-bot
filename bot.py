@@ -32,10 +32,15 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REDIS_URL = os.getenv("REDIS_URL")
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY")
 
 # Rate limiting - only track AFTER successful query
 user_last_query: dict[int, float] = defaultdict(float)
-RATE_LIMIT_SECONDS = 60
+RATE_LIMIT_SECONDS = 5  # 5 seconds between queries per user
+
+# Brave Search rate limiting (1 request per second for free tier)
+brave_last_request: float = 0.0
+BRAVE_RATE_LIMIT_SECONDS = 1.0
 
 # Conversation context: store last N messages per chat
 CONTEXT_SIZE = 10
@@ -60,6 +65,160 @@ if REDIS_URL:
     except Exception as e:
         logger.warning(f"Redis connection failed, memory disabled: {e}")
         redis_client = None
+
+# Global httpx client for connection pooling (initialized in main)
+http_client: httpx.AsyncClient = None
+
+
+# ============ INTENT CLASSIFICATION ============
+
+# Keywords for routing queries to Brave vs Perplexity
+LOCAL_KEYWORDS = {
+    "tallinn", "таллинн", "таллин", "estonia", "эстония", "эстонии",
+    "event", "events", "ивент", "ивенты", "мероприятие", "мероприятия",
+    "concert", "концерт", "концерты", "gig", "выступление",
+    "restaurant", "ресторан", "рестораны", "кафе", "cafe",
+    "bar", "бар", "бары", "pub", "паб", "club", "клуб",
+    "where to", "куда", "куда сходить", "куда пойти", "где",
+    "places", "место", "места", "заведение", "заведения",
+    "what's happening", "что происходит", "что идёт", "что идет",
+    "weekend", "выходные", "вечером", "сегодня", "завтра", "tonight",
+    "афиша", "poster", "schedule", "расписание",
+    "telliskivi", "kalamaja", "rotermann", "noblessner", "old town", "старый город",
+    "sveta", "hall", "tapper", "kultuurikatel", "fotografiska",
+    "porogen", "tops", "pudel", "st. vitus", "koht", "labor",
+}
+
+FACTCHECK_KEYWORDS = {
+    "true", "правда", "fake", "фейк", "real", "настоящий", "ложь", "враньё",
+    "why", "почему", "зачем", "explain", "объясни", "расскажи",
+    "is it", "это", "what happened", "что случилось", "что произошло",
+    "fact check", "fact-check", "factcheck", "проверь", "проверить",
+    "verify", "верифицируй", "подтверди", "опровергни",
+    "источник", "source", "откуда", "кто сказал",
+    "анализ", "analyze", "analysis", "разбор",
+}
+
+
+def classify_intent(text: str) -> str:
+    """
+    Classify query intent to route to appropriate API.
+    Returns: 'local' for Brave Search, 'factcheck' for Perplexity
+    """
+    if not text:
+        return "factcheck"
+
+    text_lower = text.lower()
+    words = set(re.findall(r'\w+', text_lower))
+
+    # Check for local keywords
+    local_score = len(words & LOCAL_KEYWORDS)
+
+    # Check for fact-check keywords
+    factcheck_score = len(words & FACTCHECK_KEYWORDS)
+
+    # Boost local score for common patterns
+    if any(phrase in text_lower for phrase in ["куда сходить", "куда пойти", "где поесть", "где выпить", "что посетить"]):
+        local_score += 3
+    if any(phrase in text_lower for phrase in ["на выходных", "на этой неделе", "сегодня вечером", "this weekend"]):
+        local_score += 2
+
+    # Boost factcheck score for analysis patterns
+    if any(phrase in text_lower for phrase in ["это правда", "правда ли", "это фейк", "что думаешь"]):
+        factcheck_score += 3
+
+    # If query has referenced content (forwarded post, URL), prefer Perplexity
+    # This is handled in the caller
+
+    logger.info(f"Intent classification: local={local_score}, factcheck={factcheck_score}")
+
+    if local_score > factcheck_score and local_score >= 1:
+        return "local"
+    return "factcheck"
+
+
+# ============ BRAVE SEARCH API ============
+
+async def query_brave_search(query: str) -> str:
+    """
+    Query Brave Search API for local/simple queries.
+    Returns formatted search results for Telegram.
+    """
+    global brave_last_request, http_client
+
+    if not BRAVE_API_KEY:
+        logger.warning("Brave API key not configured")
+        return None
+
+    # Rate limiting: ensure 1 second between requests
+    now = time.time()
+    time_since_last = now - brave_last_request
+    if time_since_last < BRAVE_RATE_LIMIT_SECONDS:
+        await asyncio.sleep(BRAVE_RATE_LIMIT_SECONDS - time_since_last)
+
+    # Add Tallinn context if not already present
+    query_lower = query.lower()
+    if "tallinn" not in query_lower and "таллинн" not in query_lower and "таллин" not in query_lower:
+        # Check if it's a local query that needs location context
+        if any(kw in query_lower for kw in ["куда", "где", "event", "concert", "bar", "restaurant", "афиша"]):
+            query = f"{query} Tallinn Estonia"
+
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": BRAVE_API_KEY,
+    }
+
+    params = {
+        "q": query,
+        "count": 5,  # Get top 5 results
+        "text_decorations": False,
+        "search_lang": "en",  # Mix of English and Russian results
+        "country": "EE",  # Estonia
+    }
+
+    try:
+        brave_last_request = time.time()
+
+        client = http_client or httpx.AsyncClient(timeout=15.0)
+        response = await client.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers=headers,
+            params=params,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        # Format results for Telegram
+        results = []
+        web_results = data.get("web", {}).get("results", [])
+
+        if not web_results:
+            return None
+
+        for result in web_results[:5]:
+            title = result.get("title", "")
+            description = result.get("description", "")
+            url = result.get("url", "")
+
+            if title and url:
+                # Clean up description
+                desc_clean = description[:150] + "..." if len(description) > 150 else description
+                results.append(f"• {title}\n  {desc_clean}\n  {url}")
+
+        if results:
+            return "\n\n".join(results)
+        return None
+
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            logger.warning("Brave API rate limited")
+            return None
+        logger.error(f"Brave API error: {e.response.status_code}")
+        return None
+    except Exception as e:
+        logger.error(f"Brave search error: {e}")
+        return None
 
 
 # ============ MEMORY FUNCTIONS ============
@@ -452,20 +611,21 @@ async def query_perplexity(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.perplexity.ai/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
-            try:
-                answer = data["choices"][0]["message"]["content"]
-            except (KeyError, IndexError):
-                logger.error(f"Unexpected API response format: {data}")
-                return "Не получил ответ от API("
-            return clean_response(answer)
+        global http_client
+        client = http_client or httpx.AsyncClient(timeout=30.0)
+        response = await client.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+        try:
+            answer = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError):
+            logger.error(f"Unexpected API response format: {data}")
+            return "Не получил ответ от API("
+        return clean_response(answer)
     except httpx.TimeoutException:
         return "Слишком долго думаю, попробуй ещё раз)"
     except httpx.HTTPStatusError as e:
@@ -918,18 +1078,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             photo_urls.append(photo_url)
             logger.info(f"Added photo from replied message")
 
-    # Query Perplexity
-    logger.info(f"Query from {user_id} ({user_name}): {question[:50]}... [has_ref={referenced_content is not None}, photos={len(photo_urls)}]")
+    # Smart routing: decide between Brave Search and Perplexity
+    # Use Perplexity for: referenced content, photos, fact-checking, complex queries
+    # Use Brave for: simple local queries (events, places, restaurants)
 
-    answer = await query_perplexity(
-        question=question,
-        referenced_content=referenced_content,
-        user_name=user_name,
-        context=conv_context,
-        user_facts=user_facts,
-        group_facts=group_facts,
-        photo_urls=photo_urls if photo_urls else None,
-    )
+    use_brave = False
+    answer = None
+
+    # Determine routing
+    if referenced_content or photo_urls:
+        # Always use Perplexity for content analysis and photos
+        use_brave = False
+        logger.info(f"Routing to Perplexity (has content/photos)")
+    else:
+        intent = classify_intent(question)
+        use_brave = (intent == "local") and BRAVE_API_KEY
+        logger.info(f"Intent: {intent}, routing to {'Brave' if use_brave else 'Perplexity'}")
+
+    logger.info(f"Query from {user_id} ({user_name}): {question[:50]}... [has_ref={referenced_content is not None}, photos={len(photo_urls)}, api={'brave' if use_brave else 'perplexity'}]")
+
+    if use_brave:
+        # Try Brave Search first for local queries
+        answer = await query_brave_search(question)
+        if answer:
+            # Format as a friendly response
+            answer = f"Вот что нашёл:\n\n{answer}"
+        else:
+            # Fall back to Perplexity if Brave fails
+            logger.info("Brave search returned no results, falling back to Perplexity")
+            use_brave = False
+
+    if not use_brave or not answer:
+        # Use Perplexity for fact-checking, analysis, and fallback
+        answer = await query_perplexity(
+            question=question,
+            referenced_content=referenced_content,
+            user_name=user_name,
+            context=conv_context,
+            user_facts=user_facts,
+            group_facts=group_facts,
+            photo_urls=photo_urls if photo_urls else None,
+        )
 
     # Set rate limit AFTER successful query
     set_rate_limit(user_id)
@@ -975,6 +1164,24 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error(f"Exception while handling an update: {context.error}")
 
 
+async def init_http_client(application) -> None:
+    """Initialize global HTTP client on startup."""
+    global http_client
+    http_client = httpx.AsyncClient(
+        timeout=30.0,
+        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+    )
+    logger.info("HTTP client initialized with connection pooling")
+
+
+async def cleanup_http_client(application) -> None:
+    """Cleanup global HTTP client on shutdown."""
+    global http_client
+    if http_client:
+        await http_client.aclose()
+        logger.info("HTTP client closed")
+
+
 def main() -> None:
     """Start the bot."""
     if not TELEGRAM_TOKEN:
@@ -986,8 +1193,13 @@ def main() -> None:
 
     logger.info(f"Starting bot @{BOT_USERNAME}")
     logger.info(f"Redis connected: {redis_client is not None}")
+    logger.info(f"Brave Search: {'enabled' if BRAVE_API_KEY else 'disabled'}")
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Initialize HTTP client with connection pooling
+    application.post_init = init_http_client
+    application.post_shutdown = cleanup_http_client
 
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
