@@ -549,30 +549,8 @@ async def query_perplexity(
 ) -> str:
     """Query Perplexity API with context, memory, and photos."""
 
-    system_prompt = """Ты дружелюбный помощник для русскоязычных в ТАЛЛИННЕ (Эстония).
-
-ЛОКАЦИЯ: Только Таллинн и Эстония. Не рекомендуй места из других городов.
-
-НАШИ ВКУСЫ:
-Мы любим: андеграунд, контркультуру, DIY, крафтовое пиво, винил, артхаус кино, живую музыку, локальные бары с характером, независимые книжные, галереи.
-Не любим: мейнстрим, гламур, туристические места, сетевые заведения.
-
-СТИЛЬ ОТВЕТА:
-- Дружелюбный и проактивный, как друг который шарит в городе
-- Давай 3-5 конкретных рекомендаций когда спрашивают про места
-- Указывай название, район, и почему это место крутое
-- Используй "ты", не "вы"
-- Без эмодзи, можно ) или ( после слова
-
-ПРО МЕСТА:
-- ВСЕГДА ищи актуальную информацию в интернете перед ответом
-- Проверяй что место до сих пор работает (ищи отзывы 2024-2025)
-- Если не уверен что место открыто - честно скажи "проверь что работает"
-- Лучше сказать "не знаю" чем дать устаревшую инфу
-
-ФОТО: Опиши что видишь, ответь по существу на вопрос о фото.
-
-ССЫЛКИ: Открой и проанализируй, дай краткую суть."""
+    # Minimal system prompt - let Perplexity search naturally
+    system_prompt = """Отвечай на русском. Используй "ты". Кратко, 2-4 предложения. Без эмодзи."""
 
     # Add memory context
     if user_facts:
@@ -580,28 +558,23 @@ async def query_perplexity(
     if group_facts:
         system_prompt += f"\n\nТы помнишь про эту группу: {', '.join(group_facts[:5])}"
 
-    # Build the user message
-    user_message = ""
+    # Build simple user message - let Perplexity search naturally
+    # Add "в Таллинне" if question is about places and doesn't have location
+    question_lower = question.lower()
+    needs_location = any(kw in question_lower for kw in [
+        "бар", "ресторан", "кафе", "клуб", "концерт", "кино", "магазин",
+        "куда", "где", "посоветуй", "порекомендуй", "подскажи"
+    ])
+    has_location = any(loc in question_lower for loc in ["таллин", "tallinn", "эстони"])
 
-    # Extract URLs from referenced content for analysis
-    extracted_urls = []
+    if needs_location and not has_location:
+        question = f"{question} в Таллинне"
+
+    # Keep message simple for better Perplexity search
     if referenced_content:
-        extracted_urls = extract_urls(referenced_content)
-        user_message += f"[Content being discussed]:\n{referenced_content}\n\n"
-
-        # Add URLs separately so Perplexity can fetch them
-        if extracted_urls:
-            user_message += f"[URLs to analyze]:\n"
-            for url in extracted_urls[:5]:  # Limit to 5 URLs
-                user_message += f"- {url}\n"
-            user_message += "\n"
-
-    if context:
-        user_message += f"[Recent conversation]:\n{context}\n\n"
-
-    user_message += f"[User's question]: {question}"
-    if user_name:
-        user_message += f" (from {user_name})"
+        user_message = f"{referenced_content}\n\nВопрос: {question}"
+    else:
+        user_message = question
 
     # Build user message content (with photos if provided)
     if photo_urls:
@@ -629,8 +602,8 @@ async def query_perplexity(
     payload = {
         "model": "sonar",
         "messages": messages,
-        "max_tokens": 500,  # Longer responses with more suggestions
-        "temperature": 0.5,  # Slightly more creative
+        "max_tokens": 300,
+        "temperature": 0.3,
     }
 
     try:
