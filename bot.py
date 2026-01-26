@@ -4,6 +4,7 @@ import time
 import json
 import logging
 import base64
+import asyncio
 from collections import defaultdict
 from datetime import datetime
 from urllib.parse import urlparse
@@ -136,12 +137,12 @@ def classify_intent(text: str) -> str:
     return "factcheck"
 
 
-# ============ BRAVE SEARCH API ============
+# ============ BRAVE SEARCH WITH SUMMARIZER ============
 
-async def query_brave_search(query: str) -> str:
+async def query_brave_summarizer(query: str) -> str:
     """
-    Query Brave Search API for local/simple queries.
-    Returns formatted search results for Telegram.
+    Query Brave Search API with AI Summarizer for intelligent answers.
+    Two-step process: 1) Web search with summary=1, 2) Get AI summary.
     """
     global brave_last_request, http_client
 
@@ -149,74 +150,83 @@ async def query_brave_search(query: str) -> str:
         logger.warning("Brave API key not configured")
         return None
 
-    # Rate limiting: ensure 1 second between requests
+    # Rate limiting
     now = time.time()
-    time_since_last = now - brave_last_request
-    if time_since_last < BRAVE_RATE_LIMIT_SECONDS:
-        await asyncio.sleep(BRAVE_RATE_LIMIT_SECONDS - time_since_last)
+    if now - brave_last_request < BRAVE_RATE_LIMIT_SECONDS:
+        await asyncio.sleep(BRAVE_RATE_LIMIT_SECONDS - (now - brave_last_request))
 
-    # Add Tallinn context if not already present
-    query_lower = query.lower()
-    if "tallinn" not in query_lower and "таллинн" not in query_lower and "таллин" not in query_lower:
+    # Add Tallinn context
+    if not any(loc in query.lower() for loc in ["tallinn", "таллинн", "таллин"]):
         query = f"{query} Tallinn"
 
-    logger.info(f"Brave search query: {query}")
+    logger.info(f"Brave Summarizer query: {query}")
 
     headers = {
         "Accept": "application/json",
-        "Accept-Encoding": "gzip",
         "X-Subscription-Token": BRAVE_API_KEY,
-    }
-
-    params = {
-        "q": query,
-        "count": 10,  # Get more results to filter
-        "text_decorations": False,
-        "country": "EE",  # Estonia
-        "freshness": "py",  # Past year only - avoid outdated info
     }
 
     try:
         brave_last_request = time.time()
+        client = http_client or httpx.AsyncClient(timeout=20.0)
 
-        client = http_client or httpx.AsyncClient(timeout=15.0)
-        response = await client.get(
+        # Step 1: Web search with summary flag
+        search_params = {
+            "q": query,
+            "summary": 1,  # Enable summarizer
+            "count": 5,
+            "country": "EE",
+            "freshness": "pw",  # Past week for freshest results
+        }
+
+        search_response = await client.get(
             "https://api.search.brave.com/res/v1/web/search",
             headers=headers,
-            params=params,
+            params=search_params,
         )
-        response.raise_for_status()
-        data = response.json()
+        search_response.raise_for_status()
+        search_data = search_response.json()
 
-        # Format results for Telegram
-        results = []
-        web_results = data.get("web", {}).get("results", [])
+        # Get summarizer key
+        summarizer_key = search_data.get("summarizer", {}).get("key")
 
-        if not web_results:
-            return None
+        if summarizer_key:
+            # Step 2: Get AI summary
+            summary_response = await client.get(
+                "https://api.search.brave.com/res/v1/summarizer/search",
+                headers=headers,
+                params={"key": summarizer_key, "entity_info": 1},
+            )
+            summary_response.raise_for_status()
+            summary_data = summary_response.json()
 
-        for result in web_results[:5]:
-            title = result.get("title", "")
-            description = result.get("description", "")
-            url = result.get("url", "")
+            if summary_data.get("status") == "complete":
+                summary_text = summary_data.get("summary", [{}])[0].get("data", "")
+                if summary_text:
+                    logger.info("Brave Summarizer returned result")
+                    return summary_text
 
-            if title and url:
-                # Clean up description
-                desc_clean = description[:150] + "..." if len(description) > 150 else description
-                results.append(f"• {title}\n  {desc_clean}\n  {url}")
+        # Fallback: format web results if no summary
+        web_results = search_data.get("web", {}).get("results", [])
+        if web_results:
+            results = []
+            for r in web_results[:3]:
+                title = r.get("title", "")
+                desc = r.get("description", "")[:100]
+                url = r.get("url", "")
+                if title:
+                    results.append(f"• {title}: {desc}... ({url})")
+            if results:
+                logger.info("Brave returning web results (no summary)")
+                return "\n".join(results)
 
-        if results:
-            return "\n\n".join(results)
         return None
 
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 429:
-            logger.warning("Brave API rate limited")
-            return None
         logger.error(f"Brave API error: {e.response.status_code}")
         return None
     except Exception as e:
-        logger.error(f"Brave search error: {e}")
+        logger.error(f"Brave error: {e}")
         return None
 
 
@@ -1081,7 +1091,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if use_brave:
         # Try Brave Search first for local queries
-        answer = await query_brave_search(question)
+        answer = await query_brave_summarizer(question)
         if answer:
             # Format as a friendly response
             answer = f"Вот что нашёл:\n\n{answer}"
