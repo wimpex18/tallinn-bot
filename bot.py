@@ -137,7 +137,8 @@ def get_context_string(chat_id: int) -> str:
     if not chat_context[chat_id]:
         return ""
     context_lines = []
-    for msg in chat_context[chat_id][-5:]:
+    # Show last 10 messages for better conversation continuity
+    for msg in chat_context[chat_id][-10:]:
         name = msg.get("name", "user")
         content = msg["content"]
         context_lines.append(f"{name}: {content}")
@@ -373,6 +374,13 @@ async def query_perplexity(
 - Кино: Sõprus, Artis
 - Районы: Telliskivi, Kalamaja, Rotermann, Noblessner
 
+КОНТЕКСТ РАЗГОВОРА - КРИТИЧНО:
+- ВСЕГДА читай историю разговора перед ответом
+- Новое сообщение часто продолжает предыдущую тему
+- Если пользователь уточняет (дату, время, место) - это про предыдущий вопрос
+- НЕ начинай новую тему, если пользователь продолжает старую
+- Пример: спросили про кино → ответил → сказали "только на сегодня" = уточнение про кино!
+
 СТРОГИЕ ПРАВИЛА:
 - Максимум 1-2 предложения
 - Только "ты", никогда "вы"
@@ -415,9 +423,9 @@ async def query_perplexity(
             user_message += "\n"
 
     if context:
-        user_message += f"[Recent conversation]:\n{context}\n\n"
+        user_message += f"[ВАЖНО - История разговора (новое сообщение может быть продолжением!)]:\n{context}\n\n"
 
-    user_message += f"[User's question]: {question}"
+    user_message += f"[Текущее сообщение пользователя]: {question}"
     if user_name:
         user_message += f" (from {user_name})"
 
