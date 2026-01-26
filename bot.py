@@ -321,22 +321,39 @@ async def query_perplexity(
     photo_urls: list[str] = None,
 ) -> str:
     """Query Perplexity API with context, memory, and photos."""
-    # Minimal system prompt - let Perplexity search naturally
-    system_prompt = 'Отвечай на русском. Используй "ты". Кратко, 2-4 предложения. Без эмодзи.'
+    # System prompt - respond in Russian but search in English/Estonian for Tallinn
+    system_prompt = (
+        'Отвечай на русском. Используй "ты". Кратко, 2-4 предложения. Без эмодзи. '
+        'ВАЖНО: При поиске информации о местах, событиях и мероприятиях в Таллинне - '
+        'ищи на АНГЛИЙСКОМ и ЭСТОНСКОМ языках (не на русском), так как большинство '
+        'актуальной информации о Таллинне на этих языках. '
+        'Хорошие источники: Facebook Events, visitestonia.com, tallinn.ee. '
+        'Если не находишь на английском/эстонском - попробуй gloss.ee (русскоязычный сайт о Таллинне).'
+    )
 
     if user_facts:
         system_prompt += f"\n\nТы помнишь про этого человека: {', '.join(user_facts[:5])}"
     if group_facts:
         system_prompt += f"\n\nТы помнишь про эту группу: {', '.join(group_facts[:5])}"
 
-    # Auto-add location for place-related queries
+    # Auto-add location for place/event-related queries
     question_lower = question.lower()
-    place_keywords = ["бар", "ресторан", "кафе", "клуб", "концерт", "кино", "магазин",
-                      "куда", "где", "посоветуй", "порекомендуй", "подскажи"]
-    location_keywords = ["таллин", "tallinn", "эстони"]
+    place_keywords = [
+        # Places
+        "бар", "ресторан", "кафе", "клуб", "кино", "магазин", "музей", "театр", "галерея",
+        # Events
+        "концерт", "мероприятие", "событие", "фестиваль", "выставка", "вечеринка", "шоу",
+        "ивент", "event", "афиша", "тусовка", "движ",
+        # Time-related (implies looking for events)
+        "сегодня", "завтра", "выходные", "вечером", "weekend",
+        # Actions
+        "куда", "где", "посоветуй", "порекомендуй", "подскажи", "сходить", "пойти"
+    ]
+    location_keywords = ["таллин", "tallinn", "эстони", "estonia"]
 
+    # Append location in English for better search results
     if any(kw in question_lower for kw in place_keywords) and not any(loc in question_lower for loc in location_keywords):
-        question = f"{question} в Таллинне"
+        question = f"{question} (Tallinn, Estonia)"
 
     # Build user message
     if referenced_content:
