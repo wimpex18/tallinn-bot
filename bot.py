@@ -84,9 +84,8 @@ LOCAL_KEYWORDS = {
     "what's happening", "что происходит", "что идёт", "что идет",
     "weekend", "выходные", "вечером", "сегодня", "завтра", "tonight",
     "афиша", "poster", "schedule", "расписание",
-    "telliskivi", "kalamaja", "rotermann", "noblessner", "old town", "старый город",
-    "sveta", "hall", "tapper", "kultuurikatel", "fotografiska",
-    "porogen", "tops", "pudel", "st. vitus", "koht", "labor",
+    "craft", "крафт", "крафтовое", "vinyl", "винил", "пластинки",
+    "bookstore", "книжный", "arthaus", "артхаус", "screening", "показ",
 }
 
 FACTCHECK_KEYWORDS = {
@@ -139,6 +138,32 @@ def classify_intent(text: str) -> str:
 
 # ============ BRAVE SEARCH API ============
 
+def enhance_query_with_preferences(query: str) -> str:
+    """
+    Enhance search query with group taste preferences.
+    Adds relevant taste modifiers based on query type.
+    """
+    query_lower = query.lower()
+
+    # Detect query type and add taste-appropriate modifiers
+    if any(kw in query_lower for kw in ["bar", "бар", "пиво", "beer", "выпить", "drink"]):
+        return f"{query} craft beer local underground"
+    elif any(kw in query_lower for kw in ["concert", "концерт", "music", "музык", "gig"]):
+        return f"{query} underground indie punk alternative"
+    elif any(kw in query_lower for kw in ["кино", "cinema", "movie", "фильм", "screening", "показ"]):
+        return f"{query} arthouse independent film"
+    elif any(kw in query_lower for kw in ["книг", "book", "читать", "read"]):
+        return f"{query} independent bookstore local"
+    elif any(kw in query_lower for kw in ["винил", "vinyl", "record", "пластинк"]):
+        return f"{query} vinyl record shop"
+    elif any(kw in query_lower for kw in ["gallery", "галере", "art", "искусств", "выставк"]):
+        return f"{query} contemporary art independent gallery"
+    elif any(kw in query_lower for kw in ["куда", "где", "place", "место", "сходить"]):
+        return f"{query} local alternative underground"
+
+    return query
+
+
 async def query_brave_search(query: str) -> str:
     """
     Query Brave Search API for local/simple queries.
@@ -156,12 +181,13 @@ async def query_brave_search(query: str) -> str:
     if time_since_last < BRAVE_RATE_LIMIT_SECONDS:
         await asyncio.sleep(BRAVE_RATE_LIMIT_SECONDS - time_since_last)
 
+    # Enhance query with group taste preferences
+    query = enhance_query_with_preferences(query)
+
     # Add Tallinn context if not already present
     query_lower = query.lower()
     if "tallinn" not in query_lower and "таллинн" not in query_lower and "таллин" not in query_lower:
-        # Check if it's a local query that needs location context
-        if any(kw in query_lower for kw in ["куда", "где", "event", "concert", "bar", "restaurant", "афиша"]):
-            query = f"{query} Tallinn Estonia"
+        query = f"{query} Tallinn Estonia"
 
     headers = {
         "Accept": "application/json",
@@ -508,29 +534,22 @@ async def query_perplexity(
 - Если спрашивают "куда сходить" - ТОЛЬКО места в Таллинне
 - Ищи актуальные события в Таллинне на эту неделю
 
-ВКУСЫ ГРУППЫ (учитывай при рекомендациях):
-- Музыка: панк, рок, метал, хип-хоп, андеграунд, инди (НЕ поп, НЕ диско, НЕ мейнстрим)
-- Бары: крафтовое пиво, коктейльные бары, dive bars (НЕ клубы, НЕ гламур)
-- Кино: артхаус, фестивальное, авторское (НЕ блокбастеры)
-- Общее: андеграунд, альтернатива, локальная сцена
+ВКУСЫ ГРУППЫ - мы любим:
+- Андеграунд, контркультура, альтернатива, DIY сцена
+- Музыка: панк, хардкор, хип-хоп, техно, инди, пост-панк, экспериментальное
+- Винил, record shops, listening bars
+- Крафтовое пиво, dive bars, локальные бары с характером
+- Артхаус кино, авторское кино, документалки, кинопоказы с обсуждением
+- Независимые книжные, зины, комиксы
+- Галереи, выставки современного искусства, перформансы
+- Локальная сцена, небольшие площадки, intimate venues
 
-ПОИСК СОБЫТИЙ - ОБЯЗАТЕЛЬНО ищи на сайтах:
-- Концерты: sveta.ee, hall.ee, tfrec.com, kultuurikatel.ee, fotografiska.com/tallinn
-- События: facebook.com/events (Tallinn), residentadvisor.net/events/ee, piletilevi.ee
-- Кино: kinosoprus.ee, kino.artis.ee
-- Типы: концерты, DJ сеты, vinyl nights, настолки, артхаус кино, выставки, DIY ивенты
+НЕ рекомендуй: мейнстрим клубы, гламурные места, сетевые заведения, туристические места
 
-Когда спрашивают "куда сходить" или "что делать":
-- ИЩИ конкретные события на указанную дату
-- Проверь сайты venue напрямую
-- Укажи название события, место, время
-- Если нашёл несколько - дай 2-3 варианта
-
-МЕСТА В ТАЛЛИННЕ:
-- Концерты: Sveta, Hall, Tapper, Kultuurikatel, Fotografiska
-- Бары: Porogen, Tops, Pudel, St. Vitus, Koht, Labor
-- Кино: Sõprus, Artis
-- Районы: Telliskivi, Kalamaja, Rotermann, Noblessner
+ВАЖНО - НЕ ВЫДУМЫВАЙ МЕСТА:
+- Рекомендуй только реальные места которые точно существуют
+- Если не уверен что место существует - лучше скажи "поищи" или "не знаю"
+- Не придумывай названия баров, клубов, ресторанов
 
 СТРОГИЕ ПРАВИЛА:
 - Максимум 1-2 предложения
