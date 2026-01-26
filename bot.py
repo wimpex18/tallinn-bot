@@ -30,14 +30,11 @@ PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REDIS_URL = os.getenv("REDIS_URL")
 
-# Rate limiting - only track AFTER successful query
+# Rate limiting
 user_last_query: dict[int, float] = defaultdict(float)
-RATE_LIMIT_SECONDS = 5  # 5 seconds between queries per user
+RATE_LIMIT_SECONDS = 5
 
-# Brave API removed - Perplexity Sonar has built-in web search
-# that works better than routing through multiple APIs
-
-# Conversation context: store last N messages per chat
+# Conversation context
 CONTEXT_SIZE = 10
 chat_context: dict[int, list[dict]] = defaultdict(list)
 
@@ -61,10 +58,8 @@ if REDIS_URL:
         logger.warning(f"Redis connection failed, memory disabled: {e}")
         redis_client = None
 
-# Global httpx client for connection pooling (initialized in main)
+# Global httpx client for connection pooling
 http_client: httpx.AsyncClient = None
-
-
 
 
 # ============ MEMORY FUNCTIONS ============
@@ -142,11 +137,9 @@ def get_context_string(chat_id: int) -> str:
     if not chat_context[chat_id]:
         return ""
     context_lines = []
-    # Show last 10 messages for better conversation continuity
-    for msg in chat_context[chat_id][-10:]:
+    for msg in chat_context[chat_id][-CONTEXT_SIZE:]:
         name = msg.get("name", "user")
-        content = msg["content"]
-        context_lines.append(f"{name}: {content}")
+        context_lines.append(f"{name}: {msg['content']}")
     return "\n".join(context_lines)
 
 
@@ -270,28 +263,10 @@ async def fetch_url_content(url: str) -> str:
 
 
 def is_forwarded_message(message) -> bool:
-    """Check if message is forwarded (works with PTB v21+)."""
+    """Check if message is forwarded (PTB v21+ uses forward_origin)."""
     if not message:
         return False
-    # PTB v21+ uses forward_origin instead of forward_date
     return message.forward_origin is not None
-
-
-def is_content_message(message) -> bool:
-    """Check if message has analyzable content (forwarded, has links, etc.)."""
-    if not message:
-        return False
-    content = get_message_content(message)
-    # Has URLs
-    if extract_urls(content):
-        return True
-    # Is forwarded
-    if is_forwarded_message(message):
-        return True
-    # Has substantial text (more than just a few words)
-    if len(content) > 100:
-        return True
-    return False
 
 
 async def download_photo_as_base64(photo, bot) -> str:
@@ -346,106 +321,34 @@ async def query_perplexity(
     photo_urls: list[str] = None,
 ) -> str:
     """Query Perplexity API with context, memory, and photos."""
-
-    system_prompt = """Ты друг в чате для русскоязычных в ТАЛЛИННЕ (Эстония). Отвечаешь КОРОТКО - 1-2 предложения.
-
-КРИТИЧНО - ТОЛЬКО ТАЛЛИНН:
-- ТЫ ЗНАЕШЬ ТОЛЬКО ПРО ТАЛЛИНН, ЭСТОНИЯ
-- НИКОГДА не рекомендуй места в других городах (Москва, Питер и т.д.)
-- Если спрашивают "куда сходить" - ТОЛЬКО места в Таллинне
-- Ищи актуальные события в Таллинне на эту неделю
-
-ВКУСЫ ГРУППЫ (учитывай при рекомендациях):
-- Музыка: панк, рок, метал, хип-хоп, андеграунд, инди (НЕ поп, НЕ диско, НЕ мейнстрим)
-- Бары: крафтовое пиво, коктейльные бары, dive bars (НЕ клубы, НЕ гламур)
-- Кино: артхаус, фестивальное, авторское (НЕ блокбастеры)
-- Общее: андеграунд, альтернатива, локальная сцена
-
-ПОИСК СОБЫТИЙ - ОБЯЗАТЕЛЬНО ищи на сайтах:
-- Концерты: sveta.ee, hall.ee, tfrec.com, kultuurikatel.ee, fotografiska.com/tallinn
-- События: facebook.com/events (Tallinn), residentadvisor.net/events/ee, piletilevi.ee
-- Кино: kinosoprus.ee, kino.artis.ee
-- Типы: концерты, DJ сеты, vinyl nights, настолки, артхаус кино, выставки, DIY ивенты
-
-Когда спрашивают "куда сходить" или "что делать":
-- ИЩИ конкретные события на указанную дату
-- Проверь сайты venue напрямую
-- Укажи название события, место, время
-- Если нашёл несколько - дай 2-3 варианта
-
-МЕСТА В ТАЛЛИННЕ:
-- Концерты: Sveta, Hall, Tapper, Kultuurikatel, Fotografiska
-- Бары: Porogen, Tops, Pudel, St. Vitus, Koht, Labor
-- Кино: Sõprus, Artis
-- Районы: Telliskivi, Kalamaja, Rotermann, Noblessner
-
-КОНТЕКСТ РАЗГОВОРА - КРИТИЧНО:
-- ВСЕГДА читай историю разговора перед ответом
-- Новое сообщение часто продолжает предыдущую тему
-- Если пользователь уточняет (дату, время, место) - это про предыдущий вопрос
-- НЕ начинай новую тему, если пользователь продолжает старую
-- Пример: спросили про кино → ответил → сказали "только на сегодня" = уточнение про кино!
-
-СТРОГИЕ ПРАВИЛА:
-- Максимум 1-2 предложения
-- Только "ты", никогда "вы"
-- Без эмодзи. Только ) или ( после слова
-- При рекомендации укажи название и район
-
-Фото:
-- Селфи/портрет: короткий комплимент
-- Мем: короткая реакция
-- Меню/афиша: ответь конкретно
-
-Ссылки:
-- ОТКРОЙ и проанализируй ссылки из контента
-- Используй реальные данные со ссылок, не выдумывай
-- Кратко изложи суть статьи/поста
-- Если нашёл статью/источник - ПРИКРЕПИ ссылку на него
-
-Если не знаешь про конкретное место в Таллинне - скажи что не знаешь."""
     # Minimal system prompt - let Perplexity search naturally
-    system_prompt = """Отвечай на русском. Используй "ты". Кратко, 2-4 предложения. Без эмодзи."""
+    system_prompt = 'Отвечай на русском. Используй "ты". Кратко, 2-4 предложения. Без эмодзи.'
 
-    # Add memory context
     if user_facts:
         system_prompt += f"\n\nТы помнишь про этого человека: {', '.join(user_facts[:5])}"
     if group_facts:
         system_prompt += f"\n\nТы помнишь про эту группу: {', '.join(group_facts[:5])}"
 
-    # Build simple user message - let Perplexity search naturally
-    # Add "в Таллинне" if question is about places and doesn't have location
+    # Auto-add location for place-related queries
     question_lower = question.lower()
-    needs_location = any(kw in question_lower for kw in [
-        "бар", "ресторан", "кафе", "клуб", "концерт", "кино", "магазин",
-        "куда", "где", "посоветуй", "порекомендуй", "подскажи"
-    ])
-    has_location = any(loc in question_lower for loc in ["таллин", "tallinn", "эстони"])
+    place_keywords = ["бар", "ресторан", "кафе", "клуб", "концерт", "кино", "магазин",
+                      "куда", "где", "посоветуй", "порекомендуй", "подскажи"]
+    location_keywords = ["таллин", "tallinn", "эстони"]
 
-    if context:
-        user_message += f"[ВАЖНО - История разговора (новое сообщение может быть продолжением!)]:\n{context}\n\n"
-
-    user_message += f"[Текущее сообщение пользователя]: {question}"
-    if user_name:
-        user_message += f" (from {user_name})"
-    if needs_location and not has_location:
+    if any(kw in question_lower for kw in place_keywords) and not any(loc in question_lower for loc in location_keywords):
         question = f"{question} в Таллинне"
 
-    # Keep message simple for better Perplexity search
+    # Build user message
     if referenced_content:
         user_message = f"{referenced_content}\n\nВопрос: {question}"
     else:
         user_message = question
 
-    # Build user message content (with photos if provided)
+    # Build message content (with photos if provided)
     if photo_urls:
-        # Format with images according to Perplexity API docs
         user_content = [{"type": "text", "text": user_message}]
-        for photo_url in photo_urls[:3]:  # Limit to 3 photos
-            user_content.append({
-                "type": "image_url",
-                "image_url": {"url": photo_url}
-            })
+        for photo_url in photo_urls[:3]:
+            user_content.append({"type": "image_url", "image_url": {"url": photo_url}})
         user_message_content = user_content
     else:
         user_message_content = user_message
@@ -496,25 +399,17 @@ async def query_perplexity(
 
 
 def clean_response(text: str) -> str:
-    """Clean up response: remove citations [1][2] and fix emoticon spacing."""
+    """Clean up response: remove citations and fix emoticon spacing."""
     if not text:
         return text
-
-    # Remove citation brackets like [1], [2], [6], etc.
-    text = re.sub(r'\[\d+\]', '', text)
-
-    # Fix emoticon spacing: " ))" or " (" should be "word))" or "word("
-    # Match space followed by emoticons and move emoticons to previous word
-    text = re.sub(r'\s+(\)+|\(+)', r'\1', text)
-
-    # Clean up any double spaces
+    text = re.sub(r'\[\d+\]', '', text)  # Remove [1], [2] citations
+    text = re.sub(r'\s+(\)+|\(+)', r'\1', text)  # Fix emoticon spacing
     text = re.sub(r'\s+', ' ', text).strip()
-
     return text
 
 
-async def extract_facts_from_response(question: str, answer: str, user_name: str) -> list[str]:
-    """Extract memorable facts from a conversation."""
+def extract_facts_from_response(question: str, answer: str, user_name: str) -> list[str]:
+    """Extract memorable facts from a conversation using regex patterns."""
     facts = []
     patterns = [
         (r"люблю\s+(\w+)", "любит {}"),
@@ -539,55 +434,49 @@ async def smart_extract_facts(question: str, answer: str, user_name: str, chat_c
     if not question or len(question) < 10:
         return []
 
+    context_part = f"Контекст чата: {chat_context}" if chat_context else ""
     prompt = f"""Извлеки важные факты о пользователе из этого диалога.
 Пользователь: {user_name or 'unknown'}
 
 Вопрос: {question}
 Ответ: {answer}
 
-{"Контекст чата: " + chat_context if chat_context else ""}
+{context_part}
 
 Выдай ТОЛЬКО факты о человеке (интересы, предпочтения, планы, работа, и т.д.)
 Формат: один факт на строку, коротко (3-7 слов)
 Если фактов нет - напиши "НЕТ"
 Максимум 3 факта."""
 
-    headers = {
-        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": "sonar",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 100,
-        "temperature": 0.1,
-    }
-
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
                 "https://api.perplexity.ai/chat/completions",
-                headers=headers,
-                json=payload,
+                headers={
+                    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "sonar",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 100,
+                    "temperature": 0.1,
+                },
             )
             response.raise_for_status()
-            data = response.json()
-            result = data["choices"][0]["message"]["content"].strip()
+            result = response.json()["choices"][0]["message"]["content"].strip()
 
             if "НЕТ" in result.upper() or len(result) < 5:
                 return []
 
-            # Parse facts (one per line)
             facts = []
             for line in result.split("\n"):
                 line = line.strip().lstrip("-•").strip()
-                if line and len(line) > 3 and len(line) < 100:
+                if 3 < len(line) < 100:
                     if user_name and not line.startswith(user_name):
                         line = f"{user_name}: {line}"
                     facts.append(line)
-
-            return facts[:3]  # Max 3 facts
+            return facts[:3]
     except Exception as e:
         logger.error(f"Failed to extract facts: {e}")
         return []
@@ -976,7 +865,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # Fallback to regex if LLM fails
         if not facts:
-            facts = await extract_facts_from_response(question, answer, user_name)
+            facts = extract_facts_from_response(question, answer, user_name)
 
         for fact in facts:
             if chat_id == user_id:
