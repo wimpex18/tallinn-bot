@@ -137,97 +137,115 @@ def classify_intent(text: str) -> str:
     return "factcheck"
 
 
-# ============ BRAVE SEARCH WITH SUMMARIZER ============
+# ============ BRAVE SEARCH APIs ============
 
-async def query_brave_summarizer(query: str) -> str:
-    """
-    Query Brave Search API with AI Summarizer for intelligent answers.
-    Two-step process: 1) Web search with summary=1, 2) Get AI summary.
-    """
-    global brave_last_request, http_client
-
-    if not BRAVE_API_KEY:
-        logger.warning("Brave API key not configured")
-        return None
-
-    # Rate limiting
+async def _brave_rate_limit():
+    """Enforce Brave API rate limit (1 req/sec for free tier)."""
+    global brave_last_request
     now = time.time()
     if now - brave_last_request < BRAVE_RATE_LIMIT_SECONDS:
         await asyncio.sleep(BRAVE_RATE_LIMIT_SECONDS - (now - brave_last_request))
+    brave_last_request = time.time()
 
-    # Add Tallinn context
-    if not any(loc in query.lower() for loc in ["tallinn", "таллинн", "таллин"]):
+
+async def query_brave_web(query: str, add_tallinn: bool = True) -> str:
+    """
+    Brave Web Search for local queries (bars, events, places).
+    Returns formatted search results.
+    """
+    global http_client
+
+    if not BRAVE_API_KEY:
+        return None
+
+    await _brave_rate_limit()
+
+    # Add Tallinn for local queries
+    if add_tallinn and not any(loc in query.lower() for loc in ["tallinn", "таллинн", "таллин"]):
         query = f"{query} Tallinn"
 
-    logger.info(f"Brave Summarizer query: {query}")
-
-    headers = {
-        "Accept": "application/json",
-        "X-Subscription-Token": BRAVE_API_KEY,
-    }
+    logger.info(f"Brave Web: {query}")
 
     try:
-        brave_last_request = time.time()
-        client = http_client or httpx.AsyncClient(timeout=20.0)
-
-        # Step 1: Web search with summary flag
-        search_params = {
-            "q": query,
-            "summary": 1,  # Enable summarizer
-            "count": 5,
-            "country": "EE",
-            "freshness": "pw",  # Past week for freshest results
-        }
-
-        search_response = await client.get(
+        client = http_client or httpx.AsyncClient(timeout=15.0)
+        response = await client.get(
             "https://api.search.brave.com/res/v1/web/search",
-            headers=headers,
-            params=search_params,
+            headers={"X-Subscription-Token": BRAVE_API_KEY},
+            params={"q": query, "count": 5, "country": "EE", "freshness": "pw"},
         )
-        search_response.raise_for_status()
-        search_data = search_response.json()
+        response.raise_for_status()
+        data = response.json()
 
-        # Get summarizer key
-        summarizer_key = search_data.get("summarizer", {}).get("key")
+        results = []
+        for r in data.get("web", {}).get("results", [])[:4]:
+            title = r.get("title", "")
+            desc = r.get("description", "")[:120]
+            url = r.get("url", "")
+            if title:
+                results.append(f"• {title}\n  {desc}\n  {url}")
 
-        if summarizer_key:
-            # Step 2: Get AI summary
-            summary_response = await client.get(
-                "https://api.search.brave.com/res/v1/summarizer/search",
-                headers=headers,
-                params={"key": summarizer_key, "entity_info": 1},
-            )
-            summary_response.raise_for_status()
-            summary_data = summary_response.json()
+        return "\n\n".join(results) if results else None
 
-            if summary_data.get("status") == "complete":
-                summary_text = summary_data.get("summary", [{}])[0].get("data", "")
-                if summary_text:
-                    logger.info("Brave Summarizer returned result")
-                    return summary_text
-
-        # Fallback: format web results if no summary
-        web_results = search_data.get("web", {}).get("results", [])
-        if web_results:
-            results = []
-            for r in web_results[:3]:
-                title = r.get("title", "")
-                desc = r.get("description", "")[:100]
-                url = r.get("url", "")
-                if title:
-                    results.append(f"• {title}: {desc}... ({url})")
-            if results:
-                logger.info("Brave returning web results (no summary)")
-                return "\n".join(results)
-
-        return None
-
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Brave API error: {e.response.status_code}")
-        return None
     except Exception as e:
-        logger.error(f"Brave error: {e}")
+        logger.error(f"Brave Web error: {e}")
         return None
+
+
+async def query_brave_news(query: str) -> str:
+    """
+    Brave News Search for fact-checking and current events.
+    Returns news articles from reputable sources.
+    """
+    global http_client
+
+    if not BRAVE_API_KEY:
+        return None
+
+    await _brave_rate_limit()
+    logger.info(f"Brave News: {query}")
+
+    try:
+        client = http_client or httpx.AsyncClient(timeout=15.0)
+        response = await client.get(
+            "https://api.search.brave.com/res/v1/news/search",
+            headers={"X-Subscription-Token": BRAVE_API_KEY},
+            params={"q": query, "count": 5, "freshness": "pm"},  # Past month
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        results = []
+        for r in data.get("results", [])[:4]:
+            title = r.get("title", "")
+            desc = r.get("description", "")[:120]
+            url = r.get("url", "")
+            source = r.get("meta_url", {}).get("hostname", "")
+            if title:
+                source_str = f" [{source}]" if source else ""
+                results.append(f"• {title}{source_str}\n  {desc}\n  {url}")
+
+        return "\n\n".join(results) if results else None
+
+    except Exception as e:
+        logger.error(f"Brave News error: {e}")
+        return None
+
+
+def extract_search_topic(text: str, urls: list[str] = None) -> str:
+    """Extract main topic from text/URL for searching."""
+    # Remove common prefixes and bot mentions
+    text = re.sub(r'@\w+', '', text).strip()
+    text = re.sub(r'^(это правда|правда ли|проверь|что думаешь|fake|fact.?check)\s*[?:]*\s*', '', text, flags=re.I)
+
+    # If there's a URL, try to extract topic from text around it
+    if urls:
+        # Remove URL from text to get the question/topic
+        for url in urls:
+            text = text.replace(url, '').strip()
+
+    # Clean up and limit length
+    text = ' '.join(text.split())[:200]
+    return text if text else None
 
 
 # ============ MEMORY FUNCTIONS ============
@@ -1070,38 +1088,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             photo_urls.append(photo_url)
             logger.info(f"Added photo from replied message")
 
-    # Smart routing: decide between Brave Search and Perplexity
-    # Use Perplexity for: referenced content, photos, fact-checking, complex queries
-    # Use Brave for: simple local queries (events, places, restaurants)
+    # Smart routing: Brave for search, Perplexity only for photos
+    # Photos → Perplexity (only option for vision)
+    # URLs/forwarded → Brave News (fact-check with news sources)
+    # Local queries → Brave Web (places, events)
+    # Other questions → Brave News or Web
 
-    use_brave = False
     answer = None
+    api_used = "none"
 
-    # Determine routing
-    if referenced_content or photo_urls:
-        # Always use Perplexity for content analysis and photos
-        use_brave = False
-        logger.info(f"Routing to Perplexity (has content/photos)")
-    else:
-        intent = classify_intent(question)
-        use_brave = (intent == "local") and BRAVE_API_KEY
-        logger.info(f"Intent: {intent}, routing to {'Brave' if use_brave else 'Perplexity'}")
+    # Extract URLs from question for context
+    question_urls = extract_urls(question) if question else []
 
-    logger.info(f"Query from {user_id} ({user_name}): {question[:50]}... [has_ref={referenced_content is not None}, photos={len(photo_urls)}, api={'brave' if use_brave else 'perplexity'}]")
+    logger.info(f"Query from {user_id} ({user_name}): {question[:50]}... [ref={referenced_content is not None}, photos={len(photo_urls)}, urls={len(question_urls)}]")
 
-    if use_brave:
-        # Try Brave Search first for local queries
-        answer = await query_brave_summarizer(question)
-        if answer:
-            # Format as a friendly response
-            answer = f"Вот что нашёл:\n\n{answer}"
-        else:
-            # Fall back to Perplexity if Brave fails
-            logger.info("Brave search returned no results, falling back to Perplexity")
-            use_brave = False
-
-    if not use_brave or not answer:
-        # Use Perplexity for fact-checking, analysis, and fallback
+    # Route 1: Photos → Perplexity (only option for image analysis)
+    if photo_urls:
+        api_used = "perplexity"
+        logger.info("Routing to Perplexity (photo analysis)")
         answer = await query_perplexity(
             question=question,
             referenced_content=referenced_content,
@@ -1109,7 +1113,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             context=conv_context,
             user_facts=user_facts,
             group_facts=group_facts,
-            photo_urls=photo_urls if photo_urls else None,
+            photo_urls=photo_urls,
+        )
+
+    # Route 2: URLs or forwarded content → Brave News (fact-check)
+    elif (referenced_content or question_urls) and BRAVE_API_KEY:
+        api_used = "brave_news"
+        # Extract topic for news search
+        search_topic = extract_search_topic(question, question_urls)
+        if referenced_content:
+            # Get first 100 chars of referenced content as context
+            ref_snippet = referenced_content[:100].replace("[Forwarded post]:", "").replace("[Message with links]:", "").strip()
+            search_topic = f"{search_topic} {ref_snippet}" if search_topic else ref_snippet
+
+        logger.info(f"Routing to Brave News: {search_topic[:50]}")
+        answer = await query_brave_news(search_topic)
+        if answer:
+            answer = f"Вот что пишут источники:\n\n{answer}"
+
+    # Route 3: Local queries → Brave Web
+    elif BRAVE_API_KEY:
+        intent = classify_intent(question)
+        if intent == "local":
+            api_used = "brave_web"
+            logger.info(f"Routing to Brave Web (local query)")
+            answer = await query_brave_web(question)
+            if answer:
+                answer = f"Вот что нашёл:\n\n{answer}"
+        else:
+            # Fact-check type questions → Brave News
+            api_used = "brave_news"
+            logger.info(f"Routing to Brave News (fact-check)")
+            answer = await query_brave_news(question)
+            if answer:
+                answer = f"Вот что пишут:\n\n{answer}"
+
+    # Fallback to Perplexity if Brave returned nothing
+    if not answer:
+        if api_used != "perplexity":
+            logger.info(f"Brave returned nothing, falling back to Perplexity")
+        api_used = "perplexity"
+        answer = await query_perplexity(
+            question=question,
+            referenced_content=referenced_content,
+            user_name=user_name,
+            context=conv_context,
+            user_facts=user_facts,
+            group_facts=group_facts,
+            photo_urls=None,
         )
 
     # Set rate limit AFTER successful query
