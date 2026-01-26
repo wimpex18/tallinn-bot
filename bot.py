@@ -151,7 +151,7 @@ async def _brave_rate_limit():
 async def query_brave_web(query: str, add_tallinn: bool = True) -> str:
     """
     Brave Web Search for local queries (bars, events, places).
-    Returns formatted search results.
+    Searches Reddit, TripAdvisor, Google Maps reviews for fresh info.
     """
     global http_client
 
@@ -160,26 +160,48 @@ async def query_brave_web(query: str, add_tallinn: bool = True) -> str:
 
     await _brave_rate_limit()
 
-    # Add Tallinn for local queries
-    if add_tallinn and not any(loc in query.lower() for loc in ["tallinn", "таллинн", "таллин"]):
-        query = f"{query} Tallinn"
+    # Translate common Russian keywords to English for better search
+    query_en = query.lower()
+    translations = {
+        "крафтовые бары": "craft beer bars",
+        "крафтовый бар": "craft beer bar",
+        "крафт": "craft beer",
+        "бары": "bars",
+        "бар": "bar",
+        "ресторан": "restaurant",
+        "рестораны": "restaurants",
+        "концерт": "concert",
+        "концерты": "concerts",
+        "куда сходить": "things to do",
+        "куда пойти": "where to go",
+        "посоветуй": "best",
+        "артхаус": "arthouse cinema",
+        "винил": "vinyl records",
+        "книжный": "bookstore",
+    }
+    for ru, en in translations.items():
+        if ru in query_en:
+            query_en = query_en.replace(ru, en)
 
-    logger.info(f"Brave Web: {query}")
+    # Add location and fresh sources hint
+    search_query = f"{query_en} Tallinn 2024 reddit OR tripadvisor OR review"
+
+    logger.info(f"Brave Web: {search_query}")
 
     try:
         client = http_client or httpx.AsyncClient(timeout=15.0)
         response = await client.get(
             "https://api.search.brave.com/res/v1/web/search",
             headers={"X-Subscription-Token": BRAVE_API_KEY},
-            params={"q": query, "count": 5, "country": "EE", "freshness": "pw"},
+            params={"q": search_query, "count": 10, "country": "EE"},
         )
         response.raise_for_status()
         data = response.json()
 
         results = []
-        for r in data.get("web", {}).get("results", [])[:4]:
+        for r in data.get("web", {}).get("results", [])[:6]:
             title = r.get("title", "")
-            desc = r.get("description", "")[:120]
+            desc = r.get("description", "")[:150]
             url = r.get("url", "")
             if title:
                 results.append(f"• {title}\n  {desc}\n  {url}")
@@ -209,15 +231,15 @@ async def query_brave_news(query: str) -> str:
         response = await client.get(
             "https://api.search.brave.com/res/v1/news/search",
             headers={"X-Subscription-Token": BRAVE_API_KEY},
-            params={"q": query, "count": 5, "freshness": "pm"},  # Past month
+            params={"q": query, "count": 10},  # No freshness filter
         )
         response.raise_for_status()
         data = response.json()
 
         results = []
-        for r in data.get("results", [])[:4]:
+        for r in data.get("results", [])[:5]:
             title = r.get("title", "")
-            desc = r.get("description", "")[:120]
+            desc = r.get("description", "")[:150]
             url = r.get("url", "")
             source = r.get("meta_url", {}).get("hostname", "")
             if title:
@@ -527,39 +549,30 @@ async def query_perplexity(
 ) -> str:
     """Query Perplexity API with context, memory, and photos."""
 
-    system_prompt = """Ты друг в чате для русскоязычных в ТАЛЛИННЕ (Эстония). Отвечаешь КОРОТКО - 1-2 предложения.
+    system_prompt = """Ты дружелюбный помощник для русскоязычных в ТАЛЛИННЕ (Эстония).
 
-КРИТИЧНО - ТОЛЬКО ТАЛЛИНН:
-- ТЫ ЗНАЕШЬ ТОЛЬКО ПРО ТАЛЛИНН, ЭСТОНИЯ
-- НИКОГДА не рекомендуй места в других городах (Москва, Питер и т.д.)
-- Если спрашивают "куда сходить" - ТОЛЬКО места в Таллинне
-- Ищи актуальные события в Таллинне на эту неделю
+ЛОКАЦИЯ: Только Таллинн и Эстония. Не рекомендуй места из других городов.
 
-ВКУСЫ ГРУППЫ - мы любим андеграунд, контркультуру, DIY, крафт, винил, артхаус, локальную сцену. НЕ любим мейнстрим, гламур, туристическое.
+НАШИ ВКУСЫ:
+Мы любим: андеграунд, контркультуру, DIY, крафтовое пиво, винил, артхаус кино, живую музыку, локальные бары с характером, независимые книжные, галереи.
+Не любим: мейнстрим, гламур, туристические места, сетевые заведения.
 
-ПРО МЕСТА - если спрашивают про бары/рестораны/места:
-- Ищи актуальную информацию в интернете
-- Проверяй что место существует и работает сейчас
-- Если не можешь найти актуальную инфу - скажи "загугли" или "не знаю что сейчас работает"
+СТИЛЬ ОТВЕТА:
+- Дружелюбный и проактивный, как друг который шарит в городе
+- Давай 3-5 конкретных рекомендаций когда спрашивают про места
+- Указывай название, район, и почему это место крутое
+- Используй "ты", не "вы"
+- Без эмодзи, можно ) или ( после слова
 
-СТРОГИЕ ПРАВИЛА:
-- Максимум 1-2 предложения
-- Только "ты", никогда "вы"
-- Без эмодзи. Только ) или ( после слова
-- При рекомендации укажи название и район
+ПРО МЕСТА:
+- ВСЕГДА ищи актуальную информацию в интернете перед ответом
+- Проверяй что место до сих пор работает (ищи отзывы 2024-2025)
+- Если не уверен что место открыто - честно скажи "проверь что работает"
+- Лучше сказать "не знаю" чем дать устаревшую инфу
 
-Фото:
-- Селфи/портрет: короткий комплимент
-- Мем: короткая реакция
-- Меню/афиша: ответь конкретно
+ФОТО: Опиши что видишь, ответь по существу на вопрос о фото.
 
-Ссылки:
-- ОТКРОЙ и проанализируй ссылки из контента
-- Используй реальные данные со ссылок, не выдумывай
-- Кратко изложи суть статьи/поста
-- Если нашёл статью/источник - ПРИКРЕПИ ссылку на него
-
-Если не знаешь про конкретное место в Таллинне - скажи что не знаешь."""
+ССЫЛКИ: Открой и проанализируй, дай краткую суть."""
 
     # Add memory context
     if user_facts:
@@ -616,8 +629,8 @@ async def query_perplexity(
     payload = {
         "model": "sonar",
         "messages": messages,
-        "max_tokens": 150,
-        "temperature": 0.3,
+        "max_tokens": 500,  # Longer responses with more suggestions
+        "temperature": 0.5,  # Slightly more creative
     }
 
     try:
