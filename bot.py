@@ -1,14 +1,10 @@
 import os
 import re
 import time
-import json
 import logging
 import base64
-import asyncio
 from collections import defaultdict
 from datetime import datetime
-from urllib.parse import urlparse
-from io import BytesIO
 
 import httpx
 import redis
@@ -33,15 +29,13 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REDIS_URL = os.getenv("REDIS_URL")
-BRAVE_API_KEY = os.getenv("BRAVE_API_KEY")
 
 # Rate limiting - only track AFTER successful query
 user_last_query: dict[int, float] = defaultdict(float)
 RATE_LIMIT_SECONDS = 5  # 5 seconds between queries per user
 
-# Brave Search rate limiting (1 request per second for free tier)
-brave_last_request: float = 0.0
-BRAVE_RATE_LIMIT_SECONDS = 1.0
+# Brave API removed - Perplexity Sonar has built-in web search
+# that works better than routing through multiple APIs
 
 # Conversation context: store last N messages per chat
 CONTEXT_SIZE = 10
@@ -71,203 +65,6 @@ if REDIS_URL:
 http_client: httpx.AsyncClient = None
 
 
-# ============ INTENT CLASSIFICATION ============
-
-# Keywords for routing queries to Brave vs Perplexity
-LOCAL_KEYWORDS = {
-    "tallinn", "таллинн", "таллин", "estonia", "эстония", "эстонии",
-    "event", "events", "ивент", "ивенты", "мероприятие", "мероприятия",
-    "concert", "концерт", "концерты", "gig", "выступление",
-    "restaurant", "ресторан", "рестораны", "кафе", "cafe",
-    "bar", "бар", "бары", "pub", "паб", "club", "клуб",
-    "where to", "куда", "куда сходить", "куда пойти", "где",
-    "places", "место", "места", "заведение", "заведения",
-    "what's happening", "что происходит", "что идёт", "что идет",
-    "weekend", "выходные", "вечером", "сегодня", "завтра", "tonight",
-    "афиша", "poster", "schedule", "расписание",
-    "craft", "крафт", "крафтовое", "vinyl", "винил", "пластинки",
-    "bookstore", "книжный", "arthaus", "артхаус", "screening", "показ",
-}
-
-FACTCHECK_KEYWORDS = {
-    "true", "правда", "fake", "фейк", "real", "настоящий", "ложь", "враньё",
-    "why", "почему", "зачем", "explain", "объясни", "расскажи",
-    "is it", "это", "what happened", "что случилось", "что произошло",
-    "fact check", "fact-check", "factcheck", "проверь", "проверить",
-    "verify", "верифицируй", "подтверди", "опровергни",
-    "источник", "source", "откуда", "кто сказал",
-    "анализ", "analyze", "analysis", "разбор",
-}
-
-
-def classify_intent(text: str) -> str:
-    """
-    Classify query intent to route to appropriate API.
-    Returns: 'local' for Brave Search, 'factcheck' for Perplexity
-    """
-    if not text:
-        return "factcheck"
-
-    text_lower = text.lower()
-    words = set(re.findall(r'\w+', text_lower))
-
-    # Check for local keywords
-    local_score = len(words & LOCAL_KEYWORDS)
-
-    # Check for fact-check keywords
-    factcheck_score = len(words & FACTCHECK_KEYWORDS)
-
-    # Boost local score for common patterns
-    if any(phrase in text_lower for phrase in ["куда сходить", "куда пойти", "где поесть", "где выпить", "что посетить"]):
-        local_score += 3
-    if any(phrase in text_lower for phrase in ["на выходных", "на этой неделе", "сегодня вечером", "this weekend"]):
-        local_score += 2
-
-    # Boost factcheck score for analysis patterns
-    if any(phrase in text_lower for phrase in ["это правда", "правда ли", "это фейк", "что думаешь"]):
-        factcheck_score += 3
-
-    # If query has referenced content (forwarded post, URL), prefer Perplexity
-    # This is handled in the caller
-
-    logger.info(f"Intent classification: local={local_score}, factcheck={factcheck_score}")
-
-    if local_score > factcheck_score and local_score >= 1:
-        return "local"
-    return "factcheck"
-
-
-# ============ BRAVE SEARCH APIs ============
-
-async def _brave_rate_limit():
-    """Enforce Brave API rate limit (1 req/sec for free tier)."""
-    global brave_last_request
-    now = time.time()
-    if now - brave_last_request < BRAVE_RATE_LIMIT_SECONDS:
-        await asyncio.sleep(BRAVE_RATE_LIMIT_SECONDS - (now - brave_last_request))
-    brave_last_request = time.time()
-
-
-async def query_brave_web(query: str, add_tallinn: bool = True) -> str:
-    """
-    Brave Web Search for local queries (bars, events, places).
-    Searches Reddit, TripAdvisor, Google Maps reviews for fresh info.
-    """
-    global http_client
-
-    if not BRAVE_API_KEY:
-        return None
-
-    await _brave_rate_limit()
-
-    # Translate common Russian keywords to English for better search
-    query_en = query.lower()
-    translations = {
-        "крафтовые бары": "craft beer bars",
-        "крафтовый бар": "craft beer bar",
-        "крафт": "craft beer",
-        "бары": "bars",
-        "бар": "bar",
-        "ресторан": "restaurant",
-        "рестораны": "restaurants",
-        "концерт": "concert",
-        "концерты": "concerts",
-        "куда сходить": "things to do",
-        "куда пойти": "where to go",
-        "посоветуй": "best",
-        "артхаус": "arthouse cinema",
-        "винил": "vinyl records",
-        "книжный": "bookstore",
-    }
-    for ru, en in translations.items():
-        if ru in query_en:
-            query_en = query_en.replace(ru, en)
-
-    # Add location and fresh sources hint
-    search_query = f"{query_en} Tallinn 2024 reddit OR tripadvisor OR review"
-
-    logger.info(f"Brave Web: {search_query}")
-
-    try:
-        client = http_client or httpx.AsyncClient(timeout=15.0)
-        response = await client.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"X-Subscription-Token": BRAVE_API_KEY},
-            params={"q": search_query, "count": 10, "country": "EE"},
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        results = []
-        for r in data.get("web", {}).get("results", [])[:6]:
-            title = r.get("title", "")
-            desc = r.get("description", "")[:150]
-            url = r.get("url", "")
-            if title:
-                results.append(f"• {title}\n  {desc}\n  {url}")
-
-        return "\n\n".join(results) if results else None
-
-    except Exception as e:
-        logger.error(f"Brave Web error: {e}")
-        return None
-
-
-async def query_brave_news(query: str) -> str:
-    """
-    Brave News Search for fact-checking and current events.
-    Returns news articles from reputable sources.
-    """
-    global http_client
-
-    if not BRAVE_API_KEY:
-        return None
-
-    await _brave_rate_limit()
-    logger.info(f"Brave News: {query}")
-
-    try:
-        client = http_client or httpx.AsyncClient(timeout=15.0)
-        response = await client.get(
-            "https://api.search.brave.com/res/v1/news/search",
-            headers={"X-Subscription-Token": BRAVE_API_KEY},
-            params={"q": query, "count": 10},  # No freshness filter
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        results = []
-        for r in data.get("results", [])[:5]:
-            title = r.get("title", "")
-            desc = r.get("description", "")[:150]
-            url = r.get("url", "")
-            source = r.get("meta_url", {}).get("hostname", "")
-            if title:
-                source_str = f" [{source}]" if source else ""
-                results.append(f"• {title}{source_str}\n  {desc}\n  {url}")
-
-        return "\n\n".join(results) if results else None
-
-    except Exception as e:
-        logger.error(f"Brave News error: {e}")
-        return None
-
-
-def extract_search_topic(text: str, urls: list[str] = None) -> str:
-    """Extract main topic from text/URL for searching."""
-    # Remove common prefixes and bot mentions
-    text = re.sub(r'@\w+', '', text).strip()
-    text = re.sub(r'^(это правда|правда ли|проверь|что думаешь|fake|fact.?check)\s*[?:]*\s*', '', text, flags=re.I)
-
-    # If there's a URL, try to extract topic from text around it
-    if urls:
-        # Remove URL from text to get the question/topic
-        for url in urls:
-            text = text.replace(url, '').strip()
-
-    # Clean up and limit length
-    text = ' '.join(text.split())[:200]
-    return text if text else None
 
 
 # ============ MEMORY FUNCTIONS ============
@@ -1138,80 +935,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             photo_urls.append(photo_url)
             logger.info(f"Added photo from replied message")
 
-    # Smart routing: Brave for search, Perplexity only for photos
-    # Photos → Perplexity (only option for vision)
-    # URLs/forwarded → Brave News (fact-check with news sources)
-    # Local queries → Brave Web (places, events)
-    # Other questions → Brave News or Web
+    # Simplified: Use Perplexity Sonar for everything
+    # Perplexity Sonar has built-in web search that works better than routing through Brave
+    # This matches the behavior of the Perplexity mobile app
 
-    answer = None
-    api_used = "none"
+    logger.info(f"Query from {user_id} ({user_name}): {question[:50]}... [ref={referenced_content is not None}, photos={len(photo_urls)}]")
 
-    # Extract URLs from question for context
-    question_urls = extract_urls(question) if question else []
-
-    logger.info(f"Query from {user_id} ({user_name}): {question[:50]}... [ref={referenced_content is not None}, photos={len(photo_urls)}, urls={len(question_urls)}]")
-
-    # Route 1: Photos → Perplexity (only option for image analysis)
-    if photo_urls:
-        api_used = "perplexity"
-        logger.info("Routing to Perplexity (photo analysis)")
-        answer = await query_perplexity(
-            question=question,
-            referenced_content=referenced_content,
-            user_name=user_name,
-            context=conv_context,
-            user_facts=user_facts,
-            group_facts=group_facts,
-            photo_urls=photo_urls,
-        )
-
-    # Route 2: URLs or forwarded content → Brave News (fact-check)
-    elif (referenced_content or question_urls) and BRAVE_API_KEY:
-        api_used = "brave_news"
-        # Extract topic for news search
-        search_topic = extract_search_topic(question, question_urls)
-        if referenced_content:
-            # Get first 100 chars of referenced content as context
-            ref_snippet = referenced_content[:100].replace("[Forwarded post]:", "").replace("[Message with links]:", "").strip()
-            search_topic = f"{search_topic} {ref_snippet}" if search_topic else ref_snippet
-
-        logger.info(f"Routing to Brave News: {search_topic[:50]}")
-        answer = await query_brave_news(search_topic)
-        if answer:
-            answer = f"Вот что пишут источники:\n\n{answer}"
-
-    # Route 3: Local queries → Brave Web
-    elif BRAVE_API_KEY:
-        intent = classify_intent(question)
-        if intent == "local":
-            api_used = "brave_web"
-            logger.info(f"Routing to Brave Web (local query)")
-            answer = await query_brave_web(question)
-            if answer:
-                answer = f"Вот что нашёл:\n\n{answer}"
-        else:
-            # Fact-check type questions → Brave News
-            api_used = "brave_news"
-            logger.info(f"Routing to Brave News (fact-check)")
-            answer = await query_brave_news(question)
-            if answer:
-                answer = f"Вот что пишут:\n\n{answer}"
-
-    # Fallback to Perplexity if Brave returned nothing
-    if not answer:
-        if api_used != "perplexity":
-            logger.info(f"Brave returned nothing, falling back to Perplexity")
-        api_used = "perplexity"
-        answer = await query_perplexity(
-            question=question,
-            referenced_content=referenced_content,
-            user_name=user_name,
-            context=conv_context,
-            user_facts=user_facts,
-            group_facts=group_facts,
-            photo_urls=None,
-        )
+    answer = await query_perplexity(
+        question=question,
+        referenced_content=referenced_content,
+        user_name=user_name,
+        context=conv_context,
+        user_facts=user_facts,
+        group_facts=group_facts,
+        photo_urls=photo_urls if photo_urls else None,
+    )
 
     # Set rate limit AFTER successful query
     set_rate_limit(user_id)
@@ -1286,7 +1024,7 @@ def main() -> None:
 
     logger.info(f"Starting bot @{BOT_USERNAME}")
     logger.info(f"Redis connected: {redis_client is not None}")
-    logger.info(f"Brave Search: {'enabled' if BRAVE_API_KEY else 'disabled'}")
+    logger.info("Using Perplexity Sonar with built-in web search")
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
