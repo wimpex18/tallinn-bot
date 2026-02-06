@@ -1,14 +1,10 @@
 import os
 import re
 import time
-import json
 import logging
 import base64
-import asyncio
 from collections import defaultdict
 from datetime import datetime
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
-from io import BytesIO
 
 import httpx
 import redis
@@ -33,17 +29,12 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REDIS_URL = os.getenv("REDIS_URL")
-BRAVE_API_KEY = os.getenv("BRAVE_API_KEY")
 
-# Rate limiting - only track AFTER successful query
+# Rate limiting
 user_last_query: dict[int, float] = defaultdict(float)
-RATE_LIMIT_SECONDS = 5  # 5 seconds between queries per user
+RATE_LIMIT_SECONDS = 5
 
-# Brave Search rate limiting (1 request per second for free tier)
-brave_last_request: float = 0.0
-BRAVE_RATE_LIMIT_SECONDS = 1.0
-
-# Conversation context: store last N messages per chat
+# Conversation context
 CONTEXT_SIZE = 10
 chat_context: dict[int, list[dict]] = defaultdict(list)
 
@@ -67,207 +58,8 @@ if REDIS_URL:
         logger.warning(f"Redis connection failed, memory disabled: {e}")
         redis_client = None
 
-# Global httpx client for connection pooling (initialized in main)
+# Global httpx client for connection pooling
 http_client: httpx.AsyncClient = None
-
-
-# ============ INTENT CLASSIFICATION ============
-
-# Keywords for routing queries to Brave vs Perplexity
-LOCAL_KEYWORDS = {
-    "tallinn", "таллинн", "таллин", "estonia", "эстония", "эстонии",
-    "event", "events", "ивент", "ивенты", "мероприятие", "мероприятия",
-    "concert", "концерт", "концерты", "gig", "выступление",
-    "restaurant", "ресторан", "рестораны", "кафе", "cafe",
-    "bar", "бар", "бары", "pub", "паб", "club", "клуб",
-    "where to", "куда", "куда сходить", "куда пойти", "где",
-    "places", "место", "места", "заведение", "заведения",
-    "what's happening", "что происходит", "что идёт", "что идет",
-    "weekend", "выходные", "вечером", "сегодня", "завтра", "tonight",
-    "афиша", "poster", "schedule", "расписание",
-    "craft", "крафт", "крафтовое", "vinyl", "винил", "пластинки",
-    "bookstore", "книжный", "arthaus", "артхаус", "screening", "показ",
-}
-
-FACTCHECK_KEYWORDS = {
-    "true", "правда", "fake", "фейк", "real", "настоящий", "ложь", "враньё",
-    "why", "почему", "зачем", "explain", "объясни", "расскажи",
-    "is it", "это", "what happened", "что случилось", "что произошло",
-    "fact check", "fact-check", "factcheck", "проверь", "проверить",
-    "verify", "верифицируй", "подтверди", "опровергни",
-    "источник", "source", "откуда", "кто сказал",
-    "анализ", "analyze", "analysis", "разбор",
-}
-
-
-def classify_intent(text: str) -> str:
-    """
-    Classify query intent to route to appropriate API.
-    Returns: 'local' for Brave Search, 'factcheck' for Perplexity
-    """
-    if not text:
-        return "factcheck"
-
-    text_lower = text.lower()
-    words = set(re.findall(r'\w+', text_lower))
-
-    # Check for local keywords
-    local_score = len(words & LOCAL_KEYWORDS)
-
-    # Check for fact-check keywords
-    factcheck_score = len(words & FACTCHECK_KEYWORDS)
-
-    # Boost local score for common patterns
-    if any(phrase in text_lower for phrase in ["куда сходить", "куда пойти", "где поесть", "где выпить", "что посетить"]):
-        local_score += 3
-    if any(phrase in text_lower for phrase in ["на выходных", "на этой неделе", "сегодня вечером", "this weekend"]):
-        local_score += 2
-
-    # Boost factcheck score for analysis patterns
-    if any(phrase in text_lower for phrase in ["это правда", "правда ли", "это фейк", "что думаешь"]):
-        factcheck_score += 3
-
-    # If query has referenced content (forwarded post, URL), prefer Perplexity
-    # This is handled in the caller
-
-    logger.info(f"Intent classification: local={local_score}, factcheck={factcheck_score}")
-
-    if local_score > factcheck_score and local_score >= 1:
-        return "local"
-    return "factcheck"
-
-
-# ============ BRAVE SEARCH APIs ============
-
-async def _brave_rate_limit():
-    """Enforce Brave API rate limit (1 req/sec for free tier)."""
-    global brave_last_request
-    now = time.time()
-    if now - brave_last_request < BRAVE_RATE_LIMIT_SECONDS:
-        await asyncio.sleep(BRAVE_RATE_LIMIT_SECONDS - (now - brave_last_request))
-    brave_last_request = time.time()
-
-
-async def query_brave_web(query: str, add_tallinn: bool = True) -> str:
-    """
-    Brave Web Search for local queries (bars, events, places).
-    Searches Reddit, TripAdvisor, Google Maps reviews for fresh info.
-    """
-    global http_client
-
-    if not BRAVE_API_KEY:
-        return None
-
-    await _brave_rate_limit()
-
-    # Translate common Russian keywords to English for better search
-    query_en = query.lower()
-    translations = {
-        "крафтовые бары": "craft beer bars",
-        "крафтовый бар": "craft beer bar",
-        "крафт": "craft beer",
-        "бары": "bars",
-        "бар": "bar",
-        "ресторан": "restaurant",
-        "рестораны": "restaurants",
-        "концерт": "concert",
-        "концерты": "concerts",
-        "куда сходить": "things to do",
-        "куда пойти": "where to go",
-        "посоветуй": "best",
-        "артхаус": "arthouse cinema",
-        "винил": "vinyl records",
-        "книжный": "bookstore",
-    }
-    for ru, en in translations.items():
-        if ru in query_en:
-            query_en = query_en.replace(ru, en)
-
-    # Add location and fresh sources hint
-    search_query = f"{query_en} Tallinn 2024 reddit OR tripadvisor OR review"
-
-    logger.info(f"Brave Web: {search_query}")
-
-    try:
-        client = http_client or httpx.AsyncClient(timeout=15.0)
-        response = await client.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"X-Subscription-Token": BRAVE_API_KEY},
-            params={"q": search_query, "count": 10, "country": "EE"},
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        results = []
-        for r in data.get("web", {}).get("results", [])[:6]:
-            title = r.get("title", "")
-            desc = r.get("description", "")[:150]
-            url = r.get("url", "")
-            if title:
-                results.append(f"• {title}\n  {desc}\n  {url}")
-
-        return "\n\n".join(results) if results else None
-
-    except Exception as e:
-        logger.error(f"Brave Web error: {e}")
-        return None
-
-
-async def query_brave_news(query: str) -> str:
-    """
-    Brave News Search for fact-checking and current events.
-    Returns news articles from reputable sources.
-    """
-    global http_client
-
-    if not BRAVE_API_KEY:
-        return None
-
-    await _brave_rate_limit()
-    logger.info(f"Brave News: {query}")
-
-    try:
-        client = http_client or httpx.AsyncClient(timeout=15.0)
-        response = await client.get(
-            "https://api.search.brave.com/res/v1/news/search",
-            headers={"X-Subscription-Token": BRAVE_API_KEY},
-            params={"q": query, "count": 10},  # No freshness filter
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        results = []
-        for r in data.get("results", [])[:5]:
-            title = r.get("title", "")
-            desc = r.get("description", "")[:150]
-            url = r.get("url", "")
-            source = r.get("meta_url", {}).get("hostname", "")
-            if title:
-                source_str = f" [{source}]" if source else ""
-                results.append(f"• {title}{source_str}\n  {desc}\n  {url}")
-
-        return "\n\n".join(results) if results else None
-
-    except Exception as e:
-        logger.error(f"Brave News error: {e}")
-        return None
-
-
-def extract_search_topic(text: str, urls: list[str] = None) -> str:
-    """Extract main topic from text/URL for searching."""
-    # Remove common prefixes and bot mentions
-    text = re.sub(r'@\w+', '', text).strip()
-    text = re.sub(r'^(это правда|правда ли|проверь|что думаешь|fake|fact.?check)\s*[?:]*\s*', '', text, flags=re.I)
-
-    # If there's a URL, try to extract topic from text around it
-    if urls:
-        # Remove URL from text to get the question/topic
-        for url in urls:
-            text = text.replace(url, '').strip()
-
-    # Clean up and limit length
-    text = ' '.join(text.split())[:200]
-    return text if text else None
 
 
 # ============ MEMORY FUNCTIONS ============
@@ -345,11 +137,9 @@ def get_context_string(chat_id: int) -> str:
     if not chat_context[chat_id]:
         return ""
     context_lines = []
-    # Show last 10 messages for better conversation continuity
-    for msg in chat_context[chat_id][-10:]:
+    for msg in chat_context[chat_id][-CONTEXT_SIZE:]:
         name = msg.get("name", "user")
-        content = msg["content"]
-        context_lines.append(f"{name}: {content}")
+        context_lines.append(f"{name}: {msg['content']}")
     return "\n".join(context_lines)
 
 
@@ -894,28 +684,10 @@ def extract_page_text(html: str) -> str:
 
 
 def is_forwarded_message(message) -> bool:
-    """Check if message is forwarded (works with PTB v21+)."""
+    """Check if message is forwarded (PTB v21+ uses forward_origin)."""
     if not message:
         return False
-    # PTB v21+ uses forward_origin instead of forward_date
     return message.forward_origin is not None
-
-
-def is_content_message(message) -> bool:
-    """Check if message has analyzable content (forwarded, has links, etc.)."""
-    if not message:
-        return False
-    content = get_message_content(message)
-    # Has URLs
-    if extract_urls(content):
-        return True
-    # Is forwarded
-    if is_forwarded_message(message):
-        return True
-    # Has substantial text (more than just a few words)
-    if len(content) > 100:
-        return True
-    return False
 
 
 async def download_photo_as_base64(photo, bot) -> str:
@@ -970,106 +742,51 @@ async def query_perplexity(
     photo_urls: list[str] = None,
 ) -> str:
     """Query Perplexity API with context, memory, and photos."""
+    # System prompt - respond in Russian but search in English/Estonian for Tallinn
+    system_prompt = (
+        'Отвечай на русском. Используй "ты". Кратко, 2-4 предложения. Без эмодзи. '
+        'ВАЖНО: При поиске информации о местах, событиях и мероприятиях в Таллинне - '
+        'ищи на АНГЛИЙСКОМ и ЭСТОНСКОМ языках (не на русском), так как большинство '
+        'актуальной информации о Таллинне на этих языках. '
+        'Хорошие источники: Facebook Events, visitestonia.com, tallinn.ee. '
+        'Если не находишь на английском/эстонском - попробуй gloss.ee (русскоязычный сайт о Таллинне).'
+    )
 
-    system_prompt = """Ты друг в чате для русскоязычных в ТАЛЛИННЕ (Эстония). Отвечаешь КОРОТКО - 1-2 предложения.
-
-КРИТИЧНО - ТОЛЬКО ТАЛЛИНН:
-- ТЫ ЗНАЕШЬ ТОЛЬКО ПРО ТАЛЛИНН, ЭСТОНИЯ
-- НИКОГДА не рекомендуй места в других городах (Москва, Питер и т.д.)
-- Если спрашивают "куда сходить" - ТОЛЬКО места в Таллинне
-- Ищи актуальные события в Таллинне на эту неделю
-
-ВКУСЫ ГРУППЫ (учитывай при рекомендациях):
-- Музыка: панк, рок, метал, хип-хоп, андеграунд, инди (НЕ поп, НЕ диско, НЕ мейнстрим)
-- Бары: крафтовое пиво, коктейльные бары, dive bars (НЕ клубы, НЕ гламур)
-- Кино: артхаус, фестивальное, авторское (НЕ блокбастеры)
-- Общее: андеграунд, альтернатива, локальная сцена
-
-ПОИСК СОБЫТИЙ - ОБЯЗАТЕЛЬНО ищи на сайтах:
-- Концерты: sveta.ee, hall.ee, tfrec.com, kultuurikatel.ee, fotografiska.com/tallinn
-- События: facebook.com/events (Tallinn), residentadvisor.net/events/ee, piletilevi.ee
-- Кино: kinosoprus.ee, kino.artis.ee
-- Типы: концерты, DJ сеты, vinyl nights, настолки, артхаус кино, выставки, DIY ивенты
-
-Когда спрашивают "куда сходить" или "что делать":
-- ИЩИ конкретные события на указанную дату
-- Проверь сайты venue напрямую
-- Укажи название события, место, время
-- Если нашёл несколько - дай 2-3 варианта
-
-МЕСТА В ТАЛЛИННЕ:
-- Концерты: Sveta, Hall, Tapper, Kultuurikatel, Fotografiska
-- Бары: Porogen, Tops, Pudel, St. Vitus, Koht, Labor
-- Кино: Sõprus, Artis
-- Районы: Telliskivi, Kalamaja, Rotermann, Noblessner
-
-КОНТЕКСТ РАЗГОВОРА - КРИТИЧНО:
-- ВСЕГДА читай историю разговора перед ответом
-- Новое сообщение часто продолжает предыдущую тему
-- Если пользователь уточняет (дату, время, место) - это про предыдущий вопрос
-- НЕ начинай новую тему, если пользователь продолжает старую
-- Пример: спросили про кино → ответил → сказали "только на сегодня" = уточнение про кино!
-
-СТРОГИЕ ПРАВИЛА:
-- Максимум 1-2 предложения
-- Только "ты", никогда "вы"
-- Без эмодзи. Только ) или ( после слова
-- При рекомендации укажи название и район
-
-Фото:
-- Селфи/портрет: короткий комплимент
-- Мем: короткая реакция
-- Меню/афиша: ответь конкретно
-
-Ссылки:
-- ОТКРОЙ и проанализируй ссылки из контента
-- Используй реальные данные со ссылок, не выдумывай
-- Кратко изложи суть статьи/поста
-- Если нашёл статью/источник - ПРИКРЕПИ ссылку на него
-
-Если не знаешь про конкретное место в Таллинне - скажи что не знаешь."""
-    # Minimal system prompt - let Perplexity search naturally
-    system_prompt = """Отвечай на русском. Используй "ты". Кратко, 2-4 предложения. Без эмодзи."""
-
-    # Add memory context
     if user_facts:
         system_prompt += f"\n\nТы помнишь про этого человека: {', '.join(user_facts[:5])}"
     if group_facts:
         system_prompt += f"\n\nТы помнишь про эту группу: {', '.join(group_facts[:5])}"
 
-    # Build simple user message - let Perplexity search naturally
-    # Add "в Таллинне" if question is about places and doesn't have location
+    # Auto-add location for place/event-related queries
     question_lower = question.lower()
-    needs_location = any(kw in question_lower for kw in [
-        "бар", "ресторан", "кафе", "клуб", "концерт", "кино", "магазин",
-        "куда", "где", "посоветуй", "порекомендуй", "подскажи"
-    ])
-    has_location = any(loc in question_lower for loc in ["таллин", "tallinn", "эстони"])
+    place_keywords = [
+        # Places
+        "бар", "ресторан", "кафе", "клуб", "кино", "магазин", "музей", "театр", "галерея",
+        # Events
+        "концерт", "мероприятие", "событие", "фестиваль", "выставка", "вечеринка", "шоу",
+        "ивент", "event", "афиша", "тусовка", "движ",
+        # Time-related (implies looking for events)
+        "сегодня", "завтра", "выходные", "вечером", "weekend",
+        # Actions
+        "куда", "где", "посоветуй", "порекомендуй", "подскажи", "сходить", "пойти"
+    ]
+    location_keywords = ["таллин", "tallinn", "эстони", "estonia"]
 
-    if context:
-        user_message += f"[ВАЖНО - История разговора (новое сообщение может быть продолжением!)]:\n{context}\n\n"
+    # Append location in English for better search results
+    if any(kw in question_lower for kw in place_keywords) and not any(loc in question_lower for loc in location_keywords):
+        question = f"{question} (Tallinn, Estonia)"
 
-    user_message += f"[Текущее сообщение пользователя]: {question}"
-    if user_name:
-        user_message += f" (from {user_name})"
-    if needs_location and not has_location:
-        question = f"{question} в Таллинне"
-
-    # Keep message simple for better Perplexity search
+    # Build user message
     if referenced_content:
         user_message = f"{referenced_content}\n\nВопрос: {question}"
     else:
         user_message = question
 
-    # Build user message content (with photos if provided)
+    # Build message content (with photos if provided)
     if photo_urls:
-        # Format with images according to Perplexity API docs
         user_content = [{"type": "text", "text": user_message}]
-        for photo_url in photo_urls[:3]:  # Limit to 3 photos
-            user_content.append({
-                "type": "image_url",
-                "image_url": {"url": photo_url}
-            })
+        for photo_url in photo_urls[:3]:
+            user_content.append({"type": "image_url", "image_url": {"url": photo_url}})
         user_message_content = user_content
     else:
         user_message_content = user_message
@@ -1120,25 +837,17 @@ async def query_perplexity(
 
 
 def clean_response(text: str) -> str:
-    """Clean up response: remove citations [1][2] and fix emoticon spacing."""
+    """Clean up response: remove citations and fix emoticon spacing."""
     if not text:
         return text
-
-    # Remove citation brackets like [1], [2], [6], etc.
-    text = re.sub(r'\[\d+\]', '', text)
-
-    # Fix emoticon spacing: " ))" or " (" should be "word))" or "word("
-    # Match space followed by emoticons and move emoticons to previous word
-    text = re.sub(r'\s+(\)+|\(+)', r'\1', text)
-
-    # Clean up any double spaces
+    text = re.sub(r'\[\d+\]', '', text)  # Remove [1], [2] citations
+    text = re.sub(r'\s+(\)+|\(+)', r'\1', text)  # Fix emoticon spacing
     text = re.sub(r'\s+', ' ', text).strip()
-
     return text
 
 
-async def extract_facts_from_response(question: str, answer: str, user_name: str) -> list[str]:
-    """Extract memorable facts from a conversation."""
+def extract_facts_from_response(question: str, answer: str, user_name: str) -> list[str]:
+    """Extract memorable facts from a conversation using regex patterns."""
     facts = []
     patterns = [
         (r"люблю\s+(\w+)", "любит {}"),
@@ -1163,55 +872,49 @@ async def smart_extract_facts(question: str, answer: str, user_name: str, chat_c
     if not question or len(question) < 10:
         return []
 
+    context_part = f"Контекст чата: {chat_context}" if chat_context else ""
     prompt = f"""Извлеки важные факты о пользователе из этого диалога.
 Пользователь: {user_name or 'unknown'}
 
 Вопрос: {question}
 Ответ: {answer}
 
-{"Контекст чата: " + chat_context if chat_context else ""}
+{context_part}
 
 Выдай ТОЛЬКО факты о человеке (интересы, предпочтения, планы, работа, и т.д.)
 Формат: один факт на строку, коротко (3-7 слов)
 Если фактов нет - напиши "НЕТ"
 Максимум 3 факта."""
 
-    headers = {
-        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": "sonar",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 100,
-        "temperature": 0.1,
-    }
-
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
                 "https://api.perplexity.ai/chat/completions",
-                headers=headers,
-                json=payload,
+                headers={
+                    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "sonar",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 100,
+                    "temperature": 0.1,
+                },
             )
             response.raise_for_status()
-            data = response.json()
-            result = data["choices"][0]["message"]["content"].strip()
+            result = response.json()["choices"][0]["message"]["content"].strip()
 
             if "НЕТ" in result.upper() or len(result) < 5:
                 return []
 
-            # Parse facts (one per line)
             facts = []
             for line in result.split("\n"):
                 line = line.strip().lstrip("-•").strip()
-                if line and len(line) > 3 and len(line) < 100:
+                if 3 < len(line) < 100:
                     if user_name and not line.startswith(user_name):
                         line = f"{user_name}: {line}"
                     facts.append(line)
-
-            return facts[:3]  # Max 3 facts
+            return facts[:3]
     except Exception as e:
         logger.error(f"Failed to extract facts: {e}")
         return []
@@ -1559,80 +1262,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             photo_urls.append(photo_url)
             logger.info(f"Added photo from replied message")
 
-    # Smart routing: Brave for search, Perplexity only for photos
-    # Photos → Perplexity (only option for vision)
-    # URLs/forwarded → Brave News (fact-check with news sources)
-    # Local queries → Brave Web (places, events)
-    # Other questions → Brave News or Web
+    # Simplified: Use Perplexity Sonar for everything
+    # Perplexity Sonar has built-in web search that works better than routing through Brave
+    # This matches the behavior of the Perplexity mobile app
 
-    answer = None
-    api_used = "none"
+    logger.info(f"Query from {user_id} ({user_name}): {question[:50]}... [ref={referenced_content is not None}, photos={len(photo_urls)}]")
 
-    # Extract URLs from question for context
-    question_urls = extract_urls(question) if question else []
-
-    logger.info(f"Query from {user_id} ({user_name}): {question[:50]}... [ref={referenced_content is not None}, photos={len(photo_urls)}, urls={len(question_urls)}]")
-
-    # Route 1: Photos → Perplexity (only option for image analysis)
-    if photo_urls:
-        api_used = "perplexity"
-        logger.info("Routing to Perplexity (photo analysis)")
-        answer = await query_perplexity(
-            question=question,
-            referenced_content=referenced_content,
-            user_name=user_name,
-            context=conv_context,
-            user_facts=user_facts,
-            group_facts=group_facts,
-            photo_urls=photo_urls,
-        )
-
-    # Route 2: URLs or forwarded content → Brave News (fact-check)
-    elif (referenced_content or question_urls) and BRAVE_API_KEY:
-        api_used = "brave_news"
-        # Extract topic for news search
-        search_topic = extract_search_topic(question, question_urls)
-        if referenced_content:
-            # Get first 100 chars of referenced content as context
-            ref_snippet = referenced_content[:100].replace("[Forwarded post]:", "").replace("[Message with links]:", "").strip()
-            search_topic = f"{search_topic} {ref_snippet}" if search_topic else ref_snippet
-
-        logger.info(f"Routing to Brave News: {search_topic[:50]}")
-        answer = await query_brave_news(search_topic)
-        if answer:
-            answer = f"Вот что пишут источники:\n\n{answer}"
-
-    # Route 3: Local queries → Brave Web
-    elif BRAVE_API_KEY:
-        intent = classify_intent(question)
-        if intent == "local":
-            api_used = "brave_web"
-            logger.info(f"Routing to Brave Web (local query)")
-            answer = await query_brave_web(question)
-            if answer:
-                answer = f"Вот что нашёл:\n\n{answer}"
-        else:
-            # Fact-check type questions → Brave News
-            api_used = "brave_news"
-            logger.info(f"Routing to Brave News (fact-check)")
-            answer = await query_brave_news(question)
-            if answer:
-                answer = f"Вот что пишут:\n\n{answer}"
-
-    # Fallback to Perplexity if Brave returned nothing
-    if not answer:
-        if api_used != "perplexity":
-            logger.info(f"Brave returned nothing, falling back to Perplexity")
-        api_used = "perplexity"
-        answer = await query_perplexity(
-            question=question,
-            referenced_content=referenced_content,
-            user_name=user_name,
-            context=conv_context,
-            user_facts=user_facts,
-            group_facts=group_facts,
-            photo_urls=None,
-        )
+    answer = await query_perplexity(
+        question=question,
+        referenced_content=referenced_content,
+        user_name=user_name,
+        context=conv_context,
+        user_facts=user_facts,
+        group_facts=group_facts,
+        photo_urls=photo_urls if photo_urls else None,
+    )
 
     # Set rate limit AFTER successful query
     set_rate_limit(user_id)
@@ -1659,7 +1303,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # Fallback to regex if LLM fails
         if not facts:
-            facts = await extract_facts_from_response(question, answer, user_name)
+            facts = extract_facts_from_response(question, answer, user_name)
 
         for fact in facts:
             if chat_id == user_id:
@@ -1707,7 +1351,7 @@ def main() -> None:
 
     logger.info(f"Starting bot @{BOT_USERNAME}")
     logger.info(f"Redis connected: {redis_client is not None}")
-    logger.info(f"Brave Search: {'enabled' if BRAVE_API_KEY else 'disabled'}")
+    logger.info("Using Perplexity Sonar with built-in web search")
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
