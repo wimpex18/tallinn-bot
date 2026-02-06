@@ -1,4 +1,6 @@
 python-telegram-bot[webhooks]==21.9
-httpx[http2]==0.28.1
+httpx==0.28.1
+curl_cffi>=0.9
+trafilatura>=2.0
 python-dotenv==1.0.1
 redis==5.0.1
