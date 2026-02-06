@@ -7,7 +7,7 @@ import base64
 import asyncio
 from collections import defaultdict
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 from io import BytesIO
 
 import httpx
@@ -426,50 +426,471 @@ def get_message_content(message) -> str:
     return ""
 
 
-async def fetch_url_content(url: str) -> str:
-    """Fetch webpage content and extract text."""
+def clean_url(url: str) -> str:
+    """Remove tracking parameters from URL (fbclid, utm_*, etc.)."""
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5,ru;q=0.3",
+        parsed = urlparse(url)
+        # Parse query parameters
+        params = parse_qs(parsed.query, keep_blank_values=False)
+
+        # List of tracking parameters to remove
+        tracking_params = {
+            'fbclid', 'gclid', 'utm_source', 'utm_medium', 'utm_campaign',
+            'utm_term', 'utm_content', 'ref', 'source', 'mc_cid', 'mc_eid',
+            'aem_', '_ga', 'yclid', 'wickedid', 'twclid', 'ttclid'
         }
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            html = response.text
 
-            # Simple HTML to text extraction
-            # Remove script and style elements
-            html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
-            html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
-            html = re.sub(r'<nav[^>]*>.*?</nav>', '', html, flags=re.DOTALL | re.IGNORECASE)
-            html = re.sub(r'<footer[^>]*>.*?</footer>', '', html, flags=re.DOTALL | re.IGNORECASE)
-            html = re.sub(r'<header[^>]*>.*?</header>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        # Filter out tracking parameters
+        cleaned_params = {
+            k: v for k, v in params.items()
+            if k.lower() not in tracking_params and not k.lower().startswith(('utm_', 'aem_'))
+        }
 
-            # Remove all HTML tags
-            text = re.sub(r'<[^>]+>', ' ', html)
+        # Rebuild query string
+        new_query = urlencode(cleaned_params, doseq=True)
 
-            # Clean up whitespace
-            text = re.sub(r'\s+', ' ', text).strip()
+        # Rebuild URL
+        cleaned = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            new_query,
+            ''  # Remove fragment
+        ))
 
-            # Decode HTML entities
-            text = text.replace('&nbsp;', ' ')
-            text = text.replace('&amp;', '&')
-            text = text.replace('&lt;', '<')
-            text = text.replace('&gt;', '>')
-            text = text.replace('&quot;', '"')
-            text = text.replace('&#39;', "'")
+        return cleaned
+    except Exception:
+        return url
 
-            # Limit to first 3000 chars (enough for article summary)
-            if len(text) > 3000:
-                text = text[:3000] + "..."
 
-            logger.info(f"Fetched {len(text)} chars from {url}")
-            return text
+def extract_metadata(html: str) -> dict:
+    """Extract metadata from HTML (og:*, meta description, title, JSON-LD)."""
+    metadata = {}
+
+    # Extract <title>
+    title_match = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
+    if title_match:
+        metadata['title'] = title_match.group(1).strip()
+
+    # Extract Open Graph tags (og:title, og:description, og:type, etc.)
+    og_patterns = [
+        ('og_title', r'<meta[^>]*property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']'),
+        ('og_title', r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*property=["\']og:title["\']'),
+        ('og_description', r'<meta[^>]*property=["\']og:description["\'][^>]*content=["\']([^"\']+)["\']'),
+        ('og_description', r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*property=["\']og:description["\']'),
+        ('og_site_name', r'<meta[^>]*property=["\']og:site_name["\'][^>]*content=["\']([^"\']+)["\']'),
+        ('og_site_name', r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*property=["\']og:site_name["\']'),
+    ]
+
+    for key, pattern in og_patterns:
+        if key not in metadata:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                metadata[key] = match.group(1).strip()
+
+    # Extract meta description
+    desc_patterns = [
+        r'<meta[^>]*name=["\']description["\'][^>]*content=["\']([^"\']+)["\']',
+        r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*name=["\']description["\']',
+    ]
+    for pattern in desc_patterns:
+        if 'description' not in metadata:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                metadata['description'] = match.group(1).strip()
+
+    # Extract JSON-LD structured data (events, products, etc.)
+    jsonld_match = re.search(
+        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        re.DOTALL | re.IGNORECASE
+    )
+    if jsonld_match:
+        try:
+            jsonld_text = jsonld_match.group(1).strip()
+            jsonld_data = json.loads(jsonld_text)
+
+            # Handle array of objects
+            if isinstance(jsonld_data, list):
+                for item in jsonld_data:
+                    if isinstance(item, dict):
+                        extract_jsonld_event(item, metadata)
+            elif isinstance(jsonld_data, dict):
+                extract_jsonld_event(jsonld_data, metadata)
+        except json.JSONDecodeError:
+            pass
+
+    return metadata
+
+
+def extract_jsonld_event(data: dict, metadata: dict) -> None:
+    """Extract event data from JSON-LD structured data."""
+    schema_type = data.get('@type', '')
+
+    # Handle Event type
+    if schema_type == 'Event' or 'Event' in str(schema_type):
+        if 'name' in data:
+            metadata['event_name'] = data['name']
+        if 'startDate' in data:
+            metadata['event_date'] = data['startDate']
+        if 'endDate' in data:
+            metadata['event_end_date'] = data['endDate']
+        if 'description' in data:
+            metadata['event_description'] = data['description']
+
+        # Location info
+        location = data.get('location', {})
+        if isinstance(location, dict):
+            if 'name' in location:
+                metadata['venue'] = location['name']
+            address = location.get('address', {})
+            if isinstance(address, dict):
+                metadata['address'] = address.get('streetAddress', '')
+            elif isinstance(address, str):
+                metadata['address'] = address
+
+        # Performer info
+        performer = data.get('performer', {})
+        if isinstance(performer, dict):
+            if 'name' in performer:
+                metadata['performer'] = performer['name']
+        elif isinstance(performer, list) and performer:
+            names = [p.get('name', '') for p in performer if isinstance(p, dict) and 'name' in p]
+            if names:
+                metadata['performer'] = ', '.join(names)
+
+        # Offers/tickets
+        offers = data.get('offers', {})
+        if isinstance(offers, dict):
+            if 'price' in offers:
+                metadata['price'] = f"{offers.get('price', '')} {offers.get('priceCurrency', '')}"
+            if 'url' in offers:
+                metadata['ticket_url'] = offers['url']
+
+
+def format_metadata_text(metadata: dict) -> str:
+    """Format extracted metadata into readable text."""
+    parts = []
+
+    # Event-specific formatting
+    if 'event_name' in metadata:
+        parts.append(f"Event: {metadata['event_name']}")
+    elif 'og_title' in metadata:
+        parts.append(f"Title: {metadata['og_title']}")
+    elif 'title' in metadata:
+        parts.append(f"Title: {metadata['title']}")
+
+    if 'performer' in metadata:
+        parts.append(f"Artist/Performer: {metadata['performer']}")
+
+    if 'event_date' in metadata:
+        parts.append(f"Date: {metadata['event_date']}")
+
+    if 'venue' in metadata:
+        venue_str = metadata['venue']
+        if 'address' in metadata and metadata['address']:
+            venue_str += f", {metadata['address']}"
+        parts.append(f"Venue: {venue_str}")
+
+    if 'price' in metadata:
+        parts.append(f"Price: {metadata['price']}")
+
+    if 'event_description' in metadata:
+        desc = metadata['event_description'][:500]
+        parts.append(f"Description: {desc}")
+    elif 'og_description' in metadata:
+        desc = metadata['og_description'][:500]
+        parts.append(f"Description: {desc}")
+    elif 'description' in metadata:
+        desc = metadata['description'][:500]
+        parts.append(f"Description: {desc}")
+
+    return '\n'.join(parts)
+
+
+# Browser-like headers for different scenarios
+BROWSER_HEADERS = {
+    'chrome': {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    },
+    'firefox': {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    },
+    'safari': {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    }
+}
+
+
+async def fetch_url_content(url: str) -> str:
+    """Fetch webpage content and extract text with improved anti-blocking."""
+    # Clean tracking parameters from URL
+    clean_url_str = clean_url(url)
+    logger.info(f"Fetching URL (cleaned): {clean_url_str}")
+
+    # Try different browser profiles
+    browser_profiles = ['chrome', 'firefox', 'safari']
+    last_error = None
+
+    for profile in browser_profiles:
+        for use_http2 in [True, False]:  # Try HTTP/2 first, then HTTP/1.1
+            try:
+                headers = BROWSER_HEADERS[profile].copy()
+                # Add referer to look more natural
+                parsed = urlparse(clean_url_str)
+                headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
+
+                async with httpx.AsyncClient(
+                    timeout=20.0,
+                    follow_redirects=True,
+                    http2=use_http2
+                ) as client:
+                    response = await client.get(clean_url_str, headers=headers)
+
+                    # Check for soft blocks (403, 429, etc.)
+                    if response.status_code in (403, 429, 503):
+                        html = response.text
+                        # Detect Cloudflare or other bot protection
+                        if is_cloudflare_block(html):
+                            logger.warning(f"Cloudflare/bot protection detected with {profile}")
+                            last_error = "Bot protection (Cloudflare)"
+                            break  # All profiles will fail against Cloudflare
+                        logger.warning(f"Got {response.status_code} with {profile}, trying next")
+                        last_error = f"HTTP {response.status_code}"
+                        continue
+
+                    response.raise_for_status()
+                    html = response.text
+
+                    # Check if we got a challenge page instead of real content
+                    if is_cloudflare_block(html):
+                        logger.warning(f"Got challenge page with {profile}")
+                        last_error = "Bot protection (challenge page)"
+                        break
+
+                    # First, try to extract structured metadata (more reliable)
+                    metadata = extract_metadata(html)
+                    metadata_text = format_metadata_text(metadata)
+
+                    if metadata_text and len(metadata_text) > 50:
+                        logger.info(f"Extracted metadata from {clean_url_str}: {len(metadata_text)} chars")
+                        # Also extract some page content for additional context
+                        page_text = extract_page_text(html)
+                        if page_text:
+                            return f"{metadata_text}\n\n[Page content]:\n{page_text}"
+                        return metadata_text
+
+                    # Fallback to page text extraction
+                    text = extract_page_text(html)
+                    if text:
+                        logger.info(f"Fetched {len(text)} chars from {clean_url_str}")
+                        return text
+
+                    logger.warning(f"No content extracted from {clean_url_str}")
+                    return ""
+
+            except httpx.HTTPStatusError as e:
+                last_error = f"HTTP {e.response.status_code}"
+                logger.warning(f"HTTP error with {profile}: {e.response.status_code}")
+                continue
+            except httpx.TimeoutException:
+                last_error = "Timeout"
+                logger.warning(f"Timeout with {profile}")
+                continue
+            except Exception as e:
+                # HTTP/2 not supported - try HTTP/1.1
+                if 'h2' in str(e).lower() or 'http2' in str(e).lower():
+                    continue
+                last_error = str(e)
+                logger.warning(f"Error with {profile}: {e}")
+                continue
+
+        # If we detected Cloudflare, don't try other profiles
+        if 'Cloudflare' in str(last_error) or 'Bot protection' in str(last_error):
+            break
+
+    # If all profiles failed, try to extract useful info from URL structure
+    logger.error(f"Failed to fetch URL {clean_url_str} after all attempts: {last_error}")
+    url_info = extract_url_info(clean_url_str)
+    if url_info:
+        logger.info(f"Extracted URL info as fallback: {url_info}")
+        return url_info
+    return ""
+
+
+def is_cloudflare_block(html: str) -> bool:
+    """Detect Cloudflare bot protection page."""
+    indicators = [
+        'just a moment',
+        'checking your browser',
+        'cloudflare',
+        'ray id',
+        'please wait',
+        'ddos protection',
+        'enable javascript',
+    ]
+    html_lower = html.lower()
+    return any(indicator in html_lower for indicator in indicators)
+
+
+def extract_url_info(url: str) -> str:
+    """Extract useful information from URL structure when page cannot be fetched."""
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.replace('www.', '')
+        path_parts = [p for p in parsed.path.split('/') if p]
+
+        info_parts = []
+
+        # Known site patterns
+        site_handlers = {
+            'tickettailor.com': parse_tickettailor_url,
+            'eventbrite.com': parse_eventbrite_url,
+            'facebook.com': parse_facebook_url,
+            'piletilevi.ee': parse_piletilevi_url,
+            'fienta.com': parse_fienta_url,
+        }
+
+        for site, handler in site_handlers.items():
+            if site in domain:
+                result = handler(parsed, path_parts)
+                if result:
+                    return result
+
+        # Generic URL info
+        info_parts.append(f"Site: {domain}")
+        if path_parts:
+            # Try to extract meaningful path segments
+            readable_parts = []
+            for part in path_parts:
+                # Skip numeric IDs and common path segments
+                if not part.isdigit() and part not in ['events', 'event', 'tickets', 'ticket', 'e']:
+                    readable_parts.append(part.replace('-', ' ').replace('_', ' '))
+            if readable_parts:
+                info_parts.append(f"Path: {' / '.join(readable_parts)}")
+
+        return '\n'.join(info_parts) if info_parts else ""
     except Exception as e:
-        logger.error(f"Failed to fetch URL {url}: {e}")
+        logger.error(f"Error extracting URL info: {e}")
         return ""
+
+
+def parse_tickettailor_url(parsed, path_parts) -> str:
+    """Parse TicketTailor URL structure."""
+    # URL format: /events/{organizer}/{event_id}
+    info = ["Site: TicketTailor (ticket platform)"]
+    if len(path_parts) >= 2 and path_parts[0] == 'events':
+        organizer = path_parts[1].replace('-', ' ').replace('_', ' ').title()
+        info.append(f"Organizer: {organizer}")
+        if len(path_parts) >= 3:
+            info.append(f"Event ID: {path_parts[2]}")
+    info.append("Note: This is a ticket sales page. Visit the URL directly for event details.")
+    return '\n'.join(info)
+
+
+def parse_eventbrite_url(parsed, path_parts) -> str:
+    """Parse Eventbrite URL structure."""
+    info = ["Site: Eventbrite (event platform)"]
+    # URL format: /e/{event-name-tickets-{id}}
+    for part in path_parts:
+        if '-tickets-' in part:
+            event_name = part.split('-tickets-')[0].replace('-', ' ').title()
+            info.append(f"Event: {event_name}")
+            break
+    return '\n'.join(info)
+
+
+def parse_facebook_url(parsed, path_parts) -> str:
+    """Parse Facebook URL structure."""
+    info = ["Site: Facebook"]
+    if 'events' in path_parts:
+        info[0] = "Site: Facebook Events"
+        idx = path_parts.index('events')
+        if len(path_parts) > idx + 1:
+            info.append(f"Event ID: {path_parts[idx + 1]}")
+    return '\n'.join(info)
+
+
+def parse_piletilevi_url(parsed, path_parts) -> str:
+    """Parse Piletilevi (Estonian ticket platform) URL."""
+    info = ["Site: Piletilevi (Estonian ticket platform)"]
+    for part in path_parts:
+        if part not in ['est', 'eng', 'rus', 'event', 'events']:
+            readable = part.replace('-', ' ').replace('_', ' ')
+            if not readable.isdigit():
+                info.append(f"Event: {readable.title()}")
+                break
+    return '\n'.join(info)
+
+
+def parse_fienta_url(parsed, path_parts) -> str:
+    """Parse Fienta (Estonian/Baltic ticket platform) URL."""
+    info = ["Site: Fienta (ticket platform)"]
+    for part in path_parts:
+        if part not in ['event', 'events', 'buy', 'tickets']:
+            readable = part.replace('-', ' ').replace('_', ' ')
+            if not readable.isdigit():
+                info.append(f"Event: {readable.title()}")
+                break
+    return '\n'.join(info)
+
+
+def extract_page_text(html: str) -> str:
+    """Extract readable text from HTML page."""
+    # Remove script and style elements
+    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<nav[^>]*>.*?</nav>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<footer[^>]*>.*?</footer>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<header[^>]*>.*?</header>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<aside[^>]*>.*?</aside>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
+
+    # Remove all HTML tags
+    text = re.sub(r'<[^>]+>', ' ', html)
+
+    # Clean up whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    # Decode HTML entities
+    text = text.replace('&nbsp;', ' ')
+    text = text.replace('&amp;', '&')
+    text = text.replace('&lt;', '<')
+    text = text.replace('&gt;', '>')
+    text = text.replace('&quot;', '"')
+    text = text.replace('&#39;', "'")
+    text = re.sub(r'&#(\d+);', lambda m: chr(int(m.group(1))), text)
+    text = re.sub(r'&#x([0-9a-fA-F]+);', lambda m: chr(int(m.group(1), 16)), text)
+
+    # Limit to first 3000 chars
+    if len(text) > 3000:
+        text = text[:3000] + "..."
+
+    return text
 
 
 def is_forwarded_message(message) -> bool:
