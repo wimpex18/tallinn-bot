@@ -1,10 +1,12 @@
 import os
 import re
 import time
+import json
 import logging
 import base64
 from collections import defaultdict
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import httpx
 import redis
@@ -58,8 +60,13 @@ if REDIS_URL:
         logger.warning(f"Redis connection failed, memory disabled: {e}")
         redis_client = None
 
-# Global httpx client for connection pooling
+# Global httpx clients for connection pooling
 http_client: httpx.AsyncClient = None
+http2_client: httpx.AsyncClient = None
+
+# URL fetch cache: {cleaned_url: (content, timestamp)}
+URL_CACHE_TTL = 300  # 5 minutes
+_url_cache: dict[str, tuple[str, float]] = {}
 
 
 # ============ MEMORY FUNCTIONS ============
@@ -436,100 +443,138 @@ BROWSER_HEADERS = {
 }
 
 
+def _build_fetch_attempts() -> list[tuple[str, httpx.AsyncClient]]:
+    """Build ordered list of (profile_name, client) attempts for URL fetching.
+
+    Uses global pooled clients instead of creating new ones per request.
+    Reduced cascade: chrome (HTTP/1.1), chrome (HTTP/2), firefox (HTTP/1.1).
+    """
+    attempts = []
+    if http_client:
+        attempts.append(('chrome', http_client))
+    if http2_client:
+        attempts.append(('chrome', http2_client))
+    if http_client:
+        attempts.append(('firefox', http_client))
+    # Fallback if global clients not yet initialized
+    if not attempts:
+        fallback = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
+        attempts.append(('chrome', fallback))
+    return attempts
+
+
 async def fetch_url_content(url: str) -> str:
-    """Fetch webpage content and extract text with improved anti-blocking."""
-    # Clean tracking parameters from URL
+    """Fetch webpage content and extract text with anti-blocking.
+
+    Uses global connection-pooled HTTP clients. Tries up to 3 attempts
+    (chrome HTTP/1.1, chrome HTTP/2, firefox HTTP/1.1) before falling back
+    to URL-based info extraction.
+    """
     clean_url_str = clean_url(url)
+
+    # Check cache first
+    now = time.time()
+    cached = _url_cache.get(clean_url_str)
+    if cached:
+        content, cached_at = cached
+        if now - cached_at < URL_CACHE_TTL:
+            logger.info(f"URL cache hit: {clean_url_str}")
+            return content
+        else:
+            del _url_cache[clean_url_str]
+
     logger.info(f"Fetching URL (cleaned): {clean_url_str}")
 
-    # Try different browser profiles
-    browser_profiles = ['chrome', 'firefox', 'safari']
+    parsed = urlparse(clean_url_str)
     last_error = None
 
-    for profile in browser_profiles:
-        for use_http2 in [True, False]:  # Try HTTP/2 first, then HTTP/1.1
-            try:
-                headers = BROWSER_HEADERS[profile].copy()
-                # Add referer to look more natural
-                parsed = urlparse(clean_url_str)
-                headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
+    result = None
 
-                async with httpx.AsyncClient(
-                    timeout=20.0,
-                    follow_redirects=True,
-                    http2=use_http2
-                ) as client:
-                    response = await client.get(clean_url_str, headers=headers)
+    for profile, client in _build_fetch_attempts():
+        try:
+            headers = BROWSER_HEADERS[profile].copy()
+            headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
 
-                    # Check for soft blocks (403, 429, etc.)
-                    if response.status_code in (403, 429, 503):
-                        html = response.text
-                        # Detect Cloudflare or other bot protection
-                        if is_cloudflare_block(html):
-                            logger.warning(f"Cloudflare/bot protection detected with {profile}")
-                            last_error = "Bot protection (Cloudflare)"
-                            break  # All profiles will fail against Cloudflare
-                        logger.warning(f"Got {response.status_code} with {profile}, trying next")
-                        last_error = f"HTTP {response.status_code}"
-                        continue
+            response = await client.get(clean_url_str, headers=headers)
 
-                    response.raise_for_status()
-                    html = response.text
-
-                    # Check if we got a challenge page instead of real content
-                    if is_cloudflare_block(html):
-                        logger.warning(f"Got challenge page with {profile}")
-                        last_error = "Bot protection (challenge page)"
-                        break
-
-                    # First, try to extract structured metadata (more reliable)
-                    metadata = extract_metadata(html)
-                    metadata_text = format_metadata_text(metadata)
-
-                    if metadata_text and len(metadata_text) > 50:
-                        logger.info(f"Extracted metadata from {clean_url_str}: {len(metadata_text)} chars")
-                        # Also extract some page content for additional context
-                        page_text = extract_page_text(html)
-                        if page_text:
-                            return f"{metadata_text}\n\n[Page content]:\n{page_text}"
-                        return metadata_text
-
-                    # Fallback to page text extraction
-                    text = extract_page_text(html)
-                    if text:
-                        logger.info(f"Fetched {len(text)} chars from {clean_url_str}")
-                        return text
-
-                    logger.warning(f"No content extracted from {clean_url_str}")
-                    return ""
-
-            except httpx.HTTPStatusError as e:
-                last_error = f"HTTP {e.response.status_code}"
-                logger.warning(f"HTTP error with {profile}: {e.response.status_code}")
-                continue
-            except httpx.TimeoutException:
-                last_error = "Timeout"
-                logger.warning(f"Timeout with {profile}")
-                continue
-            except Exception as e:
-                # HTTP/2 not supported - try HTTP/1.1
-                if 'h2' in str(e).lower() or 'http2' in str(e).lower():
-                    continue
-                last_error = str(e)
-                logger.warning(f"Error with {profile}: {e}")
+            # Check for soft blocks (403, 429, etc.)
+            if response.status_code in (403, 429, 503):
+                html = response.text
+                if is_cloudflare_block(html):
+                    logger.warning(f"Cloudflare/bot protection detected with {profile}")
+                    last_error = "Bot protection (Cloudflare)"
+                    break  # Cloudflare blocks all profiles
+                logger.warning(f"Got {response.status_code} with {profile}, trying next")
+                last_error = f"HTTP {response.status_code}"
                 continue
 
-        # If we detected Cloudflare, don't try other profiles
-        if 'Cloudflare' in str(last_error) or 'Bot protection' in str(last_error):
+            response.raise_for_status()
+            html = response.text
+
+            if is_cloudflare_block(html):
+                logger.warning(f"Got challenge page with {profile}")
+                last_error = "Bot protection (challenge page)"
+                break
+
+            # Try structured metadata first (more reliable)
+            metadata = extract_metadata(html)
+            metadata_text = format_metadata_text(metadata)
+
+            if metadata_text and len(metadata_text) > 50:
+                logger.info(f"Extracted metadata from {clean_url_str}: {len(metadata_text)} chars")
+                page_text = extract_page_text(html)
+                if page_text:
+                    result = f"{metadata_text}\n\n[Page content]:\n{page_text}"
+                else:
+                    result = metadata_text
+                break
+
+            # Fallback to page text extraction
+            text = extract_page_text(html)
+            if text:
+                logger.info(f"Fetched {len(text)} chars from {clean_url_str}")
+                result = text
+                break
+
+            logger.warning(f"No content extracted from {clean_url_str}")
+            result = ""
             break
 
-    # If all profiles failed, try to extract useful info from URL structure
-    logger.error(f"Failed to fetch URL {clean_url_str} after all attempts: {last_error}")
-    url_info = extract_url_info(clean_url_str)
-    if url_info:
-        logger.info(f"Extracted URL info as fallback: {url_info}")
-        return url_info
-    return ""
+        except httpx.HTTPStatusError as e:
+            last_error = f"HTTP {e.response.status_code}"
+            logger.warning(f"HTTP error with {profile}: {e.response.status_code}")
+            continue
+        except httpx.TimeoutException:
+            last_error = "Timeout"
+            logger.warning(f"Timeout with {profile}")
+            continue
+        except Exception as e:
+            if 'h2' in str(e).lower() or 'http2' in str(e).lower():
+                continue
+            last_error = str(e)
+            logger.warning(f"Error with {profile}: {e}")
+            continue
+
+    # All attempts failed — extract minimal info from URL
+    if result is None:
+        logger.error(f"Failed to fetch URL {clean_url_str} after all attempts: {last_error}")
+        url_info = extract_url_info(clean_url_str)
+        if url_info:
+            logger.info(f"Extracted URL info as fallback: {url_info}")
+            result = url_info
+        else:
+            result = ""
+
+    # Cache the result (including failures, to avoid re-fetching blocked pages)
+    _url_cache[clean_url_str] = (result, time.time())
+
+    # Prune expired cache entries periodically (keep cache bounded)
+    if len(_url_cache) > 50:
+        expired = [k for k, (_, ts) in _url_cache.items() if time.time() - ts > URL_CACHE_TTL]
+        for k in expired:
+            del _url_cache[k]
+
+    return result
 
 
 def is_cloudflare_block(html: str) -> bool:
@@ -548,118 +593,54 @@ def is_cloudflare_block(html: str) -> bool:
 
 
 def extract_url_info(url: str) -> str:
-    """Extract useful information from URL structure when page cannot be fetched."""
+    """Extract minimal factual info from URL when page cannot be fetched.
+
+    IMPORTANT: Only returns domain and platform type. Never interprets URL path
+    segments as event names or content — this caused AI hallucinations.
+    """
     try:
         parsed = urlparse(url)
         domain = parsed.netloc.replace('www.', '')
-        path_parts = [p for p in parsed.path.split('/') if p]
 
-        info_parts = []
-
-        # Known site patterns
-        site_handlers = {
-            'tickettailor.com': parse_tickettailor_url,
-            'eventbrite.com': parse_eventbrite_url,
-            'facebook.com': parse_facebook_url,
-            'piletilevi.ee': parse_piletilevi_url,
-            'fienta.com': parse_fienta_url,
+        # Known platform descriptions (factual, no content interpretation)
+        platform_names = {
+            'tickettailor.com': 'TicketTailor (ticket sales platform)',
+            'eventbrite.com': 'Eventbrite (event platform)',
+            'facebook.com': 'Facebook',
+            'piletilevi.ee': 'Piletilevi (Estonian ticket platform)',
+            'fienta.com': 'Fienta (Baltic ticket platform)',
+            'piletimaailm.com': 'Piletimaailm (Estonian ticket platform)',
         }
 
-        for site, handler in site_handlers.items():
+        # Determine platform name
+        platform = None
+        for site, name in platform_names.items():
             if site in domain:
-                result = handler(parsed, path_parts)
-                if result:
-                    return result
+                platform = name
+                break
 
-        # Generic URL info
-        info_parts.append("[PAGE NOT ACCESSIBLE - URL info only]")
-        info_parts.append(f"Site: {domain}")
-        if path_parts:
-            # Try to extract meaningful path segments
-            readable_parts = []
+        info = ["[PAGE NOT ACCESSIBLE - content could not be loaded]"]
+        info.append(f"Site: {platform or domain}")
+        info.append(f"URL: {url}")
+
+        # Only extract event name from Eventbrite (reliable slug format: event-name-tickets-ID)
+        if 'eventbrite.com' in domain:
+            path_parts = [p for p in parsed.path.split('/') if p]
             for part in path_parts:
-                # Skip numeric IDs and common path segments
-                if not part.isdigit() and part not in ['events', 'event', 'tickets', 'ticket', 'e']:
-                    readable_parts.append(part.replace('-', ' ').replace('_', ' '))
-            if readable_parts:
-                info_parts.append(f"Path segments: {' / '.join(readable_parts)}")
-        info_parts.append("IMPORTANT: Cannot access page content. Search for more info if needed.")
+                if '-tickets-' in part:
+                    event_name = part.split('-tickets-')[0].replace('-', ' ').title()
+                    info.append(f"Possible event name from URL: {event_name}")
+                    break
 
-        return '\n'.join(info_parts) if info_parts else ""
+        info.append("")
+        info.append("CRITICAL: The page content is NOT available. URL path segments are NOT reliable.")
+        info.append("You MUST search the web for this URL or event to find actual details.")
+        info.append("DO NOT interpret or guess based on URL slugs, organizer IDs, or path fragments.")
+
+        return '\n'.join(info)
     except Exception as e:
         logger.error(f"Error extracting URL info: {e}")
         return ""
-
-
-def parse_tickettailor_url(parsed, path_parts) -> str:
-    """Parse TicketTailor URL structure."""
-    # URL format: /events/{organizer}/{event_id}
-    info = ["[PAGE NOT ACCESSIBLE - URL info only]"]
-    info.append("Site: TicketTailor (ticket sales platform)")
-    if len(path_parts) >= 2 and path_parts[0] == 'events':
-        organizer = path_parts[1].replace('-', ' ').replace('_', ' ').title()
-        info.append(f"Organizer ID: {organizer} (this is just a URL slug, NOT the event name)")
-        if len(path_parts) >= 3:
-            info.append(f"Event ID: {path_parts[2]}")
-    info.append("IMPORTANT: Cannot access page content. DO NOT guess what the event is about.")
-    info.append("Search for the event ID or organizer name to find actual event details.")
-    return '\n'.join(info)
-
-
-def parse_eventbrite_url(parsed, path_parts) -> str:
-    """Parse Eventbrite URL structure."""
-    info = ["[PAGE NOT ACCESSIBLE - URL info only]"]
-    info.append("Site: Eventbrite (event platform)")
-    # URL format: /e/{event-name-tickets-{id}}
-    for part in path_parts:
-        if '-tickets-' in part:
-            event_name = part.split('-tickets-')[0].replace('-', ' ').title()
-            info.append(f"Event name from URL: {event_name}")
-            break
-    info.append("IMPORTANT: Cannot access page. Search for this event for actual details.")
-    return '\n'.join(info)
-
-
-def parse_facebook_url(parsed, path_parts) -> str:
-    """Parse Facebook URL structure."""
-    info = ["[PAGE NOT ACCESSIBLE - URL info only]"]
-    if 'events' in path_parts:
-        info.append("Site: Facebook Events")
-        idx = path_parts.index('events')
-        if len(path_parts) > idx + 1:
-            info.append(f"Event ID: {path_parts[idx + 1]}")
-    else:
-        info.append("Site: Facebook")
-    info.append("IMPORTANT: Cannot access page. Search for this event for actual details.")
-    return '\n'.join(info)
-
-
-def parse_piletilevi_url(parsed, path_parts) -> str:
-    """Parse Piletilevi (Estonian ticket platform) URL."""
-    info = ["[PAGE NOT ACCESSIBLE - URL info only]"]
-    info.append("Site: Piletilevi (Estonian ticket platform)")
-    for part in path_parts:
-        if part not in ['est', 'eng', 'rus', 'event', 'events']:
-            readable = part.replace('-', ' ').replace('_', ' ')
-            if not readable.isdigit():
-                info.append(f"Event from URL: {readable.title()}")
-                break
-    info.append("IMPORTANT: Cannot access page. Search for this event for actual details.")
-    return '\n'.join(info)
-
-
-def parse_fienta_url(parsed, path_parts) -> str:
-    """Parse Fienta (Estonian/Baltic ticket platform) URL."""
-    info = ["[PAGE NOT ACCESSIBLE - URL info only]"]
-    info.append("Site: Fienta (ticket platform)")
-    for part in path_parts:
-        if part not in ['event', 'events', 'buy', 'tickets']:
-            readable = part.replace('-', ' ').replace('_', ' ')
-            if not readable.isdigit():
-                info.append(f"Event from URL: {readable.title()}")
-                break
-    info.append("IMPORTANT: Cannot access page. Search for this event for actual details.")
-    return '\n'.join(info)
 
 
 def extract_page_text(html: str) -> str:
@@ -763,7 +744,10 @@ async def query_perplexity(
         'актуальной информации о Таллинне на этих языках. '
         'Хорошие источники: Facebook Events, visitestonia.com, tallinn.ee. '
         'Если не находишь на английском/эстонском - попробуй gloss.ee (русскоязычный сайт о Таллинне). '
-        'Если видишь "[PAGE NOT ACCESSIBLE]" - страница не загрузилась, ПОИЩИ информацию об этом событии/ссылке сам, НЕ выдумывай.'
+        'Если видишь "[PAGE NOT ACCESSIBLE]" - страница не загрузилась. '
+        'СТРОГО ЗАПРЕЩЕНО угадывать содержание по URL-адресу или частям ссылки. '
+        'Вместо этого ПОИЩИ информацию по этой ссылке или событию через веб-поиск. '
+        'Если не нашёл - честно скажи что страница недоступна и ты не смог найти информацию.'
     )
 
     # Add memory context
@@ -1338,21 +1322,31 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def init_http_client(application) -> None:
-    """Initialize global HTTP client on startup."""
-    global http_client
+    """Initialize global HTTP clients on startup."""
+    global http_client, http2_client
+    client_limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
     http_client = httpx.AsyncClient(
         timeout=30.0,
-        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        follow_redirects=True,
+        limits=client_limits,
     )
-    logger.info("HTTP client initialized with connection pooling")
+    http2_client = httpx.AsyncClient(
+        timeout=20.0,
+        follow_redirects=True,
+        http2=True,
+        limits=client_limits,
+    )
+    logger.info("HTTP clients initialized with connection pooling (HTTP/1.1 + HTTP/2)")
 
 
 async def cleanup_http_client(application) -> None:
-    """Cleanup global HTTP client on shutdown."""
-    global http_client
+    """Cleanup global HTTP clients on shutdown."""
+    global http_client, http2_client
     if http_client:
         await http_client.aclose()
-        logger.info("HTTP client closed")
+    if http2_client:
+        await http2_client.aclose()
+    logger.info("HTTP clients closed")
 
 
 def main() -> None:
