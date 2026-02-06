@@ -2,6 +2,7 @@ import os
 import re
 import time
 import json
+import asyncio
 import logging
 import base64
 from collections import defaultdict
@@ -9,7 +10,7 @@ from datetime import datetime
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import httpx
-import redis
+import redis.asyncio as aioredis
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -49,16 +50,8 @@ USERNAME_TO_NAME = {
     "wimpex18": "Сергей",
 }
 
-# Redis connection for persistent memory
+# Redis connection for persistent memory (initialized async in post_init)
 redis_client = None
-if REDIS_URL:
-    try:
-        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-        redis_client.ping()
-        logger.info("Connected to Redis for memory storage")
-    except Exception as e:
-        logger.warning(f"Redis connection failed, memory disabled: {e}")
-        redis_client = None
 
 # Global httpx clients for connection pooling
 http_client: httpx.AsyncClient = None
@@ -68,58 +61,61 @@ http2_client: httpx.AsyncClient = None
 URL_CACHE_TTL = 300  # 5 minutes
 _url_cache: dict[str, tuple[str, float]] = {}
 
+# In-memory eviction settings
+CONTEXT_MAX_AGE = 3600  # 1 hour — evict chat contexts older than this
+RATE_LIMIT_MAX_AGE = 300  # 5 min — evict stale rate limit entries
+_last_eviction: float = 0.0
+EVICTION_INTERVAL = 300  # run eviction check every 5 minutes
+
 
 # ============ MEMORY FUNCTIONS ============
 
-def save_user_fact(user_id: int, fact: str) -> None:
-    """Save a fact about a user to persistent memory."""
+async def save_user_fact(user_id: int, fact: str) -> None:
+    """Save a fact about a user to persistent memory (sorted set, newest kept)."""
     if not redis_client:
         return
     try:
         key = f"user:{user_id}:facts"
-        redis_client.sadd(key, fact)
-        if redis_client.scard(key) > 20:
-            facts = list(redis_client.smembers(key))
-            redis_client.delete(key)
-            for f in facts[-20:]:
-                redis_client.sadd(key, f)
+        await redis_client.zadd(key, {fact: time.time()})
+        count = await redis_client.zcard(key)
+        if count > 20:
+            # Remove oldest entries, keep newest 20
+            await redis_client.zremrangebyrank(key, 0, -(20 + 1))
     except Exception as e:
         logger.error(f"Failed to save user fact: {e}")
 
 
-def get_user_facts(user_id: int) -> list[str]:
-    """Get all facts about a user from memory."""
+async def get_user_facts(user_id: int) -> list[str]:
+    """Get all facts about a user from memory (ordered oldest to newest)."""
     if not redis_client:
         return []
     try:
-        return list(redis_client.smembers(f"user:{user_id}:facts"))
+        return await redis_client.zrange(f"user:{user_id}:facts", 0, -1)
     except Exception as e:
         logger.error(f"Failed to get user facts: {e}")
         return []
 
 
-def save_group_fact(chat_id: int, fact: str) -> None:
-    """Save a fact about the group to persistent memory."""
+async def save_group_fact(chat_id: int, fact: str) -> None:
+    """Save a fact about the group to persistent memory (sorted set, newest kept)."""
     if not redis_client:
         return
     try:
         key = f"group:{chat_id}:facts"
-        redis_client.sadd(key, fact)
-        if redis_client.scard(key) > 30:
-            facts = list(redis_client.smembers(key))
-            redis_client.delete(key)
-            for f in facts[-30:]:
-                redis_client.sadd(key, f)
+        await redis_client.zadd(key, {fact: time.time()})
+        count = await redis_client.zcard(key)
+        if count > 30:
+            await redis_client.zremrangebyrank(key, 0, -(30 + 1))
     except Exception as e:
         logger.error(f"Failed to save group fact: {e}")
 
 
-def get_group_facts(chat_id: int) -> list[str]:
-    """Get all facts about the group from memory."""
+async def get_group_facts(chat_id: int) -> list[str]:
+    """Get all facts about the group from memory (ordered oldest to newest)."""
     if not redis_client:
         return []
     try:
-        return list(redis_client.smembers(f"group:{chat_id}:facts"))
+        return await redis_client.zrange(f"group:{chat_id}:facts", 0, -1)
     except Exception as e:
         logger.error(f"Failed to get group facts: {e}")
         return []
@@ -148,6 +144,37 @@ def get_context_string(chat_id: int) -> str:
         name = msg.get("name", "user")
         context_lines.append(f"{name}: {msg['content']}")
     return "\n".join(context_lines)
+
+
+def evict_stale_data() -> None:
+    """Remove stale entries from in-memory dicts to prevent unbounded growth.
+
+    Called periodically from handle_message (every EVICTION_INTERVAL seconds).
+    """
+    global _last_eviction
+    now = time.time()
+    if now - _last_eviction < EVICTION_INTERVAL:
+        return
+    _last_eviction = now
+
+    # Evict chat contexts with no recent messages
+    stale_chats = [
+        chat_id for chat_id, msgs in chat_context.items()
+        if msgs and now - msgs[-1].get("time", 0) > CONTEXT_MAX_AGE
+    ]
+    for chat_id in stale_chats:
+        del chat_context[chat_id]
+
+    # Evict expired rate limit entries
+    stale_users = [
+        uid for uid, ts in user_last_query.items()
+        if now - ts > RATE_LIMIT_MAX_AGE
+    ]
+    for uid in stale_users:
+        del user_last_query[uid]
+
+    if stale_chats or stale_users:
+        logger.info(f"Evicted {len(stale_chats)} stale contexts, {len(stale_users)} rate limit entries")
 
 
 # ============ UTILITY FUNCTIONS ============
@@ -443,32 +470,69 @@ BROWSER_HEADERS = {
 }
 
 
-def _build_fetch_attempts() -> list[tuple[str, httpx.AsyncClient]]:
-    """Build ordered list of (profile_name, client) attempts for URL fetching.
+class _FetchResult:
+    """Result of a single URL fetch attempt."""
+    __slots__ = ('content', 'error', 'cloudflare')
+    def __init__(self, content=None, error=None, cloudflare=False):
+        self.content = content
+        self.error = error
+        self.cloudflare = cloudflare
 
-    Uses global pooled clients instead of creating new ones per request.
-    Reduced cascade: chrome (HTTP/1.1), chrome (HTTP/2), firefox (HTTP/1.1).
-    """
-    attempts = []
-    if http_client:
-        attempts.append(('chrome', http_client))
-    if http2_client:
-        attempts.append(('chrome', http2_client))
-    if http_client:
-        attempts.append(('firefox', http_client))
-    # Fallback if global clients not yet initialized
-    if not attempts:
-        fallback = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
-        attempts.append(('chrome', fallback))
-    return attempts
+
+async def _try_fetch(profile: str, client: httpx.AsyncClient, url: str, referer: str) -> _FetchResult:
+    """Single fetch attempt: HTTP request + content extraction."""
+    try:
+        headers = BROWSER_HEADERS[profile].copy()
+        headers['Referer'] = referer
+
+        response = await client.get(url, headers=headers)
+
+        if response.status_code in (403, 429, 503):
+            html = response.text
+            if is_cloudflare_block(html):
+                logger.warning(f"Cloudflare detected with {profile}")
+                return _FetchResult(error="Cloudflare", cloudflare=True)
+            logger.warning(f"Got {response.status_code} with {profile}")
+            return _FetchResult(error=f"HTTP {response.status_code}")
+
+        response.raise_for_status()
+        html = response.text
+
+        if is_cloudflare_block(html):
+            logger.warning(f"Challenge page with {profile}")
+            return _FetchResult(error="challenge page", cloudflare=True)
+
+        # Try structured metadata first
+        metadata = extract_metadata(html)
+        metadata_text = format_metadata_text(metadata)
+
+        if metadata_text and len(metadata_text) > 50:
+            logger.info(f"Extracted metadata ({len(metadata_text)} chars) with {profile}")
+            page_text = extract_page_text(html)
+            if page_text:
+                return _FetchResult(content=f"{metadata_text}\n\n[Page content]:\n{page_text}")
+            return _FetchResult(content=metadata_text)
+
+        text = extract_page_text(html)
+        if text:
+            logger.info(f"Fetched {len(text)} chars with {profile}")
+            return _FetchResult(content=text)
+
+        return _FetchResult(content="")
+
+    except httpx.HTTPStatusError as e:
+        return _FetchResult(error=f"HTTP {e.response.status_code}")
+    except httpx.TimeoutException:
+        return _FetchResult(error="Timeout")
+    except Exception as e:
+        return _FetchResult(error=str(e))
 
 
 async def fetch_url_content(url: str) -> str:
-    """Fetch webpage content and extract text with anti-blocking.
+    """Fetch webpage content with parallel browser profile attempts.
 
-    Uses global connection-pooled HTTP clients. Tries up to 3 attempts
-    (chrome HTTP/1.1, chrome HTTP/2, firefox HTTP/1.1) before falling back
-    to URL-based info extraction.
+    Launches all fetch attempts concurrently and returns the first successful
+    result, cancelling remaining tasks. Aborts immediately on Cloudflare detection.
     """
     clean_url_str = clean_url(url)
 
@@ -486,89 +550,65 @@ async def fetch_url_content(url: str) -> str:
     logger.info(f"Fetching URL (cleaned): {clean_url_str}")
 
     parsed = urlparse(clean_url_str)
-    last_error = None
+    referer = f"{parsed.scheme}://{parsed.netloc}/"
+
+    # Build parallel fetch attempts
+    attempts = []
+    if http_client:
+        attempts.append(('chrome', http_client))
+    if http2_client:
+        attempts.append(('chrome', http2_client))
+    if http_client:
+        attempts.append(('firefox', http_client))
+    if not attempts:
+        fallback = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
+        attempts.append(('chrome', fallback))
+
+    # Launch all attempts concurrently
+    tasks = {
+        asyncio.create_task(_try_fetch(profile, client, clean_url_str, referer)): profile
+        for profile, client in attempts
+    }
 
     result = None
+    pending = set(tasks.keys())
 
-    for profile, client in _build_fetch_attempts():
-        try:
-            headers = BROWSER_HEADERS[profile].copy()
-            headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                fetch_result = task.result()
 
-            response = await client.get(clean_url_str, headers=headers)
+                # Cloudflare: abort everything
+                if fetch_result.cloudflare:
+                    for t in pending:
+                        t.cancel()
+                    pending = set()
+                    break
 
-            # Check for soft blocks (403, 429, etc.)
-            if response.status_code in (403, 429, 503):
-                html = response.text
-                if is_cloudflare_block(html):
-                    logger.warning(f"Cloudflare/bot protection detected with {profile}")
-                    last_error = "Bot protection (Cloudflare)"
-                    break  # Cloudflare blocks all profiles
-                logger.warning(f"Got {response.status_code} with {profile}, trying next")
-                last_error = f"HTTP {response.status_code}"
-                continue
+                # Success: take result and cancel remaining
+                if fetch_result.content is not None:
+                    result = fetch_result.content
+                    for t in pending:
+                        t.cancel()
+                    pending = set()
+                    break
 
-            response.raise_for_status()
-            html = response.text
-
-            if is_cloudflare_block(html):
-                logger.warning(f"Got challenge page with {profile}")
-                last_error = "Bot protection (challenge page)"
+            if result is not None:
                 break
-
-            # Try structured metadata first (more reliable)
-            metadata = extract_metadata(html)
-            metadata_text = format_metadata_text(metadata)
-
-            if metadata_text and len(metadata_text) > 50:
-                logger.info(f"Extracted metadata from {clean_url_str}: {len(metadata_text)} chars")
-                page_text = extract_page_text(html)
-                if page_text:
-                    result = f"{metadata_text}\n\n[Page content]:\n{page_text}"
-                else:
-                    result = metadata_text
-                break
-
-            # Fallback to page text extraction
-            text = extract_page_text(html)
-            if text:
-                logger.info(f"Fetched {len(text)} chars from {clean_url_str}")
-                result = text
-                break
-
-            logger.warning(f"No content extracted from {clean_url_str}")
-            result = ""
-            break
-
-        except httpx.HTTPStatusError as e:
-            last_error = f"HTTP {e.response.status_code}"
-            logger.warning(f"HTTP error with {profile}: {e.response.status_code}")
-            continue
-        except httpx.TimeoutException:
-            last_error = "Timeout"
-            logger.warning(f"Timeout with {profile}")
-            continue
-        except Exception as e:
-            if 'h2' in str(e).lower() or 'http2' in str(e).lower():
-                continue
-            last_error = str(e)
-            logger.warning(f"Error with {profile}: {e}")
-            continue
+    except Exception as e:
+        logger.error(f"Error in parallel fetch: {e}")
 
     # All attempts failed — extract minimal info from URL
     if result is None:
-        logger.error(f"Failed to fetch URL {clean_url_str} after all attempts: {last_error}")
+        logger.error(f"Failed to fetch URL {clean_url_str} after all attempts")
         url_info = extract_url_info(clean_url_str)
-        if url_info:
-            logger.info(f"Extracted URL info as fallback: {url_info}")
-            result = url_info
-        else:
-            result = ""
+        result = url_info if url_info else ""
 
     # Cache the result (including failures, to avoid re-fetching blocked pages)
     _url_cache[clean_url_str] = (result, time.time())
 
-    # Prune expired cache entries periodically (keep cache bounded)
+    # Prune expired cache entries periodically
     if len(_url_cache) > 50:
         expired = [k for k, (_, ts) in _url_cache.items() if time.time() - ts > URL_CACHE_TTL]
         for k in expired:
@@ -886,46 +926,46 @@ async def smart_extract_facts(question: str, answer: str, user_name: str, chat_c
 Максимум 3 факта."""
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                "https://api.perplexity.ai/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "sonar",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 100,
-                    "temperature": 0.1,
-                },
-            )
-            response.raise_for_status()
-            result = response.json()["choices"][0]["message"]["content"].strip()
+        client = http_client or httpx.AsyncClient(timeout=10.0)
+        response = await client.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers={
+                "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "sonar",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 100,
+                "temperature": 0.1,
+            },
+        )
+        response.raise_for_status()
+        result = response.json()["choices"][0]["message"]["content"].strip()
 
-            if "НЕТ" in result.upper() or len(result) < 5:
-                return []
+        if "НЕТ" in result.upper() or len(result) < 5:
+            return []
 
-            facts = []
-            for line in result.split("\n"):
-                line = line.strip().lstrip("-•").strip()
-                if 3 < len(line) < 100:
-                    if user_name and not line.startswith(user_name):
-                        line = f"{user_name}: {line}"
-                    facts.append(line)
-            return facts[:3]
+        facts = []
+        for line in result.split("\n"):
+            line = line.strip().lstrip("-•").strip()
+            if 3 < len(line) < 100:
+                if user_name and not line.startswith(user_name):
+                    line = f"{user_name}: {line}"
+                facts.append(line)
+        return facts[:3]
     except Exception as e:
         logger.error(f"Failed to extract facts: {e}")
         return []
 
 
-def save_user_interaction(user_id: int, user_name: str, username: str) -> None:
+async def save_user_interaction(user_id: int, user_name: str, username: str) -> None:
     """Save info about user who interacted with the bot."""
     if not redis_client or not user_name:
         return
     try:
         key = f"user:{user_id}:profile"
-        redis_client.hset(key, mapping={
+        await redis_client.hset(key, mapping={
             "name": user_name,
             "username": username or "",
             "last_seen": datetime.now().isoformat(),
@@ -1030,9 +1070,9 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         fact = f"{user_name}: {fact}"
 
     if update.effective_chat.type == "private":
-        save_user_fact(user_id, fact)
+        await save_user_fact(user_id, fact)
     else:
-        save_group_fact(chat_id, fact)
+        await save_group_fact(chat_id, fact)
 
     await update.message.reply_text("Запомнил)")
 
@@ -1052,9 +1092,9 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if redis_client:
         try:
             if update.effective_chat.type == "private":
-                redis_client.delete(f"user:{user_id}:facts")
+                await redis_client.delete(f"user:{user_id}:facts")
             else:
-                redis_client.delete(f"group:{chat_id}:facts")
+                await redis_client.delete(f"group:{chat_id}:facts")
             await update.message.reply_text("Забыл всё)")
         except Exception as e:
             logger.error(f"Failed to forget: {e}")
@@ -1076,7 +1116,7 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if update.effective_chat.type == "private":
         # Show user facts in private chat
-        facts = get_user_facts(user_id)
+        facts = await get_user_facts(user_id)
         if facts:
             facts_text = "\n".join([f"- {fact}" for fact in facts])
             await update.message.reply_text(f"Что я помню про тебя:\n\n{facts_text}")
@@ -1084,8 +1124,8 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("Пока ничего не помню про тебя")
     else:
         # Show both user and group facts in group chat
-        user_facts = get_user_facts(user_id)
-        group_facts = get_group_facts(chat_id)
+        user_facts = await get_user_facts(user_id)
+        group_facts = await get_group_facts(chat_id)
 
         response = ""
         if user_facts:
@@ -1102,11 +1142,44 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(response.strip())
 
 
+async def _extract_and_save_facts(
+    question: str, answer: str, user_name: str,
+    conv_context: str, chat_id: int, user_id: int,
+) -> None:
+    """Background task: extract facts from conversation and save to Redis.
+
+    Runs as asyncio.create_task() so it doesn't block the message handler.
+    """
+    try:
+        facts = await smart_extract_facts(
+            question=question,
+            answer=answer,
+            user_name=user_name,
+            chat_context=conv_context,
+        )
+        if not facts:
+            facts = extract_facts_from_response(question, answer, user_name)
+
+        for fact in facts:
+            if chat_id == user_id:
+                await save_user_fact(user_id, fact)
+            else:
+                await save_group_fact(chat_id, fact)
+
+        if facts:
+            logger.info(f"Learned facts: {facts}")
+    except Exception as e:
+        logger.error(f"Background fact extraction failed: {e}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming messages."""
     message = update.message
     if not message:
         return
+
+    # Periodically clean up stale in-memory data
+    evict_stale_data()
 
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -1238,8 +1311,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Get context and memory
     conv_context = get_context_string(chat_id)
-    user_facts = get_user_facts(user_id)
-    group_facts = get_group_facts(chat_id) if chat_id != user_id else []
+    user_facts = await get_user_facts(user_id)
+    group_facts = await get_group_facts(chat_id) if chat_id != user_id else []
 
     # Check for photos to analyze
     photo_urls = []
@@ -1285,35 +1358,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     add_to_context(chat_id, "assistant", "bot", answer)
 
     # Save user interaction (learn who talks to us)
-    save_user_interaction(user_id, user_name, user.username)
+    await save_user_interaction(user_id, user_name, user.username)
 
     # Send response immediately, then learn in background
     await message.reply_text(answer, reply_to_message_id=message.message_id)
 
-    # Smart fact extraction (runs after response sent)
-    try:
-        # Use LLM to extract facts from conversation
-        facts = await smart_extract_facts(
-            question=question,
-            answer=answer,
-            user_name=user_name,
-            chat_context=conv_context
-        )
-
-        # Fallback to regex if LLM fails
-        if not facts:
-            facts = extract_facts_from_response(question, answer, user_name)
-
-        for fact in facts:
-            if chat_id == user_id:
-                save_user_fact(user_id, fact)
-            else:
-                save_group_fact(chat_id, fact)
-
-        if facts:
-            logger.info(f"Learned facts: {facts}")
-    except Exception as e:
-        logger.error(f"Learning failed: {e}")
+    # Fire-and-forget: extract and save facts without blocking the handler
+    asyncio.create_task(_extract_and_save_facts(
+        question=question,
+        answer=answer,
+        user_name=user_name,
+        conv_context=conv_context,
+        chat_id=chat_id,
+        user_id=user_id,
+    ))
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1321,9 +1379,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error(f"Exception while handling an update: {context.error}")
 
 
-async def init_http_client(application) -> None:
-    """Initialize global HTTP clients on startup."""
-    global http_client, http2_client
+async def init_clients(application) -> None:
+    """Initialize global HTTP clients and async Redis on startup."""
+    global http_client, http2_client, redis_client
     client_limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
     http_client = httpx.AsyncClient(
         timeout=30.0,
@@ -1338,15 +1396,27 @@ async def init_http_client(application) -> None:
     )
     logger.info("HTTP clients initialized with connection pooling (HTTP/1.1 + HTTP/2)")
 
+    # Initialize async Redis
+    if REDIS_URL:
+        try:
+            redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+            await redis_client.ping()
+            logger.info("Connected to Redis (async) for memory storage")
+        except Exception as e:
+            logger.warning(f"Redis connection failed, memory disabled: {e}")
+            redis_client = None
 
-async def cleanup_http_client(application) -> None:
-    """Cleanup global HTTP clients on shutdown."""
-    global http_client, http2_client
+
+async def cleanup_clients(application) -> None:
+    """Cleanup global HTTP clients and Redis on shutdown."""
+    global http_client, http2_client, redis_client
     if http_client:
         await http_client.aclose()
     if http2_client:
         await http2_client.aclose()
-    logger.info("HTTP clients closed")
+    if redis_client:
+        await redis_client.aclose()
+    logger.info("HTTP clients and Redis closed")
 
 
 def main() -> None:
@@ -1359,14 +1429,14 @@ def main() -> None:
         raise ValueError("BOT_USERNAME environment variable is required")
 
     logger.info(f"Starting bot @{BOT_USERNAME}")
-    logger.info(f"Redis connected: {redis_client is not None}")
+    logger.info(f"Redis URL configured: {REDIS_URL is not None}")
     logger.info("Using Perplexity Sonar with built-in web search")
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Initialize HTTP client with connection pooling
-    application.post_init = init_http_client
-    application.post_shutdown = cleanup_http_client
+    # Initialize HTTP clients and Redis
+    application.post_init = init_clients
+    application.post_shutdown = cleanup_clients
 
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
