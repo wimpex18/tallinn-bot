@@ -10,7 +10,9 @@ from datetime import datetime
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import httpx
+import trafilatura
 import redis.asyncio as aioredis
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -53,9 +55,9 @@ USERNAME_TO_NAME = {
 # Redis connection for persistent memory (initialized async in post_init)
 redis_client = None
 
-# Global httpx clients for connection pooling
-http_client: httpx.AsyncClient = None
-http2_client: httpx.AsyncClient = None
+# Global HTTP clients
+http_client: httpx.AsyncClient = None  # For Perplexity API calls (no impersonation needed)
+curl_session: CurlAsyncSession = None  # For URL fetching (browser TLS impersonation)
 
 # URL fetch cache: {cleaned_url: (content, timestamp)}
 URL_CACHE_TTL = 300  # 5 minutes
@@ -324,36 +326,64 @@ def extract_metadata(html: str) -> dict:
             if match:
                 metadata['description'] = match.group(1).strip()
 
-    # Extract JSON-LD structured data (events, products, etc.)
-    jsonld_match = re.search(
+    # Extract ALL JSON-LD blocks (some pages have multiple)
+    jsonld_matches = re.findall(
         r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html,
         re.DOTALL | re.IGNORECASE
     )
-    if jsonld_match:
+    for jsonld_text in jsonld_matches:
         try:
-            jsonld_text = jsonld_match.group(1).strip()
-            jsonld_data = json.loads(jsonld_text)
-
-            # Handle array of objects
-            if isinstance(jsonld_data, list):
-                for item in jsonld_data:
-                    if isinstance(item, dict):
-                        extract_jsonld_event(item, metadata)
-            elif isinstance(jsonld_data, dict):
-                extract_jsonld_event(jsonld_data, metadata)
+            jsonld_data = json.loads(jsonld_text.strip())
+            items = jsonld_data if isinstance(jsonld_data, list) else [jsonld_data]
+            for item in items:
+                if isinstance(item, dict):
+                    _extract_jsonld_item(item, metadata)
         except json.JSONDecodeError:
             pass
+
+    # Detect paywall from HTML patterns (fallback if JSON-LD didn't catch it)
+    if 'is_paywalled' not in metadata:
+        paywall_indicators = [
+            'paywall', 'piano-paywall', 'reg-wall', 'subscribe-wall',
+            'premium-content', 'locked-content', 'article__pw',
+        ]
+        html_lower = html.lower()
+        if any(ind in html_lower for ind in paywall_indicators):
+            metadata['is_paywalled'] = True
 
     return metadata
 
 
-def extract_jsonld_event(data: dict, metadata: dict) -> None:
-    """Extract event data from JSON-LD structured data."""
-    schema_type = data.get('@type', '')
+def _extract_jsonld_item(data: dict, metadata: dict) -> None:
+    """Extract structured data from JSON-LD (events, articles, etc.)."""
+    schema_type = str(data.get('@type', ''))
+
+    # Detect paywall from JSON-LD (most reliable signal)
+    if data.get('isAccessibleForFree') is False:
+        metadata['is_paywalled'] = True
+
+    # Handle Article/NewsArticle types
+    if any(t in schema_type for t in ('Article', 'NewsArticle', 'BlogPosting', 'WebPage')):
+        if 'headline' in data and 'article_headline' not in metadata:
+            metadata['article_headline'] = data['headline']
+        if 'description' in data and 'article_description' not in metadata:
+            metadata['article_description'] = data['description'][:500]
+        if 'author' in data:
+            author = data['author']
+            if isinstance(author, dict):
+                metadata['author'] = author.get('name', '')
+            elif isinstance(author, list):
+                names = [a.get('name', '') for a in author if isinstance(a, dict)]
+                if names:
+                    metadata['author'] = ', '.join(names)
+            elif isinstance(author, str):
+                metadata['author'] = author
+        if 'datePublished' in data:
+            metadata['date_published'] = data['datePublished']
 
     # Handle Event type
-    if schema_type == 'Event' or 'Event' in str(schema_type):
+    if 'Event' in schema_type:
         if 'name' in data:
             metadata['event_name'] = data['name']
         if 'startDate' in data:
@@ -397,13 +427,25 @@ def format_metadata_text(metadata: dict) -> str:
     """Format extracted metadata into readable text."""
     parts = []
 
+    # Paywall notice
+    if metadata.get('is_paywalled'):
+        parts.append("[PAYWALL: article is behind a paywall, only preview available]")
+
     # Event-specific formatting
     if 'event_name' in metadata:
         parts.append(f"Event: {metadata['event_name']}")
+    elif 'article_headline' in metadata:
+        parts.append(f"Article: {metadata['article_headline']}")
     elif 'og_title' in metadata:
         parts.append(f"Title: {metadata['og_title']}")
     elif 'title' in metadata:
         parts.append(f"Title: {metadata['title']}")
+
+    if 'author' in metadata:
+        parts.append(f"Author: {metadata['author']}")
+
+    if 'date_published' in metadata:
+        parts.append(f"Published: {metadata['date_published']}")
 
     if 'performer' in metadata:
         parts.append(f"Artist/Performer: {metadata['performer']}")
@@ -423,6 +465,9 @@ def format_metadata_text(metadata: dict) -> str:
     if 'event_description' in metadata:
         desc = metadata['event_description'][:500]
         parts.append(f"Description: {desc}")
+    elif 'article_description' in metadata:
+        desc = metadata['article_description'][:500]
+        parts.append(f"Description: {desc}")
     elif 'og_description' in metadata:
         desc = metadata['og_description'][:500]
         parts.append(f"Description: {desc}")
@@ -433,106 +478,81 @@ def format_metadata_text(metadata: dict) -> str:
     return '\n'.join(parts)
 
 
-# Browser-like headers for different scenarios
-BROWSER_HEADERS = {
-    'chrome': {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-    },
-    'firefox': {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-    },
-    'safari': {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-    }
-}
+# Browser impersonation targets for curl_cffi (TLS fingerprint level)
+IMPERSONATE_PROFILES = ["chrome", "safari"]
 
 
-class _FetchResult:
-    """Result of a single URL fetch attempt."""
-    __slots__ = ('content', 'error', 'cloudflare')
-    def __init__(self, content=None, error=None, cloudflare=False):
-        self.content = content
-        self.error = error
-        self.cloudflare = cloudflare
+def _extract_content_from_html(html: str, url: str) -> str:
+    """Extract content from successfully fetched HTML.
+
+    Structured fallback chain:
+    1. Metadata (OG tags, JSON-LD) — always extracted
+    2. Article text via trafilatura — best for news/blog content
+    3. Regex fallback — for non-article pages
+    Combines metadata + body text for maximum context.
+    """
+    # Layer 1: Structured metadata (always try)
+    metadata = extract_metadata(html)
+    metadata_text = format_metadata_text(metadata)
+
+    # Layer 2: Article body text (trafilatura > regex fallback)
+    page_text = extract_page_text(html)
+
+    # Combine: metadata header + body content
+    if metadata_text and len(metadata_text) > 50:
+        if page_text and len(page_text) > 50:
+            return f"{metadata_text}\n\n[Page content]:\n{page_text}"
+        return metadata_text
+
+    if page_text and len(page_text) > 50:
+        return page_text
+
+    return ""
 
 
-async def _try_fetch(profile: str, client: httpx.AsyncClient, url: str, referer: str) -> _FetchResult:
-    """Single fetch attempt: HTTP request + content extraction."""
+async def _curl_fetch(url: str, impersonate: str) -> tuple[str | None, str | None]:
+    """Single curl_cffi fetch attempt with browser TLS impersonation.
+
+    Returns (html, None) on success, (None, error_string) on failure.
+    """
     try:
-        headers = BROWSER_HEADERS[profile].copy()
-        headers['Referer'] = referer
+        session = curl_session
+        if not session:
+            # Fallback if global session not yet initialized
+            session = CurlAsyncSession()
 
-        response = await client.get(url, headers=headers)
+        response = await session.get(
+            url,
+            impersonate=impersonate,
+            timeout=20,
+            allow_redirects=True,
+        )
 
         if response.status_code in (403, 429, 503):
             html = response.text
             if is_cloudflare_block(html):
-                logger.warning(f"Cloudflare detected with {profile}")
-                return _FetchResult(error="Cloudflare", cloudflare=True)
-            logger.warning(f"Got {response.status_code} with {profile}")
-            return _FetchResult(error=f"HTTP {response.status_code}")
+                return None, "cloudflare"
+            return None, f"HTTP {response.status_code}"
 
-        response.raise_for_status()
+        if response.status_code >= 400:
+            return None, f"HTTP {response.status_code}"
+
         html = response.text
-
         if is_cloudflare_block(html):
-            logger.warning(f"Challenge page with {profile}")
-            return _FetchResult(error="challenge page", cloudflare=True)
+            return None, "cloudflare"
 
-        # Try structured metadata first
-        metadata = extract_metadata(html)
-        metadata_text = format_metadata_text(metadata)
+        return html, None
 
-        if metadata_text and len(metadata_text) > 50:
-            logger.info(f"Extracted metadata ({len(metadata_text)} chars) with {profile}")
-            page_text = extract_page_text(html)
-            if page_text:
-                return _FetchResult(content=f"{metadata_text}\n\n[Page content]:\n{page_text}")
-            return _FetchResult(content=metadata_text)
-
-        text = extract_page_text(html)
-        if text:
-            logger.info(f"Fetched {len(text)} chars with {profile}")
-            return _FetchResult(content=text)
-
-        return _FetchResult(content="")
-
-    except httpx.HTTPStatusError as e:
-        return _FetchResult(error=f"HTTP {e.response.status_code}")
-    except httpx.TimeoutException:
-        return _FetchResult(error="Timeout")
     except Exception as e:
-        return _FetchResult(error=str(e))
+        return None, str(e)
 
 
 async def fetch_url_content(url: str) -> str:
-    """Fetch webpage content with parallel browser profile attempts.
+    """Fetch webpage content using curl_cffi with browser TLS impersonation.
 
-    Launches all fetch attempts concurrently and returns the first successful
-    result, cancelling remaining tasks. Aborts immediately on Cloudflare detection.
+    Uses curl_cffi which produces real Chrome/Safari TLS fingerprints,
+    bypassing WAF checks that block Python HTTP libraries.
+    Tries multiple impersonation profiles in parallel.
     """
     clean_url_str = clean_url(url)
 
@@ -547,27 +567,12 @@ async def fetch_url_content(url: str) -> str:
         else:
             del _url_cache[clean_url_str]
 
-    logger.info(f"Fetching URL (cleaned): {clean_url_str}")
+    logger.info(f"Fetching URL: {clean_url_str}")
 
-    parsed = urlparse(clean_url_str)
-    referer = f"{parsed.scheme}://{parsed.netloc}/"
-
-    # Build parallel fetch attempts
-    attempts = []
-    if http_client:
-        attempts.append(('chrome', http_client))
-    if http2_client:
-        attempts.append(('chrome', http2_client))
-    if http_client:
-        attempts.append(('firefox', http_client))
-    if not attempts:
-        fallback = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
-        attempts.append(('chrome', fallback))
-
-    # Launch all attempts concurrently
+    # Launch parallel fetches with different browser impersonation profiles
     tasks = {
-        asyncio.create_task(_try_fetch(profile, client, clean_url_str, referer)): profile
-        for profile, client in attempts
+        asyncio.create_task(_curl_fetch(clean_url_str, profile)): profile
+        for profile in IMPERSONATE_PROFILES
     }
 
     result = None
@@ -577,22 +582,30 @@ async def fetch_url_content(url: str) -> str:
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
-                fetch_result = task.result()
+                html, error = task.result()
 
-                # Cloudflare: abort everything
-                if fetch_result.cloudflare:
+                if error == "cloudflare":
+                    logger.warning(f"Cloudflare block on {clean_url_str}")
                     for t in pending:
                         t.cancel()
                     pending = set()
                     break
 
-                # Success: take result and cancel remaining
-                if fetch_result.content is not None:
-                    result = fetch_result.content
+                if html is not None:
+                    content = _extract_content_from_html(html, clean_url_str)
+                    if content:
+                        result = content
+                        logger.info(f"Fetched {len(content)} chars from {clean_url_str}")
+                    else:
+                        result = ""
+                        logger.warning(f"No content extracted from {clean_url_str}")
                     for t in pending:
                         t.cancel()
                     pending = set()
                     break
+
+                if error:
+                    logger.warning(f"Fetch error ({tasks[task]}): {error}")
 
             if result is not None:
                 break
@@ -601,14 +614,12 @@ async def fetch_url_content(url: str) -> str:
 
     # All attempts failed — extract minimal info from URL
     if result is None:
-        logger.error(f"Failed to fetch URL {clean_url_str} after all attempts")
+        logger.error(f"Failed to fetch {clean_url_str}")
         url_info = extract_url_info(clean_url_str)
         result = url_info if url_info else ""
 
-    # Cache the result (including failures, to avoid re-fetching blocked pages)
+    # Cache the result
     _url_cache[clean_url_str] = (result, time.time())
-
-    # Prune expired cache entries periodically
     if len(_url_cache) > 50:
         expired = [k for k, (_, ts) in _url_cache.items() if time.time() - ts > URL_CACHE_TTL]
         for k in expired:
@@ -684,36 +695,40 @@ def extract_url_info(url: str) -> str:
 
 
 def extract_page_text(html: str) -> str:
-    """Extract readable text from HTML page."""
-    # Remove script and style elements
-    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r'<nav[^>]*>.*?</nav>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r'<footer[^>]*>.*?</footer>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r'<header[^>]*>.*?</header>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r'<aside[^>]*>.*?</aside>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
+    """Extract readable article text from HTML using trafilatura.
 
-    # Remove all HTML tags
-    text = re.sub(r'<[^>]+>', ' ', html)
+    trafilatura (F1=0.958) accurately separates article content from
+    navigation, ads, and boilerplate. Falls back to basic regex stripping
+    if trafilatura returns nothing (e.g., non-article pages).
+    """
+    # Primary: trafilatura (handles articles, blog posts, news)
+    try:
+        text = trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=True,
+            favor_recall=True,  # prefer getting more text over precision
+        )
+        if text and len(text.strip()) > 50:
+            if len(text) > 3000:
+                text = text[:3000] + "..."
+            return text
+    except Exception as e:
+        logger.warning(f"trafilatura extraction failed: {e}")
 
-    # Clean up whitespace
+    # Fallback: basic regex stripping (for non-article pages)
+    cleaned = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<style[^>]*>.*?</style>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<nav[^>]*>.*?</nav>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<footer[^>]*>.*?</footer>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<!--.*?-->', '', cleaned, flags=re.DOTALL)
+    text = re.sub(r'<[^>]+>', ' ', cleaned)
     text = re.sub(r'\s+', ' ', text).strip()
+    text = text.replace('&nbsp;', ' ').replace('&amp;', '&')
+    text = text.replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"')
 
-    # Decode HTML entities
-    text = text.replace('&nbsp;', ' ')
-    text = text.replace('&amp;', '&')
-    text = text.replace('&lt;', '<')
-    text = text.replace('&gt;', '>')
-    text = text.replace('&quot;', '"')
-    text = text.replace('&#39;', "'")
-    text = re.sub(r'&#(\d+);', lambda m: chr(int(m.group(1))), text)
-    text = re.sub(r'&#x([0-9a-fA-F]+);', lambda m: chr(int(m.group(1), 16)), text)
-
-    # Limit to first 3000 chars
     if len(text) > 3000:
         text = text[:3000] + "..."
-
     return text
 
 
@@ -787,7 +802,9 @@ async def query_perplexity(
         'Если видишь "[PAGE NOT ACCESSIBLE]" - страница не загрузилась. '
         'СТРОГО ЗАПРЕЩЕНО угадывать содержание по URL-адресу или частям ссылки. '
         'Вместо этого ПОИЩИ информацию по этой ссылке или событию через веб-поиск. '
-        'Если не нашёл - честно скажи что страница недоступна и ты не смог найти информацию.'
+        'Если не нашёл - честно скажи что страница недоступна и ты не смог найти информацию. '
+        'Если видишь "[PAYWALL]" - статья за пейволлом, доступен только превью. '
+        'Расскажи что есть из превью и упомяни что полная статья доступна по подписке.'
     )
 
     # Add memory context
@@ -1381,20 +1398,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def init_clients(application) -> None:
     """Initialize global HTTP clients and async Redis on startup."""
-    global http_client, http2_client, redis_client
-    client_limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
+    global http_client, curl_session, redis_client
+
+    # httpx for Perplexity API calls (no impersonation needed)
     http_client = httpx.AsyncClient(
         timeout=30.0,
         follow_redirects=True,
-        limits=client_limits,
+        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
     )
-    http2_client = httpx.AsyncClient(
-        timeout=20.0,
-        follow_redirects=True,
-        http2=True,
-        limits=client_limits,
+
+    # curl_cffi for URL fetching (browser TLS impersonation)
+    curl_session = CurlAsyncSession(
+        timeout=20,
+        allow_redirects=True,
+        max_clients=10,
     )
-    logger.info("HTTP clients initialized with connection pooling (HTTP/1.1 + HTTP/2)")
+
+    logger.info("HTTP clients initialized (httpx for API, curl_cffi for URL fetching)")
 
     # Initialize async Redis
     if REDIS_URL:
@@ -1409,14 +1429,14 @@ async def init_clients(application) -> None:
 
 async def cleanup_clients(application) -> None:
     """Cleanup global HTTP clients and Redis on shutdown."""
-    global http_client, http2_client, redis_client
+    global http_client, curl_session, redis_client
     if http_client:
         await http_client.aclose()
-    if http2_client:
-        await http2_client.aclose()
+    if curl_session:
+        await curl_session.close()
     if redis_client:
         await redis_client.aclose()
-    logger.info("HTTP clients and Redis closed")
+    logger.info("All clients closed")
 
 
 def main() -> None:
