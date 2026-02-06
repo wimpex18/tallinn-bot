@@ -572,6 +572,7 @@ def extract_url_info(url: str) -> str:
                     return result
 
         # Generic URL info
+        info_parts.append("[PAGE NOT ACCESSIBLE - URL info only]")
         info_parts.append(f"Site: {domain}")
         if path_parts:
             # Try to extract meaningful path segments
@@ -581,7 +582,8 @@ def extract_url_info(url: str) -> str:
                 if not part.isdigit() and part not in ['events', 'event', 'tickets', 'ticket', 'e']:
                     readable_parts.append(part.replace('-', ' ').replace('_', ' '))
             if readable_parts:
-                info_parts.append(f"Path: {' / '.join(readable_parts)}")
+                info_parts.append(f"Path segments: {' / '.join(readable_parts)}")
+        info_parts.append("IMPORTANT: Cannot access page content. Search for more info if needed.")
 
         return '\n'.join(info_parts) if info_parts else ""
     except Exception as e:
@@ -592,60 +594,71 @@ def extract_url_info(url: str) -> str:
 def parse_tickettailor_url(parsed, path_parts) -> str:
     """Parse TicketTailor URL structure."""
     # URL format: /events/{organizer}/{event_id}
-    info = ["Site: TicketTailor (ticket platform)"]
+    info = ["[PAGE NOT ACCESSIBLE - URL info only]"]
+    info.append("Site: TicketTailor (ticket sales platform)")
     if len(path_parts) >= 2 and path_parts[0] == 'events':
         organizer = path_parts[1].replace('-', ' ').replace('_', ' ').title()
-        info.append(f"Organizer: {organizer}")
+        info.append(f"Organizer ID: {organizer} (this is just a URL slug, NOT the event name)")
         if len(path_parts) >= 3:
             info.append(f"Event ID: {path_parts[2]}")
-    info.append("Note: This is a ticket sales page. Visit the URL directly for event details.")
+    info.append("IMPORTANT: Cannot access page content. DO NOT guess what the event is about.")
+    info.append("Search for the event ID or organizer name to find actual event details.")
     return '\n'.join(info)
 
 
 def parse_eventbrite_url(parsed, path_parts) -> str:
     """Parse Eventbrite URL structure."""
-    info = ["Site: Eventbrite (event platform)"]
+    info = ["[PAGE NOT ACCESSIBLE - URL info only]"]
+    info.append("Site: Eventbrite (event platform)")
     # URL format: /e/{event-name-tickets-{id}}
     for part in path_parts:
         if '-tickets-' in part:
             event_name = part.split('-tickets-')[0].replace('-', ' ').title()
-            info.append(f"Event: {event_name}")
+            info.append(f"Event name from URL: {event_name}")
             break
+    info.append("IMPORTANT: Cannot access page. Search for this event for actual details.")
     return '\n'.join(info)
 
 
 def parse_facebook_url(parsed, path_parts) -> str:
     """Parse Facebook URL structure."""
-    info = ["Site: Facebook"]
+    info = ["[PAGE NOT ACCESSIBLE - URL info only]"]
     if 'events' in path_parts:
-        info[0] = "Site: Facebook Events"
+        info.append("Site: Facebook Events")
         idx = path_parts.index('events')
         if len(path_parts) > idx + 1:
             info.append(f"Event ID: {path_parts[idx + 1]}")
+    else:
+        info.append("Site: Facebook")
+    info.append("IMPORTANT: Cannot access page. Search for this event for actual details.")
     return '\n'.join(info)
 
 
 def parse_piletilevi_url(parsed, path_parts) -> str:
     """Parse Piletilevi (Estonian ticket platform) URL."""
-    info = ["Site: Piletilevi (Estonian ticket platform)"]
+    info = ["[PAGE NOT ACCESSIBLE - URL info only]"]
+    info.append("Site: Piletilevi (Estonian ticket platform)")
     for part in path_parts:
         if part not in ['est', 'eng', 'rus', 'event', 'events']:
             readable = part.replace('-', ' ').replace('_', ' ')
             if not readable.isdigit():
-                info.append(f"Event: {readable.title()}")
+                info.append(f"Event from URL: {readable.title()}")
                 break
+    info.append("IMPORTANT: Cannot access page. Search for this event for actual details.")
     return '\n'.join(info)
 
 
 def parse_fienta_url(parsed, path_parts) -> str:
     """Parse Fienta (Estonian/Baltic ticket platform) URL."""
-    info = ["Site: Fienta (ticket platform)"]
+    info = ["[PAGE NOT ACCESSIBLE - URL info only]"]
+    info.append("Site: Fienta (ticket platform)")
     for part in path_parts:
         if part not in ['event', 'events', 'buy', 'tickets']:
             readable = part.replace('-', ' ').replace('_', ' ')
             if not readable.isdigit():
-                info.append(f"Event: {readable.title()}")
+                info.append(f"Event from URL: {readable.title()}")
                 break
+    info.append("IMPORTANT: Cannot access page. Search for this event for actual details.")
     return '\n'.join(info)
 
 
@@ -749,9 +762,11 @@ async def query_perplexity(
         'ищи на АНГЛИЙСКОМ и ЭСТОНСКОМ языках (не на русском), так как большинство '
         'актуальной информации о Таллинне на этих языках. '
         'Хорошие источники: Facebook Events, visitestonia.com, tallinn.ee. '
-        'Если не находишь на английском/эстонском - попробуй gloss.ee (русскоязычный сайт о Таллинне).'
+        'Если не находишь на английском/эстонском - попробуй gloss.ee (русскоязычный сайт о Таллинне). '
+        'Если видишь "[PAGE NOT ACCESSIBLE]" - страница не загрузилась, ПОИЩИ информацию об этом событии/ссылке сам, НЕ выдумывай.'
     )
 
+    # Add memory context
     if user_facts:
         system_prompt += f"\n\nТы помнишь про этого человека: {', '.join(user_facts[:5])}"
     if group_facts:
