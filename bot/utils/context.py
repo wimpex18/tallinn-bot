@@ -37,6 +37,38 @@ def get_context_string(chat_id: int) -> str:
     return "\n".join(lines)
 
 
+def get_context_messages(chat_id: int) -> list[dict]:
+    """Get recent conversation as a list of {role, content} for the API.
+
+    Merges consecutive same-role messages and maps to user/assistant roles.
+    Returns at most CONTEXT_SIZE messages.
+    """
+    if not chat_context[chat_id]:
+        return []
+
+    api_msgs = []
+    for msg in chat_context[chat_id][-CONTEXT_SIZE:]:
+        role = "assistant" if msg["role"] == "assistant" else "user"
+        name = msg.get("name", "user")
+        text = msg["content"]
+        # Prefix user messages with the speaker's name (groups have multiple users)
+        if role == "user":
+            text = f"{name}: {text}"
+
+        # Merge consecutive same-role messages (API requires alternating roles)
+        if api_msgs and api_msgs[-1]["role"] == role:
+            api_msgs[-1]["content"] += f"\n{text}"
+        else:
+            api_msgs.append({"role": role, "content": text})
+
+    # API requires first message after system to be "user".
+    # Drop leading assistant messages (rare edge case).
+    while api_msgs and api_msgs[0]["role"] == "assistant":
+        api_msgs.pop(0)
+
+    return api_msgs
+
+
 def evict_stale_data() -> None:
     """Remove stale entries from in-memory dicts.
 
