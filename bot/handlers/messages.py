@@ -111,9 +111,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     referenced_content = None
     reply_msg = message.reply_to_message
 
-    # Case 1: User replies to another message
+    # Case 1: User replies to another message (reply to bot OR @mention in reply)
     msg_text = get_message_content(message)
-    if reply_msg and msg_text and f"@{BOT_USERNAME}" in msg_text:
+    if reply_msg:
         reply_content = get_message_content(reply_msg)
         if reply_content:
             reply_author = get_display_name(reply_msg.from_user) if reply_msg.from_user else "unknown"
@@ -122,6 +122,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             reply_urls = get_all_urls(reply_msg)
 
+            # Determine if this is a reply to the bot's own message
+            is_reply_to_bot = (
+                reply_msg.from_user
+                and reply_msg.from_user.username == BOT_USERNAME
+            )
+
             if is_forwarded_message(reply_msg):
                 referenced_content = f"[Forwarded post]: {reply_content}"
                 if reply_urls:
@@ -129,6 +135,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             elif reply_urls:
                 referenced_content = f"[Message with links]: {reply_content}"
                 referenced_content += f"\n[URLs]: {', '.join(reply_urls[:5])}"
+            elif is_reply_to_bot:
+                # User is replying to the bot's own message — include it as context
+                referenced_content = f"[Your previous reply]: {reply_content}"
             else:
                 referenced_content = f"[Message from {reply_author}]: {reply_content}"
 

@@ -69,10 +69,13 @@ async def query_perplexity(
         question = f"{question} (Tallinn, Estonia)"
 
     # Build user message
+    parts = []
+    if context:
+        parts.append(f"[Recent conversation]:\n{context}")
     if referenced_content:
-        user_message = f"{referenced_content}\n\nВопрос: {question}"
-    else:
-        user_message = question
+        parts.append(f"{referenced_content}")
+    parts.append(f"Вопрос: {question}" if referenced_content or context else question)
+    user_message = "\n\n".join(parts)
 
     # Build message content (with photos if provided)
     if photo_urls:
