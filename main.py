@@ -6,9 +6,13 @@ Performance-critical settings applied here:
 - drop_pending_updates=True on webhook (clear stale backlog on restart)
 - Increased read/write/connect timeouts
 - webhook secret_token for security
+- JobQueue for proactive memory + scheduled tasks
+- Silent observer handler (group 1) for style profiling + spontaneous replies
 """
 
 import os
+import datetime
+import zoneinfo
 import logging
 
 import httpx
@@ -19,6 +23,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
@@ -27,20 +32,132 @@ from config import (
     PERPLEXITY_TIMEOUT,
     TELEGRAM_POOL_SIZE, TELEGRAM_POOL_TIMEOUT,
     TELEGRAM_READ_TIMEOUT, TELEGRAM_WRITE_TIMEOUT, TELEGRAM_CONNECT_TIMEOUT,
+    PROACTIVE_MEMORY_INTERVAL,
+    QUIET_HOURS_START, QUIET_HOURS_END,
     logger,
 )
 from bot.handlers.commands import (
     start_command, help_command, remember_command, forget_command, memory_command,
+    cleanup_command, quiet_command,
 )
 from bot.handlers.messages import handle_message
+from bot.handlers.observer import observe_and_learn
 from bot.handlers.errors import error_handler
 from bot.services import memory as memory_service
 from bot.services import perplexity as perplexity_service
 from bot.services import url_fetcher as url_fetcher_service
+from bot.services.style import generate_style_summary_llm
 
+TALLINN_TZ = zoneinfo.ZoneInfo("Europe/Tallinn")
+
+
+# ── Scheduled jobs ───────────────────────────────────────────────────
+
+async def proactive_memory_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodically review recent group messages and extract facts.
+
+    Runs ~3× per day, skips quiet hours.
+    """
+    hour = datetime.datetime.now(TALLINN_TZ).hour
+    if QUIET_HOURS_START > QUIET_HOURS_END:
+        if hour >= QUIET_HOURS_START or hour < QUIET_HOURS_END:
+            return
+    elif QUIET_HOURS_START <= hour < QUIET_HOURS_END:
+        return
+
+    if not memory_service.redis_client:
+        return
+
+    logger.info("[job] Proactive memory extraction starting")
+
+    try:
+        # Find all chats that have recent messages
+        cursor = 0
+        while True:
+            cursor, keys = await memory_service.redis_client.scan(
+                cursor, match="chat:*:recent_msgs", count=50,
+            )
+            for key in keys:
+                chat_id_str = key.split(":")[1]
+                try:
+                    chat_id = int(chat_id_str)
+                except ValueError:
+                    continue
+
+                # Skip quiet-mode chats
+                if await memory_service.is_quiet_mode(chat_id):
+                    continue
+
+                messages = await memory_service.get_recent_chat_messages(chat_id, 20)
+                if len(messages) < 3:
+                    continue
+
+                facts = await memory_service.extract_facts_from_conversation(
+                    chat_id, messages,
+                )
+                for fact in facts:
+                    await memory_service.save_group_fact(chat_id, fact)
+
+                if facts:
+                    logger.info(f"[job] Learned {len(facts)} facts from chat {chat_id}")
+
+            if cursor == 0:
+                break
+    except Exception as e:
+        logger.error(f"[job] Proactive memory extraction failed: {e}")
+
+
+async def refresh_style_profiles_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodically regenerate LLM-based style summaries for active users."""
+    if not memory_service.redis_client:
+        return
+
+    logger.info("[job] Refreshing user style profiles")
+    try:
+        cursor = 0
+        refreshed = 0
+        while True:
+            cursor, keys = await memory_service.redis_client.scan(
+                cursor, match="user:*:style", count=50,
+            )
+            for key in keys:
+                user_id_str = key.split(":")[1]
+                try:
+                    user_id = int(user_id_str)
+                except ValueError:
+                    continue
+
+                msg_count = int(
+                    await memory_service.redis_client.hget(key, "msg_count") or 0
+                )
+                if msg_count < 10:
+                    continue
+
+                profile = await memory_service.redis_client.hgetall(
+                    f"user:{user_id}:profile"
+                )
+                user_name = profile.get("name", "user")
+                result = await generate_style_summary_llm(
+                    memory_service.redis_client,
+                    memory_service.http_client,
+                    user_id,
+                    user_name,
+                )
+                if result:
+                    refreshed += 1
+
+            if cursor == 0:
+                break
+        if refreshed:
+            logger.info(f"[job] Refreshed {refreshed} style profiles")
+    except Exception as e:
+        logger.error(f"[job] Style profile refresh failed: {e}")
+
+
+# ── Client lifecycle ─────────────────────────────────────────────────
 
 async def init_clients(application) -> None:
-    """Initialize global HTTP clients and async Redis on startup."""
+    """Initialize global HTTP clients, async Redis, and schedule jobs."""
     # httpx for Perplexity API calls (no TLS impersonation needed)
     client = httpx.AsyncClient(
         timeout=PERPLEXITY_TIMEOUT,
@@ -67,6 +184,26 @@ async def init_clients(application) -> None:
             logger.warning(f"Redis connection failed, memory disabled: {e}")
             memory_service.redis_client = None
 
+    # Schedule periodic jobs
+    jq = application.job_queue
+    if jq:
+        # Proactive memory extraction (~3× per day)
+        jq.run_repeating(
+            proactive_memory_job,
+            interval=PROACTIVE_MEMORY_INTERVAL,
+            first=600,   # first run 10 min after startup
+            name="proactive_memory",
+        )
+        # Style profile refresh (once a day at 14:00 Tallinn time)
+        jq.run_daily(
+            refresh_style_profiles_job,
+            time=datetime.time(14, 0, tzinfo=TALLINN_TZ),
+            name="refresh_styles",
+        )
+        logger.info("JobQueue: proactive_memory + refresh_styles scheduled")
+    else:
+        logger.warning("JobQueue not available — install python-telegram-bot[job-queue]")
+
 
 async def cleanup_clients(application) -> None:
     """Cleanup global HTTP clients and Redis on shutdown."""
@@ -78,6 +215,8 @@ async def cleanup_clients(application) -> None:
         await memory_service.redis_client.aclose()
     logger.info("All clients closed")
 
+
+# ── Main ─────────────────────────────────────────────────────────────
 
 def main() -> None:
     if not TELEGRAM_TOKEN:
@@ -112,16 +251,28 @@ def main() -> None:
     application.post_init = init_clients
     application.post_shutdown = cleanup_clients
 
-    # ── Register handlers ────────────────────────────────────────
+    # ── Handler group 0 (default): commands + main message handler ───
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("remember", remember_command))
     application.add_handler(CommandHandler("forget", forget_command))
     application.add_handler(CommandHandler("memory", memory_command))
+    application.add_handler(CommandHandler("cleanup", cleanup_command))
+    application.add_handler(CommandHandler("quiet", quiet_command))
     application.add_handler(MessageHandler(
         (filters.TEXT | filters.FORWARDED | filters.PHOTO) & ~filters.COMMAND,
         handle_message,
     ))
+
+    # ── Handler group 1: silent observer (runs on EVERY group message) ──
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
+            observe_and_learn,
+        ),
+        group=1,
+    )
+
     application.add_error_handler(error_handler)
 
     # ── Run ──────────────────────────────────────────────────────
@@ -134,7 +285,7 @@ def main() -> None:
             "port": port,
             "url_path": TELEGRAM_TOKEN,
             "webhook_url": f"{webhook_url}/{TELEGRAM_TOKEN}",
-            "drop_pending_updates": True,  # clear stale backlog on restart
+            "drop_pending_updates": True,
         }
         if WEBHOOK_SECRET:
             webhook_kwargs["secret_token"] = WEBHOOK_SECRET

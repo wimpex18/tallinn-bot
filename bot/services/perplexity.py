@@ -22,6 +22,7 @@ async def query_perplexity(
     user_facts: list[str] = None,
     group_facts: list[str] = None,
     photo_urls: list[str] = None,
+    user_style: str = None,
 ) -> str:
     """Query Perplexity API with context, memory, and photos.
 
@@ -48,6 +49,8 @@ async def query_perplexity(
         system_prompt += f"\n\nТы помнишь про этого человека: {', '.join(user_facts[:5])}"
     if group_facts:
         system_prompt += f"\n\nТы помнишь про эту группу: {', '.join(group_facts[:5])}"
+    if user_style:
+        system_prompt += f"\n\n{user_style}"
 
     # Auto-append "Tallinn, Estonia" for place/event queries
     question_lower = question.lower()

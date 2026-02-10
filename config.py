@@ -44,6 +44,39 @@ TELEGRAM_READ_TIMEOUT = 30
 TELEGRAM_WRITE_TIMEOUT = 30
 TELEGRAM_CONNECT_TIMEOUT = 15
 
+# ── Proactive behaviour ──────────────────────────────────────────────
+# Spontaneous replies (bot randomly replies to interesting messages)
+SPONTANEOUS_REPLY_PROBABILITY = 0.03      # 3 % base chance per group message
+SPONTANEOUS_REPLY_KEYWORD_BOOST = 0.12    # +12 % if message touches Tallinn topics
+SPONTANEOUS_REPLY_COOLDOWN = 600          # min 10 min between spontaneous replies per chat
+SPONTANEOUS_REPLY_MIN_MESSAGES = 5        # need N messages since last bot reply
+PROACTIVE_MAX_PER_HOUR = 3               # max spontaneous msgs per group per hour
+
+# Proactive memory: the bot reviews recent conversation 3× per day
+# and extracts facts it missed (scheduled via JobQueue)
+PROACTIVE_MEMORY_INTERVAL = 8 * 3600     # every ~8 h ≈ 3× per day
+RECENT_MESSAGES_BUFFER = 20              # how many recent msgs to keep per chat
+
+# Style profiling
+STYLE_MIN_MESSAGES = 5                   # require N msgs before generating a style summary
+STYLE_SUMMARY_TTL = 86400                # cache style summary for 24 h
+STYLE_RECENT_MESSAGES_KEPT = 20          # number of recent messages stored per user for style
+
+# Night-time guard (Tallinn timezone): no proactive messages between these hours
+QUIET_HOURS_START = 23    # 23:00
+QUIET_HOURS_END = 8       # 08:00
+
+# Interesting topics that boost spontaneous reply probability
+INTERESTING_TOPICS = [
+    "таллинн", "tallinn", "эстони", "estonia", "бар", "ресторан",
+    "кафе", "клуб", "кино", "концерт", "мероприят", "фестивал",
+    "погод", "рекоменд", "посоветуй", "сходить", "пойти",
+    "event", "weekend", "выходн",
+]
+
+# Redis key TTLs (prevent orphaned data)
+REDIS_KEY_TTL_DAYS = 90   # expire user/group keys untouched for 90 days
+
 # ── Username → display name mapping ─────────────────────────────────
 USERNAME_TO_NAME = {
     "Vitalina_Bohaichuk": "Виталина",
