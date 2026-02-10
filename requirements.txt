@@ -1,4 +1,4 @@
-python-telegram-bot[webhooks]==21.9
+python-telegram-bot[webhooks]==22.6
 httpx==0.28.1
 curl_cffi>=0.9
 trafilatura>=2.0
