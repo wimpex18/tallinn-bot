@@ -131,3 +131,48 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             response = "Пока ничего не помню"
 
         await update.message.reply_text(response.strip())
+
+
+async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /cleanup — remove stale Redis keys (admin only)."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    # Only allow in private chat or by group admin
+    if update.effective_chat.type != "private":
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        if member.status not in ["creator", "administrator"]:
+            await update.message.reply_text("Только админ может это делать)")
+            return
+
+    from bot.services.memory import cleanup_stale_redis_keys
+    await update.message.reply_text("Чищу старые данные...")
+    stats = await cleanup_stale_redis_keys(max_age_days=90)
+    await update.message.reply_text(
+        f"Готово! Просканировано: {stats.get('scanned', 0)}, "
+        f"удалено: {stats.get('deleted', 0)}"
+    )
+
+
+async def quiet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /quiet — toggle proactive/spontaneous messages in this chat."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("Эта команда для групповых чатов)")
+        return
+
+    member = await context.bot.get_chat_member(chat_id, user_id)
+    if member.status not in ["creator", "administrator"]:
+        await update.message.reply_text("Только админ может это делать)")
+        return
+
+    from bot.services.memory import is_quiet_mode, set_quiet_mode
+    currently_quiet = await is_quiet_mode(chat_id)
+    await set_quiet_mode(chat_id, not currently_quiet)
+
+    if currently_quiet:
+        await update.message.reply_text("Включил спонтанные сообщения)")
+    else:
+        await update.message.reply_text("Выключил спонтанные сообщения. /quiet чтобы вернуть)")

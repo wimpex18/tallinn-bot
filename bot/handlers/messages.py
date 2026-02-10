@@ -20,7 +20,10 @@ from bot.services.memory import (
     get_user_facts, get_group_facts,
     save_user_fact, save_group_fact, save_user_interaction,
     smart_extract_facts, extract_facts_from_response,
+    redis_client,
 )
+from bot.services.style import get_style_summary
+from bot.handlers.observer import record_bot_replied
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +201,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_facts, group_facts = await asyncio.gather(user_facts_coro, group_facts_coro)
 
+    # Fetch per-user communication style (for tone adaptation)
+    from bot.services import memory as mem_svc
+    user_style = await get_style_summary(mem_svc.redis_client, user_id)
+
     timer.checkpoint("memory")
 
     # ── Photos ───────────────────────────────────────────────────
@@ -230,6 +237,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_facts=user_facts,
         group_facts=group_facts,
         photo_urls=photo_urls if photo_urls else None,
+        user_style=user_style,
     )
 
     timer.checkpoint("perplexity")
@@ -241,6 +249,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await save_user_interaction(user_id, user_name, user.username)
 
     await message.reply_text(answer, reply_to_message_id=message.message_id)
+    record_bot_replied(chat_id)
 
     timer.checkpoint("reply_sent")
     timer.done()

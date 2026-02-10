@@ -6,7 +6,7 @@ import logging
 
 import httpx
 
-from config import PERPLEXITY_API_KEY
+from config import PERPLEXITY_API_KEY, STYLE_RECENT_MESSAGES_KEPT
 
 logger = logging.getLogger(__name__)
 
@@ -155,3 +155,184 @@ async def smart_extract_facts(
     except Exception as e:
         logger.error(f"Failed to extract facts: {e}")
         return []
+
+
+# ── Recent messages buffer (for proactive memory + style) ────────────
+
+async def store_recent_message(
+    chat_id: int, user_id: int, user_name: str, text: str,
+) -> None:
+    """Push a message into per-chat and per-user recent-message lists in Redis."""
+    if not redis_client:
+        return
+    try:
+        entry = f"{user_name}: {text[:300]}"
+        pipe = redis_client.pipeline()
+        # Per-chat buffer (for proactive memory extraction)
+        pipe.lpush(f"chat:{chat_id}:recent_msgs", entry)
+        pipe.ltrim(f"chat:{chat_id}:recent_msgs", 0, 29)  # keep 30
+        # Per-user buffer (for style analysis)
+        pipe.lpush(f"user:{user_id}:recent_msgs", text[:300])
+        pipe.ltrim(f"user:{user_id}:recent_msgs", 0, STYLE_RECENT_MESSAGES_KEPT - 1)
+        await pipe.execute()
+    except Exception as e:
+        logger.error(f"Failed to store recent message: {e}")
+
+
+async def get_recent_chat_messages(chat_id: int, count: int = 20) -> list[str]:
+    """Get the last N messages from a chat (newest first)."""
+    if not redis_client:
+        return []
+    try:
+        return await redis_client.lrange(f"chat:{chat_id}:recent_msgs", 0, count - 1)
+    except Exception as e:
+        logger.error(f"Failed to get recent chat messages: {e}")
+        return []
+
+
+# ── Proactive fact extraction from conversation ──────────────────────
+
+async def extract_facts_from_conversation(
+    chat_id: int, messages: list[str],
+) -> list[str]:
+    """Use LLM to extract facts about users from a batch of group messages.
+
+    Called by the proactive memory job, not per-message.
+    """
+    if not messages or len(messages) < 3:
+        return []
+
+    conversation = "\n".join(reversed(messages))  # oldest first
+    prompt = f"""Проанализируй эти сообщения из группового чата:
+
+{conversation}
+
+Извлеки важные факты о людях: интересы, предпочтения, планы, работа, настроение,
+отношения. Формат: "Имя: факт" — один факт на строку, коротко (3-7 слов).
+Если фактов нет — ответь НЕТ. Максимум 5 фактов."""
+
+    try:
+        client = http_client or httpx.AsyncClient(timeout=15.0)
+        resp = await client.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers={
+                "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "sonar",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 150,
+                "temperature": 0.1,
+            },
+        )
+        resp.raise_for_status()
+        result = resp.json()["choices"][0]["message"]["content"].strip()
+
+        if "НЕТ" in result.upper() or len(result) < 5:
+            return []
+
+        facts = []
+        for line in result.split("\n"):
+            line = line.strip().lstrip("-•0123456789.").strip()
+            if 5 < len(line) < 120:
+                facts.append(line)
+        return facts[:5]
+    except Exception as e:
+        logger.error(f"Proactive fact extraction failed: {e}")
+        return []
+
+
+# ── Redis cleanup / maintenance ──────────────────────────────────────
+
+async def cleanup_stale_redis_keys(max_age_days: int = 90) -> dict:
+    """Scan Redis for orphaned keys and delete those untouched for > max_age_days.
+
+    Returns a summary dict of what was cleaned up.
+    """
+    if not redis_client:
+        return {"error": "Redis not connected"}
+
+    stats = {"scanned": 0, "deleted": 0, "patterns": {}}
+    now = time.time()
+    cutoff = now - (max_age_days * 86400)
+
+    try:
+        cursor = 0
+        while True:
+            cursor, keys = await redis_client.scan(cursor, count=100)
+            for key in keys:
+                stats["scanned"] += 1
+                key_type = await redis_client.type(key)
+
+                should_delete = False
+
+                if key_type == "zset":
+                    # Sorted sets: check highest score (most recent timestamp)
+                    top = await redis_client.zrange(key, -1, -1, withscores=True)
+                    if not top:
+                        should_delete = True
+                    elif top[0][1] < cutoff:
+                        should_delete = True
+
+                elif key_type == "hash":
+                    last_seen = await redis_client.hget(key, "last_seen")
+                    if last_seen:
+                        # Profile hash — check last_seen
+                        try:
+                            from datetime import datetime
+                            dt = datetime.fromisoformat(last_seen)
+                            if dt.timestamp() < cutoff:
+                                should_delete = True
+                        except (ValueError, TypeError):
+                            pass
+                    else:
+                        # Style hash — no TTL check needed, counter-based
+                        pass
+
+                elif key_type == "list":
+                    # Recent message lists — check TTL or if empty
+                    length = await redis_client.llen(key)
+                    if length == 0:
+                        should_delete = True
+
+                if should_delete:
+                    await redis_client.delete(key)
+                    stats["deleted"] += 1
+                    # Track pattern
+                    pattern = ":".join(key.split(":")[:1] + ["*"] + key.split(":")[2:])
+                    stats["patterns"][pattern] = stats["patterns"].get(pattern, 0) + 1
+
+            if cursor == 0:
+                break
+    except Exception as e:
+        logger.error(f"Redis cleanup failed: {e}")
+        stats["error"] = str(e)
+
+    logger.info(f"Redis cleanup: scanned={stats['scanned']}, deleted={stats['deleted']}")
+    return stats
+
+
+# ── Quiet-mode per chat ──────────────────────────────────────────────
+
+async def set_quiet_mode(chat_id: int, enabled: bool) -> None:
+    """Toggle proactive messages for a chat."""
+    if not redis_client:
+        return
+    try:
+        if enabled:
+            await redis_client.set(f"chat:{chat_id}:quiet", "1")
+        else:
+            await redis_client.delete(f"chat:{chat_id}:quiet")
+    except Exception as e:
+        logger.error(f"Failed to set quiet mode: {e}")
+
+
+async def is_quiet_mode(chat_id: int) -> bool:
+    """Check if proactive messages are disabled for a chat."""
+    if not redis_client:
+        return False
+    try:
+        return await redis_client.exists(f"chat:{chat_id}:quiet") > 0
+    except Exception:
+        return False
