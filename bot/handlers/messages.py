@@ -8,7 +8,7 @@ from telegram.ext import ContextTypes
 
 from config import BOT_USERNAME
 from bot.middleware.timing import Timer
-from bot.utils.context import add_to_context, get_context_string, evict_stale_data
+from bot.utils.context import add_to_context, get_context_messages, evict_stale_data
 from bot.utils.helpers import (
     get_message_content, get_all_urls, extract_urls, extract_question,
     is_forwarded_message, has_photo, download_photo_as_base64,
@@ -200,7 +200,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_typing(context.bot, chat_id)
 
     # ── Gather context + memory in parallel ──────────────────────
-    conv_context = get_context_string(chat_id)
+    conv_context_msgs = get_context_messages(chat_id)
 
     async def _empty_list():
         return []
@@ -242,7 +242,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         question=question,
         referenced_content=referenced_content,
         user_name=user_name,
-        context=conv_context,
+        context_messages=conv_context_msgs,
         user_facts=user_facts,
         group_facts=group_facts,
         photo_urls=photo_urls if photo_urls else None,
@@ -264,7 +264,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     timer.done()
 
     # Fire-and-forget: background fact extraction
+    # Build a flat string for fact extraction (doesn't need multi-turn)
+    conv_context_str = "\n".join(
+        f"{m['role']}: {m['content']}" for m in conv_context_msgs
+    ) if conv_context_msgs else ""
     asyncio.create_task(_extract_and_save_facts(
         question=question, answer=answer, user_name=user_name,
-        conv_context=conv_context, chat_id=chat_id, user_id=user_id,
+        conv_context=conv_context_str, chat_id=chat_id, user_id=user_id,
     ))

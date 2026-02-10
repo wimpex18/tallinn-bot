@@ -18,15 +18,16 @@ async def query_perplexity(
     question: str,
     referenced_content: str = None,
     user_name: str = None,
-    context: str = None,
+    context_messages: list[dict] = None,
     user_facts: list[str] = None,
     group_facts: list[str] = None,
     photo_urls: list[str] = None,
     user_style: str = None,
 ) -> str:
-    """Query Perplexity API with context, memory, and photos.
+    """Query Perplexity API with multi-turn context, memory, and photos.
 
-    Returns cleaned answer text.  Timing is logged for diagnostics.
+    Uses proper alternating user/assistant messages so the model can
+    resolve pronouns and follow-up references from conversation history.
     """
     t0 = time.monotonic()
 
@@ -68,13 +69,11 @@ async def query_perplexity(
     ):
         question = f"{question} (Tallinn, Estonia)"
 
-    # Build user message
+    # Build the current user message (question + any referenced content)
     parts = []
-    if context:
-        parts.append(f"[Recent conversation]:\n{context}")
     if referenced_content:
         parts.append(f"{referenced_content}")
-    parts.append(f"Вопрос: {question}" if referenced_content or context else question)
+    parts.append(f"Вопрос: {question}" if referenced_content else question)
     user_message = "\n\n".join(parts)
 
     # Build message content (with photos if provided)
@@ -86,10 +85,30 @@ async def query_perplexity(
     else:
         user_message_content = user_message
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message_content},
-    ]
+    # Build messages array: system + conversation history + current message
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # Add multi-turn conversation history (proper alternating roles)
+    if context_messages:
+        # Ensure history starts with "user" role (API requirement)
+        for msg in context_messages:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+
+    # Ensure alternating roles (API requirement).
+    # If last history message is "user", merge the current question into it.
+    if len(messages) > 1 and messages[-1]["role"] == "user":
+        prev_text = messages[-1]["content"]
+        combined_text = f"{prev_text}\n{user_message}"
+        if photo_urls:
+            # Rebuild as multimodal content with merged text
+            content = [{"type": "text", "text": combined_text}]
+            for photo_url in photo_urls[:3]:
+                content.append({"type": "image_url", "image_url": {"url": photo_url}})
+            messages[-1]["content"] = content
+        else:
+            messages[-1]["content"] = combined_text
+    else:
+        messages.append({"role": "user", "content": user_message_content})
 
     payload = {
         "model": "sonar",
