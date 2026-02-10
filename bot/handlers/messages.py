@@ -115,6 +115,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     msg_text = get_message_content(message)
     if reply_msg:
         reply_content = get_message_content(reply_msg)
+        logger.info(
+            f"Reply detected: reply_to_message exists, "
+            f"from_user={reply_msg.from_user.username if reply_msg.from_user else 'None'}, "
+            f"has_text={bool(reply_msg.text)}, has_caption={bool(reply_msg.caption)}, "
+            f"content_len={len(reply_content) if reply_content else 0}"
+        )
         if reply_content:
             reply_author = get_display_name(reply_msg.from_user) if reply_msg.from_user else "unknown"
             if not reply_author:
@@ -136,8 +142,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 referenced_content = f"[Message with links]: {reply_content}"
                 referenced_content += f"\n[URLs]: {', '.join(reply_urls[:5])}"
             elif is_reply_to_bot:
-                # User is replying to the bot's own message — include it as context
-                referenced_content = f"[Your previous reply]: {reply_content}"
+                # User is replying to the bot's own message — include full text as context
+                # Use explicit label so the AI resolves pronouns ("этот клуб", "там", etc.)
+                referenced_content = (
+                    f"[КОНТЕКСТ — предыдущий ответ бота, на который пользователь отвечает]:\n"
+                    f"{reply_content}\n\n"
+                    f"Пользователь отвечает на это сообщение. "
+                    f"Разреши все ссылки и местоимения "
+                    f"(«этот клуб», «там», «он», «она», «это» и т.д.) "
+                    f"используя информацию из предыдущего ответа."
+                )
+                logger.info(
+                    f"Reply-to-bot context captured ({len(reply_content)} chars): "
+                    f"{reply_content[:150]}..."
+                )
             else:
                 referenced_content = f"[Message from {reply_author}]: {reply_content}"
 
@@ -234,9 +252,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # ── Query Perplexity ─────────────────────────────────────────
     logger.info(
-        f"Query from {user_id} ({user_name}): {question[:80]}... "
-        f"[ref={referenced_content is not None}, photos={len(photo_urls)}]"
+        f"Query from {user_id} ({user_name}): {question[:120]}... "
+        f"[ref={'yes('+str(len(referenced_content))+'chars)' if referenced_content else 'no'}, "
+        f"ctx_msgs={len(conv_context_msgs)}, photos={len(photo_urls)}]"
     )
+    if referenced_content:
+        logger.info(f"Referenced content preview: {referenced_content[:200]}...")
 
     answer = await query_perplexity(
         question=question,
@@ -253,7 +274,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # ── Post-processing ──────────────────────────────────────────
     set_rate_limit(user_id)
-    add_to_context(chat_id, "user", user_name or "user", question)
+    # Note: user message already added to context at top of handler (line ~102)
+    # for group chats, so only add for private chats to avoid duplicate
+    if update.effective_chat.type == "private":
+        add_to_context(chat_id, "user", user_name or "user", question)
     add_to_context(chat_id, "assistant", "bot", answer)
     await save_user_interaction(user_id, user_name, user.username)
 

@@ -43,7 +43,12 @@ async def query_perplexity(
         'Вместо этого ПОИЩИ информацию по этой ссылке или событию через веб-поиск. '
         'Если не нашёл - честно скажи что страница недоступна и ты не смог найти информацию. '
         'Если видишь "[PAYWALL]" - статья за пейволлом, доступен только превью. '
-        'Расскажи что есть из превью и упомяни что полная статья доступна по подписке.'
+        'Расскажи что есть из превью и упомяни что полная статья доступна по подписке. '
+        'ВАЖНО: Когда пользователь отвечает на твоё предыдущее сообщение и использует '
+        'ссылки типа «этот клуб», «там», «он», «она», «этот ресторан», «это место» — '
+        'ОБЯЗАТЕЛЬНО найди конкретное название из предыдущего ответа и используй его при поиске. '
+        'Например, если ты упомянул клуб Privè, а пользователь спрашивает «что ещё в этом клубе» — '
+        'ищи именно по «Privè Tallinn events».'
     )
 
     if user_facts:
@@ -109,6 +114,13 @@ async def query_perplexity(
             messages[-1]["content"] = combined_text
     else:
         messages.append({"role": "user", "content": user_message_content})
+
+    # Log the full message payload for debugging context resolution
+    for i, msg in enumerate(messages):
+        content_preview = msg["content"] if isinstance(msg["content"], str) else "[multimodal]"
+        if len(content_preview) > 300:
+            content_preview = content_preview[:300] + "..."
+        logger.info(f"Perplexity msg[{i}] role={msg['role']}: {content_preview}")
 
     payload = {
         "model": "sonar",
