@@ -10,6 +10,7 @@ Responsibilities:
 """
 
 import time
+import re
 import random
 import asyncio
 import logging
@@ -34,7 +35,7 @@ from config import (
     QUIET_HOURS_END,
 )
 from bot.utils.helpers import get_message_content, get_display_name
-from bot.utils.context import get_context_string
+from bot.utils.context import add_to_context, get_context_string
 from bot.services.memory import (
     store_recent_message, is_quiet_mode, save_group_fact, redis_client,
 )
@@ -178,6 +179,10 @@ async def observe_and_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             _hourly_sends[chat_id] = []
         _hourly_sends[chat_id].append(now)
 
+        # Track the spontaneous reply in conversation context so
+        # follow-up questions can reference what the bot just said.
+        add_to_context(chat_id, "assistant", "bot", comment)
+
         await message.reply_text(comment, reply_to_message_id=message.message_id)
         logger.info(f"[spontaneous] Replied in chat {chat_id}: {comment[:60]}...")
 
@@ -230,7 +235,6 @@ async def _generate_spontaneous_comment(
         if not result or "НЕТ" in result.upper() or len(result) < 3:
             return None
         # Clean citation markers
-        import re
         result = re.sub(r'\[\d+\]', '', result).strip()
         return result
     except Exception as e:
