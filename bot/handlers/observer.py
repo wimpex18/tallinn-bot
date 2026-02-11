@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 _last_spontaneous: dict[int, float] = {}     # chat_id -> timestamp
 _messages_since_reply: dict[int, int] = {}   # chat_id -> count
 _hourly_sends: dict[int, list[float]] = {}   # chat_id -> [timestamps]
+_OBSERVER_MAX_CHATS = 500   # evict stale entries if tracking more than this many chats
+_OBSERVER_STALE_AGE = 7200  # 2 hours — consider a chat stale if no spontaneous activity
 
 TALLINN_TZ = zoneinfo.ZoneInfo("Europe/Tallinn")
 
@@ -81,6 +83,23 @@ def _check_rate_ok(chat_id: int) -> bool:
         return False
 
     return True
+
+
+def evict_stale_observer_data() -> None:
+    """Remove stale entries from observer tracking dicts to prevent unbounded growth."""
+    now = time.time()
+    if len(_last_spontaneous) <= _OBSERVER_MAX_CHATS:
+        return
+    stale = [
+        cid for cid, ts in _last_spontaneous.items()
+        if now - ts > _OBSERVER_STALE_AGE
+    ]
+    for cid in stale:
+        _last_spontaneous.pop(cid, None)
+        _messages_since_reply.pop(cid, None)
+        _hourly_sends.pop(cid, None)
+    if stale:
+        logger.info(f"Observer evicted {len(stale)} stale chat tracking entries")
 
 
 def record_bot_replied(chat_id: int) -> None:
@@ -121,6 +140,9 @@ async def observe_and_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     # 2. Increment "messages since last bot reply" counter
     _messages_since_reply[chat_id] = _messages_since_reply.get(chat_id, 0) + 1
+
+    # Periodic cleanup of observer tracking dicts
+    evict_stale_observer_data()
 
     # 3. Maybe send a spontaneous reply
     #    Skip if: message is from the bot itself, quiet hours, quiet mode

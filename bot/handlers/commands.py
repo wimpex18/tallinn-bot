@@ -1,9 +1,13 @@
 """Telegram command handlers: /start, /help, /remember, /forget, /memory."""
 
+import logging
+
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from config import USERNAME_TO_NAME
+
+logger = logging.getLogger(__name__)
 from bot.services.memory import (
     save_user_fact, get_user_facts,
     save_group_fact, get_group_facts,
@@ -91,8 +95,7 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await memory.redis_client.delete(f"group:{chat_id}:facts")
             await update.message.reply_text("Забыл всё)")
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"Failed to forget: {e}")
+            logger.error(f"Failed to forget: {e}")
             await update.message.reply_text("Не получилось забыть(")
     else:
         await update.message.reply_text("Память не подключена(")

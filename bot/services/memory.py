@@ -70,12 +70,12 @@ async def save_user_interaction(user_id: int, user_name: str, username: str) -> 
     if not redis_client or not user_name:
         return
     try:
-        from datetime import datetime
+        from datetime import datetime, timezone
         key = f"user:{user_id}:profile"
         await redis_client.hset(key, mapping={
             "name": user_name,
             "username": username or "",
-            "last_seen": datetime.now().isoformat(),
+            "last_seen": datetime.now(timezone.utc).isoformat(),
         })
     except Exception as e:
         logger.error(f"Failed to save user interaction: {e}")
