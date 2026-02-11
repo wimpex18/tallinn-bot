@@ -129,23 +129,28 @@ async def query_perplexity(
         system_prompt += f"\n\n{user_style}"
 
     # Auto-append "Tallinn, Estonia" for place/event queries,
-    # but ONLY if no other city/location is explicitly mentioned.
-    question_lower = question.lower()
-    place_keywords = [
-        "бар", "ресторан", "кафе", "клуб", "кино", "магазин", "музей", "театр", "галерея",
-        "концерт", "мероприятие", "событие", "фестиваль", "выставка", "вечеринка", "шоу",
-        "ивент", "event", "афиша", "тусовка", "движ",
-        "сегодня", "завтра", "выходные", "вечером", "weekend",
-        "куда", "где", "посоветуй", "порекомендуй", "подскажи", "сходить", "пойти",
-    ]
-    location_keywords = ["таллин", "tallinn", "эстони", "estonia"]
+    # but ONLY if:
+    #  - no other city/location is explicitly mentioned
+    #  - NOT a reply to a previous bot message (referenced_content exists),
+    #    because in that case the location context comes from the referenced
+    #    answer, not the default Tallinn assumption
+    if not referenced_content:
+        question_lower = question.lower()
+        place_keywords = [
+            "бар", "ресторан", "кафе", "клуб", "кино", "магазин", "музей", "театр", "галерея",
+            "концерт", "мероприятие", "событие", "фестиваль", "выставка", "вечеринка", "шоу",
+            "ивент", "event", "афиша", "тусовка", "движ",
+            "сегодня", "завтра", "выходные", "вечером", "weekend",
+            "куда", "где", "посоветуй", "порекомендуй", "подскажи", "сходить", "пойти",
+        ]
+        location_keywords = ["таллин", "tallinn", "эстони", "estonia"]
 
-    has_place_keyword = any(kw in question_lower for kw in place_keywords)
-    has_tallinn_mention = any(loc in question_lower for loc in location_keywords)
-    has_other_location = _has_non_tallinn_location(question_lower)
+        has_place_keyword = any(kw in question_lower for kw in place_keywords)
+        has_tallinn_mention = any(loc in question_lower for loc in location_keywords)
+        has_other_location = _has_non_tallinn_location(question_lower)
 
-    if has_place_keyword and not has_tallinn_mention and not has_other_location:
-        question = f"{question} (Tallinn, Estonia)"
+        if has_place_keyword and not has_tallinn_mention and not has_other_location:
+            question = f"{question} (Tallinn, Estonia)"
 
     # Build the current user message (question + any referenced content).
     # When there is referenced content (e.g. reply to bot), put the context
