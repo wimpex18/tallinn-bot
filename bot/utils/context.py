@@ -19,7 +19,7 @@ def add_to_context(chat_id: int, role: str, name: str, content: str) -> None:
     chat_context[chat_id].append({
         "role": role,
         "name": name,
-        "content": content[:500],
+        "content": content[:1000],
         "time": time.time(),
     })
     if len(chat_context[chat_id]) > CONTEXT_SIZE:

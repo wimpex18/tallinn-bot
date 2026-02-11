@@ -96,12 +96,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = update.effective_user
     user_name = get_display_name(user)
 
-    # Track context for all group messages (even if not responding)
     msg_content = get_message_content(message)
-    if msg_content and update.effective_chat.type != "private":
-        add_to_context(chat_id, "user", user_name or "user", msg_content)
 
+    # For messages the bot won't respond to: track in context and exit early.
+    # For messages the bot WILL respond to: defer add_to_context until AFTER
+    # get_context_messages() to avoid the current message appearing in the
+    # conversation history sent to the API (which caused duplication).
     if not should_respond(update, BOT_USERNAME):
+        if msg_content and update.effective_chat.type != "private":
+            add_to_context(chat_id, "user", user_name or "user", msg_content)
         return
 
     timer.checkpoint("routing")
@@ -112,7 +115,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     reply_msg = message.reply_to_message
 
     # Case 1: User replies to another message (reply to bot OR @mention in reply)
-    msg_text = get_message_content(message)
     if reply_msg:
         reply_content = get_message_content(reply_msg)
         logger.info(
@@ -142,15 +144,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 referenced_content = f"[Message with links]: {reply_content}"
                 referenced_content += f"\n[URLs]: {', '.join(reply_urls[:5])}"
             elif is_reply_to_bot:
-                # User is replying to the bot's own message — include full text as context
-                # Use explicit label so the AI resolves pronouns ("этот клуб", "там", etc.)
+                # User is replying to the bot's own message — include full text
+                # so the model can resolve pronouns ("этот артист", "там", etc.)
                 referenced_content = (
-                    f"[КОНТЕКСТ — предыдущий ответ бота, на который пользователь отвечает]:\n"
-                    f"{reply_content}\n\n"
-                    f"Пользователь отвечает на это сообщение. "
-                    f"Разреши все ссылки и местоимения "
-                    f"(«этот клуб», «там», «он», «она», «это» и т.д.) "
-                    f"используя информацию из предыдущего ответа."
+                    f"[Предыдущий ответ бота, на который пользователь отвечает]:\n"
+                    f"«{reply_content}»"
                 )
                 logger.info(
                     f"Reply-to-bot context captured ({len(reply_content)} chars): "
@@ -210,6 +208,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Rate limit (checked after we know we will process)
     is_limited, remaining = check_rate_limit(user_id)
     if is_limited:
+        # Still track in context so future replies have full history
+        if msg_content and update.effective_chat.type != "private":
+            add_to_context(chat_id, "user", user_name or "user", msg_content)
         await message.reply_text(
             f"Подожди {remaining} сек, не спеши)", reply_to_message_id=message.message_id,
         )
@@ -218,7 +219,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_typing(context.bot, chat_id)
 
     # ── Gather context + memory in parallel ──────────────────────
+    # IMPORTANT: get context BEFORE adding the current message, so the
+    # current question is not duplicated in the conversation history
+    # that we send to the API.
     conv_context_msgs = get_context_messages(chat_id)
+
+    # Now add the current user message to context (for future queries).
+    if update.effective_chat.type != "private":
+        if msg_content:
+            add_to_context(chat_id, "user", user_name or "user", msg_content)
+    else:
+        add_to_context(chat_id, "user", user_name or "user", question)
 
     async def _empty_list():
         return []
@@ -274,10 +285,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # ── Post-processing ──────────────────────────────────────────
     set_rate_limit(user_id)
-    # Note: user message already added to context at top of handler (line ~102)
-    # for group chats, so only add for private chats to avoid duplicate
-    if update.effective_chat.type == "private":
-        add_to_context(chat_id, "user", user_name or "user", question)
+    # User message was already added to context before the API call.
     add_to_context(chat_id, "assistant", "bot", answer)
     await save_user_interaction(user_id, user_name, user.username)
 

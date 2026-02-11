@@ -33,22 +33,32 @@ async def query_perplexity(
 
     system_prompt = (
         'Отвечай на русском. Используй "ты". Кратко, 2-4 предложения. Без эмодзи. '
-        'ВАЖНО: При поиске информации о местах, событиях и мероприятиях в Таллинне - '
+        'ВАЖНО: При поиске информации о местах, событиях и мероприятиях в Таллинне — '
         'ищи на АНГЛИЙСКОМ и ЭСТОНСКОМ языках (не на русском), так как большинство '
         'актуальной информации о Таллинне на этих языках. '
         'Хорошие источники: Facebook Events, visitestonia.com, tallinn.ee. '
-        'Если не находишь на английском/эстонском - попробуй gloss.ee (русскоязычный сайт о Таллинне). '
-        'Если видишь "[PAGE NOT ACCESSIBLE]" - страница не загрузилась. '
+        'Если не находишь на английском/эстонском — попробуй gloss.ee (русскоязычный сайт о Таллинне). '
+        'Если видишь "[PAGE NOT ACCESSIBLE]" — страница не загрузилась. '
         'СТРОГО ЗАПРЕЩЕНО угадывать содержание по URL-адресу или частям ссылки. '
         'Вместо этого ПОИЩИ информацию по этой ссылке или событию через веб-поиск. '
-        'Если не нашёл - честно скажи что страница недоступна и ты не смог найти информацию. '
-        'Если видишь "[PAYWALL]" - статья за пейволлом, доступен только превью. '
+        'Если не нашёл — честно скажи что страница недоступна и ты не смог найти информацию. '
+        'Если видишь "[PAYWALL]" — статья за пейволлом, доступен только превью. '
         'Расскажи что есть из превью и упомяни что полная статья доступна по подписке. '
-        'ВАЖНО: Когда пользователь отвечает на твоё предыдущее сообщение и использует '
-        'ссылки типа «этот клуб», «там», «он», «она», «этот ресторан», «это место» — '
-        'ОБЯЗАТЕЛЬНО найди конкретное название из предыдущего ответа и используй его при поиске. '
-        'Например, если ты упомянул клуб Privè, а пользователь спрашивает «что ещё в этом клубе» — '
-        'ищи именно по «Privè Tallinn events».'
+        '\n\n'
+        'КРИТИЧЕСКИ ВАЖНО — РАЗРЕШЕНИЕ МЕСТОИМЕНИЙ И ССЫЛОК:\n'
+        'Когда в сообщении есть блок [Предыдущий ответ бота], пользователь отвечает '
+        'на предыдущее сообщение бота. ВСЕ местоимения и указательные слова в вопросе '
+        'пользователя (такие как «этот артист», «этот клуб», «там», «туда», «он», «она», '
+        '«это место», «этот ресторан», «этого артиста», «на него» и т.д.) '
+        'ССЫЛАЮТСЯ на конкретные названия из предыдущего ответа бота.\n'
+        'ПЕРЕД формированием поискового запроса ты ОБЯЗАН:\n'
+        '1. Найти в предыдущем ответе бота конкретное название (артиста, клуба, места и т.д.)\n'
+        '2. Заменить местоимение в вопросе этим конкретным названием\n'
+        '3. Сформулировать поисковый запрос на АНГЛИЙСКОМ с конкретным названием\n'
+        'Пример: предыдущий ответ упоминает «Ляпис Трубецкой», пользователь спрашивает '
+        '«кто похож на этого артиста» → ищи «artists similar to Lyapis Trubetskoy».\n'
+        'Пример: предыдущий ответ упоминает «клуб Privè», пользователь спрашивает '
+        '«что ещё в этом клубе» → ищи «Privè Tallinn upcoming events».'
     )
 
     if user_facts:
@@ -74,12 +84,13 @@ async def query_perplexity(
     ):
         question = f"{question} (Tallinn, Estonia)"
 
-    # Build the current user message (question + any referenced content)
-    parts = []
+    # Build the current user message (question + any referenced content).
+    # When there is referenced content (e.g. reply to bot), put the context
+    # first so the model sees it before the question and can resolve pronouns.
     if referenced_content:
-        parts.append(f"{referenced_content}")
-    parts.append(f"Вопрос: {question}" if referenced_content else question)
-    user_message = "\n\n".join(parts)
+        user_message = f"{referenced_content}\n\nВопрос пользователя: {question}"
+    else:
+        user_message = question
 
     # Build message content (with photos if provided)
     if photo_urls:
@@ -100,18 +111,24 @@ async def query_perplexity(
             messages.append({"role": msg["role"], "content": msg["content"]})
 
     # Ensure alternating roles (API requirement).
-    # If last history message is "user", merge the current question into it.
     if len(messages) > 1 and messages[-1]["role"] == "user":
-        prev_text = messages[-1]["content"]
-        combined_text = f"{prev_text}\n{user_message}"
-        if photo_urls:
-            # Rebuild as multimodal content with merged text
-            content = [{"type": "text", "text": combined_text}]
-            for photo_url in photo_urls[:3]:
-                content.append({"type": "image_url", "image_url": {"url": photo_url}})
-            messages[-1]["content"] = content
+        if referenced_content:
+            # When the user replies to the bot with context, don't merge with
+            # unrelated previous user messages — that buries the context.
+            # Insert a minimal assistant separator to maintain role alternation.
+            messages.append({"role": "assistant", "content": "(другие сообщения в чате)"})
+            messages.append({"role": "user", "content": user_message_content})
         else:
-            messages[-1]["content"] = combined_text
+            # Regular consecutive user messages — merge them.
+            prev_text = messages[-1]["content"]
+            combined_text = f"{prev_text}\n{user_message}"
+            if photo_urls:
+                content = [{"type": "text", "text": combined_text}]
+                for photo_url in photo_urls[:3]:
+                    content.append({"type": "image_url", "image_url": {"url": photo_url}})
+                messages[-1]["content"] = content
+            else:
+                messages[-1]["content"] = combined_text
     else:
         messages.append({"role": "user", "content": user_message_content})
 
