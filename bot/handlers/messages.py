@@ -20,6 +20,7 @@ from bot.services.memory import (
     get_user_facts, get_group_facts,
     save_user_fact, save_group_fact, save_user_interaction,
     smart_extract_facts, extract_facts_from_response,
+    get_recent_chat_messages,
     redis_client,
 )
 from bot.services.style import get_style_summary
@@ -223,6 +224,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # current question is not duplicated in the conversation history
     # that we send to the API.
     conv_context_msgs = get_context_messages(chat_id)
+
+    # Redis fallback: after a restart, in-memory context is empty.
+    # Load recent messages from Redis so the bot still has chat history.
+    if not conv_context_msgs and update.effective_chat.type != "private":
+        try:
+            recent = await get_recent_chat_messages(chat_id, 15)
+            if recent:
+                # Redis stores newest-first; reverse to oldest-first
+                for entry in reversed(recent):
+                    conv_context_msgs.append({"role": "user", "content": entry})
+                logger.info(
+                    f"Loaded {len(conv_context_msgs)} messages from Redis "
+                    f"(in-memory context was empty after restart)"
+                )
+        except Exception as e:
+            logger.warning(f"Redis context fallback failed: {e}")
 
     # Now add the current user message to context (for future queries).
     if update.effective_chat.type != "private":

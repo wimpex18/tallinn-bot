@@ -21,7 +21,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 RATE_LIMIT_SECONDS = 5
 
 # ── Conversation context ─────────────────────────────────────────────
-CONTEXT_SIZE = 10
+CONTEXT_SIZE = 20
 CONTEXT_MAX_AGE = 3600       # 1 hour — evict stale contexts
 RATE_LIMIT_MAX_AGE = 300     # 5 min — evict stale rate-limit entries
 EVICTION_INTERVAL = 300      # run eviction every 5 min

@@ -182,6 +182,12 @@ async def init_clients(application) -> None:
             logger.info("Connected to Redis (async) for memory storage")
         except Exception as e:
             logger.warning(f"Redis connection failed, memory disabled: {e}")
+            # Close the connection if it was created but ping failed
+            if memory_service.redis_client:
+                try:
+                    await memory_service.redis_client.aclose()
+                except Exception:
+                    pass
             memory_service.redis_client = None
 
     # Schedule periodic jobs
