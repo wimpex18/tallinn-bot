@@ -239,11 +239,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             recent = await get_recent_chat_messages(chat_id, 15)
             if recent:
-                # Redis stores newest-first; reverse to oldest-first
-                for entry in reversed(recent):
-                    conv_context_msgs.append({"role": "user", "content": entry})
+                # Redis stores newest-first; reverse to oldest-first.
+                # Merge all into a single "user" message because Redis
+                # doesn't store roles — creating separate entries for each
+                # would produce consecutive "user" messages which violates
+                # the Perplexity API's alternating-role requirement.
+                combined = "\n".join(reversed(recent))
+                conv_context_msgs.append({"role": "user", "content": combined})
                 logger.info(
-                    f"Loaded {len(conv_context_msgs)} messages from Redis "
+                    f"Loaded {len(recent)} messages from Redis as single context block "
                     f"(in-memory context was empty after restart)"
                 )
         except Exception as e:
