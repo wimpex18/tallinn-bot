@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # ── Routing ──────────────────────────────────────────────────────────
 
-def should_respond(update: Update, bot_username: str) -> bool:
+def should_respond(update: Update, bot_username: str, bot_id: int = None) -> bool:
     message = update.message
     if not message:
         return False
@@ -44,7 +44,15 @@ def should_respond(update: Update, bot_username: str) -> bool:
         return True
 
     if message.reply_to_message and message.reply_to_message.from_user:
-        if message.reply_to_message.from_user.username == bot_username:
+        reply_from = message.reply_to_message.from_user
+        # Match by username (case-insensitive) or by bot ID as fallback
+        if reply_from.username and reply_from.username.lower() == bot_username.lower():
+            return True
+        if bot_id and reply_from.id == bot_id:
+            logger.info(
+                f"Reply matched by bot_id={bot_id} (username was "
+                f"'{reply_from.username}' vs expected '{bot_username}')"
+            )
             return True
 
     if content and f"@{bot_username}" in content:
@@ -103,7 +111,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # For messages the bot WILL respond to: defer add_to_context until AFTER
     # get_context_messages() to avoid the current message appearing in the
     # conversation history sent to the API (which caused duplication).
-    if not should_respond(update, BOT_USERNAME):
+    if not should_respond(update, BOT_USERNAME, bot_id=context.bot.id):
         if msg_content and update.effective_chat.type != "private":
             add_to_context(chat_id, "user", user_name or "user", msg_content)
         return
