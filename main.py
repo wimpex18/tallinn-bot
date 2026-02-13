@@ -33,7 +33,6 @@ from config import (
     TELEGRAM_POOL_SIZE, TELEGRAM_POOL_TIMEOUT,
     TELEGRAM_READ_TIMEOUT, TELEGRAM_WRITE_TIMEOUT, TELEGRAM_CONNECT_TIMEOUT,
     PROACTIVE_MEMORY_INTERVAL,
-    PROACTIVE_CHAT_INTERVAL, PROACTIVE_CHAT_FIRST_DELAY, PROACTIVE_CHAT_MIN_MESSAGES,
     QUIET_HOURS_START, QUIET_HOURS_END,
     logger,
 )
@@ -42,8 +41,7 @@ from bot.handlers.commands import (
     cleanup_command, quiet_command,
 )
 from bot.handlers.messages import handle_message
-from bot.handlers.observer import observe_and_learn, generate_proactive_message
-from bot.utils.context import add_to_context
+from bot.handlers.observer import observe_and_learn
 from bot.handlers.errors import error_handler
 from bot.services import memory as memory_service
 from bot.services import perplexity as perplexity_service
@@ -156,83 +154,6 @@ async def refresh_style_profiles_job(context: ContextTypes.DEFAULT_TYPE) -> None
         logger.error(f"[job] Style profile refresh failed: {e}")
 
 
-async def proactive_chat_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Periodically send a proactive message to active group chats.
-
-    Runs every PROACTIVE_CHAT_INTERVAL seconds, skips quiet hours.
-    Looks at recent conversation context and generates a relevant comment.
-    """
-    hour = datetime.datetime.now(TALLINN_TZ).hour
-    if QUIET_HOURS_START > QUIET_HOURS_END:
-        if hour >= QUIET_HOURS_START or hour < QUIET_HOURS_END:
-            logger.info("[job] proactive_chat: quiet hours, skipping")
-            return
-    elif QUIET_HOURS_START <= hour < QUIET_HOURS_END:
-        logger.info("[job] proactive_chat: quiet hours, skipping")
-        return
-
-    if not memory_service.redis_client:
-        return
-
-    logger.info("[job] Proactive chat job starting")
-
-    try:
-        cursor = 0
-        sent = 0
-        while True:
-            cursor, keys = await memory_service.redis_client.scan(
-                cursor, match="chat:*:recent_msgs", count=50,
-            )
-            for key in keys:
-                chat_id_str = key.split(":")[1]
-                try:
-                    chat_id = int(chat_id_str)
-                except ValueError:
-                    continue
-
-                # Skip quiet-mode chats
-                if await memory_service.is_quiet_mode(chat_id):
-                    continue
-
-                # Load recent messages
-                messages = await memory_service.get_recent_chat_messages(
-                    chat_id, PROACTIVE_CHAT_MIN_MESSAGES + 5,
-                )
-                if len(messages) < PROACTIVE_CHAT_MIN_MESSAGES:
-                    continue
-
-                # Generate a proactive comment
-                comment = await generate_proactive_message(messages)
-                if not comment:
-                    logger.info(f"[job] proactive_chat: LLM declined for chat {chat_id}")
-                    continue
-
-                # Send the message
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text=comment)
-                    sent += 1
-                    logger.info(
-                        f"[job] proactive_chat: sent to {chat_id}: {comment[:60]}..."
-                    )
-
-                    # Track in both Redis and in-memory context
-                    await memory_service.store_recent_message(
-                        chat_id, 0, "bot", comment,
-                    )
-                    add_to_context(chat_id, "assistant", "bot", comment)
-                except Exception as e:
-                    logger.error(
-                        f"[job] proactive_chat: failed to send to {chat_id}: {e}"
-                    )
-
-            if cursor == 0:
-                break
-
-        logger.info(f"[job] proactive_chat: done, sent {sent} messages")
-    except Exception as e:
-        logger.error(f"[job] Proactive chat job failed: {e}")
-
-
 # ── Client lifecycle ─────────────────────────────────────────────────
 
 async def init_clients(application) -> None:
@@ -285,16 +206,7 @@ async def init_clients(application) -> None:
             time=datetime.time(14, 0, tzinfo=TALLINN_TZ),
             name="refresh_styles",
         )
-        # Proactive chat messages (every PROACTIVE_CHAT_INTERVAL)
-        jq.run_repeating(
-            proactive_chat_job,
-            interval=PROACTIVE_CHAT_INTERVAL,
-            first=PROACTIVE_CHAT_FIRST_DELAY,
-            name="proactive_chat",
-        )
-        logger.info(
-            "JobQueue: proactive_memory + refresh_styles + proactive_chat scheduled"
-        )
+        logger.info("JobQueue: proactive_memory + refresh_styles scheduled")
     else:
         logger.warning("JobQueue not available — install python-telegram-bot[job-queue]")
 
