@@ -46,8 +46,8 @@ TELEGRAM_CONNECT_TIMEOUT = 15
 
 # ── Proactive behaviour ──────────────────────────────────────────────
 # Spontaneous replies (bot randomly replies to interesting messages)
-SPONTANEOUS_REPLY_PROBABILITY = 0.03      # 3 % base chance per group message
-SPONTANEOUS_REPLY_KEYWORD_BOOST = 0.12    # +12 % if message touches Tallinn topics
+SPONTANEOUS_REPLY_PROBABILITY = 0.0       # disabled — bot only replies when asked
+SPONTANEOUS_REPLY_KEYWORD_BOOST = 0.0     # disabled
 SPONTANEOUS_REPLY_COOLDOWN = 600          # min 10 min between spontaneous replies per chat
 SPONTANEOUS_REPLY_MIN_MESSAGES = 5        # need N messages since last bot reply
 PROACTIVE_MAX_PER_HOUR = 3               # max spontaneous msgs per group per hour
