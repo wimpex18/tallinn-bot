@@ -52,6 +52,11 @@ SPONTANEOUS_REPLY_COOLDOWN = 600          # min 10 min between spontaneous repli
 SPONTANEOUS_REPLY_MIN_MESSAGES = 5        # need N messages since last bot reply
 PROACTIVE_MAX_PER_HOUR = 3               # max spontaneous msgs per group per hour
 
+# Scheduled proactive messages (bot initiates conversation on its own)
+PROACTIVE_CHAT_INTERVAL = 4 * 3600       # check every 4 hours
+PROACTIVE_CHAT_FIRST_DELAY = 1800        # first check 30 min after startup
+PROACTIVE_CHAT_MIN_MESSAGES = 3          # need >= N recent msgs to have context
+
 # Proactive memory: the bot reviews recent conversation 3× per day
 # and extracts facts it missed (scheduled via JobQueue)
 PROACTIVE_MEMORY_INTERVAL = 8 * 3600     # every ~8 h ≈ 3× per day
