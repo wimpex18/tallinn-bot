@@ -140,20 +140,24 @@ async def generate_style_summary_llm(
     )
 
     try:
-        client = http_client or httpx.AsyncClient(timeout=10.0)
-        resp = await client.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers={
-                "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "sonar",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 100,
-                "temperature": 0.2,
-            },
-        )
+        _client = http_client or httpx.AsyncClient(timeout=10.0)
+        try:
+            resp = await _client.post(
+                "https://api.perplexity.ai/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "sonar",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 100,
+                    "temperature": 0.2,
+                },
+            )
+        finally:
+            if _client is not http_client:
+                await _client.aclose()
         resp.raise_for_status()
         result = resp.json()["choices"][0]["message"]["content"].strip()
         if "НЕТ" in result.upper() or len(result) < 10:

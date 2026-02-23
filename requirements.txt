@@ -3,4 +3,4 @@ httpx==0.28.1
 curl_cffi>=0.14,<0.15
 trafilatura>=2.0
 python-dotenv==1.2.1
-redis==7.1.1
+redis==7.2.0

@@ -144,8 +144,14 @@ async def fetch_url_content(url: str) -> str:
     # Cache (including failures)
     _url_cache[clean_url_str] = (result, time.time())
     if len(_url_cache) > 50:
-        expired = [k for k, (_, ts) in _url_cache.items() if time.time() - ts > URL_CACHE_TTL]
+        now_ts = time.time()
+        expired = [k for k, (_, ts) in _url_cache.items() if now_ts - ts > URL_CACHE_TTL]
         for k in expired:
             del _url_cache[k]
+        # If still over limit (all entries fresh), evict the oldest
+        if len(_url_cache) > 50:
+            oldest = sorted(_url_cache, key=lambda k: _url_cache[k][1])
+            for k in oldest[:len(_url_cache) - 50]:
+                del _url_cache[k]
 
     return result
