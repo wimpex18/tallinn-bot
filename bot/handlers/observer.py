@@ -17,14 +17,12 @@ import logging
 import zoneinfo
 from datetime import datetime
 
-import httpx
-
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from config import (
     BOT_USERNAME,
-    PERPLEXITY_API_KEY,
+    ANTHROPIC_MODEL,
     SPONTANEOUS_REPLY_PROBABILITY,
     SPONTANEOUS_REPLY_KEYWORD_BOOST,
     SPONTANEOUS_REPLY_COOLDOWN,
@@ -205,6 +203,10 @@ async def _generate_spontaneous_comment(
 
     Returns None if the LLM decides to stay silent.
     """
+    from bot.services import claude as claude_service
+    if not claude_service.anthropic_client:
+        return None
+
     prompt = (
         f"Ты участник группового чата о жизни в Таллинне. "
         f"Вот недавний контекст:\n{conv_context}\n\n"
@@ -215,22 +217,13 @@ async def _generate_spontaneous_comment(
     )
 
     try:
-        client = memory_service.http_client or httpx.AsyncClient(timeout=15.0)
-        resp = await client.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers={
-                "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "sonar",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 80,
-                "temperature": 0.7,
-            },
+        response = await claude_service.anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=80,
+            temperature=0.7,
+            messages=[{"role": "user", "content": prompt}],
         )
-        resp.raise_for_status()
-        result = resp.json()["choices"][0]["message"]["content"].strip()
+        result = response.content[0].text.strip() if response.content else ""
 
         if not result or "НЕТ" in result.upper() or len(result) < 3:
             return None

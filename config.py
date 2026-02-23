@@ -12,7 +12,7 @@ logger = logging.getLogger("tallinn_bot")
 
 # ── Environment variables ────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REDIS_URL = os.getenv("REDIS_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
@@ -21,7 +21,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 RATE_LIMIT_SECONDS = 5
 
 # ── Conversation context ─────────────────────────────────────────────
-CONTEXT_SIZE = 20
+CONTEXT_SIZE = 50            # increased from 20 — Claude handles long contexts well
 CONTEXT_MAX_AGE = 3600       # 1 hour — evict stale contexts
 RATE_LIMIT_MAX_AGE = 300     # 5 min — evict stale rate-limit entries
 EVICTION_INTERVAL = 300      # run eviction every 5 min
@@ -31,10 +31,11 @@ URL_CACHE_TTL = 300          # 5 min cache per URL
 FETCH_TIMEOUT = 20           # seconds per fetch attempt
 IMPERSONATE_PROFILES = ["chrome", "safari"]
 
-# ── Perplexity API ───────────────────────────────────────────────────
-PERPLEXITY_TIMEOUT = 30.0
-PERPLEXITY_MAX_TOKENS = 300
-PERPLEXITY_TEMPERATURE = 0.3
+# ── Anthropic API ─────────────────────────────────────────────────────
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
+ANTHROPIC_TIMEOUT = 60.0
+ANTHROPIC_MAX_TOKENS = 1024
+ANTHROPIC_TEMPERATURE = 0.3
 
 # ── Telegram connection pool (critical for performance) ──────────────
 # PTB v21.9 defaults to pool_size=1 which causes severe bottlenecks.

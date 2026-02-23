@@ -15,7 +15,7 @@ import datetime
 import zoneinfo
 import logging
 
-import httpx
+import anthropic
 import redis.asyncio as aioredis
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from telegram import Update
@@ -28,8 +28,7 @@ from telegram.ext import (
 )
 
 from config import (
-    TELEGRAM_TOKEN, PERPLEXITY_API_KEY, BOT_USERNAME, REDIS_URL, WEBHOOK_SECRET,
-    PERPLEXITY_TIMEOUT,
+    TELEGRAM_TOKEN, ANTHROPIC_API_KEY, BOT_USERNAME, REDIS_URL, WEBHOOK_SECRET,
     TELEGRAM_POOL_SIZE, TELEGRAM_POOL_TIMEOUT,
     TELEGRAM_READ_TIMEOUT, TELEGRAM_WRITE_TIMEOUT, TELEGRAM_CONNECT_TIMEOUT,
     PROACTIVE_MEMORY_INTERVAL,
@@ -44,7 +43,7 @@ from bot.handlers.messages import handle_message
 from bot.handlers.observer import observe_and_learn
 from bot.handlers.errors import error_handler
 from bot.services import memory as memory_service
-from bot.services import perplexity as perplexity_service
+from bot.services import claude as claude_service
 from bot.services import url_fetcher as url_fetcher_service
 from bot.services.style import generate_style_summary_llm
 
@@ -139,7 +138,6 @@ async def refresh_style_profiles_job(context: ContextTypes.DEFAULT_TYPE) -> None
                 user_name = profile.get("name", "user")
                 result = await generate_style_summary_llm(
                     memory_service.redis_client,
-                    memory_service.http_client,
                     user_id,
                     user_name,
                 )
@@ -158,21 +156,16 @@ async def refresh_style_profiles_job(context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def init_clients(application) -> None:
     """Initialize global HTTP clients, async Redis, and schedule jobs."""
-    # httpx for Perplexity API calls (no TLS impersonation needed)
-    client = httpx.AsyncClient(
-        timeout=PERPLEXITY_TIMEOUT,
-        follow_redirects=True,
-        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
-    )
-    memory_service.http_client = client
-    perplexity_service.http_client = client
+    # Anthropic async client (SDK manages its own HTTP connection pool)
+    claude_service.anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    logger.info("Anthropic client initialized")
 
     # curl_cffi for URL fetching (browser TLS impersonation)
     url_fetcher_service.curl_session = CurlAsyncSession(
         timeout=20, allow_redirects=True, max_clients=10,
     )
 
-    logger.info("HTTP clients initialized (httpx for API, curl_cffi for URL fetching)")
+    logger.info("HTTP clients initialized (anthropic SDK + curl_cffi for URL fetching)")
 
     # Async Redis
     if REDIS_URL:
@@ -213,8 +206,8 @@ async def init_clients(application) -> None:
 
 async def cleanup_clients(application) -> None:
     """Cleanup global HTTP clients and Redis on shutdown."""
-    if perplexity_service.http_client:
-        await perplexity_service.http_client.aclose()
+    if claude_service.anthropic_client:
+        await claude_service.anthropic_client.close()
     if url_fetcher_service.curl_session:
         await url_fetcher_service.curl_session.close()
     if memory_service.redis_client:
@@ -227,8 +220,8 @@ async def cleanup_clients(application) -> None:
 def main() -> None:
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_TOKEN environment variable is required")
-    if not PERPLEXITY_API_KEY:
-        raise ValueError("PERPLEXITY_API_KEY environment variable is required")
+    if not ANTHROPIC_API_KEY:
+        raise ValueError("ANTHROPIC_API_KEY environment variable is required")
     if not BOT_USERNAME:
         raise ValueError("BOT_USERNAME environment variable is required")
 

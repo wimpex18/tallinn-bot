@@ -4,15 +4,12 @@ import time
 import re
 import logging
 
-import httpx
-
-from config import PERPLEXITY_API_KEY, STYLE_RECENT_MESSAGES_KEPT
+from config import STYLE_RECENT_MESSAGES_KEPT, ANTHROPIC_MODEL
 
 logger = logging.getLogger(__name__)
 
 # Initialized in main.py post_init
 redis_client = None
-http_client: httpx.AsyncClient = None
 
 
 async def save_user_fact(user_id: int, fact: str) -> None:
@@ -109,6 +106,10 @@ async def smart_extract_facts(
     if not question or len(question) < 10:
         return []
 
+    from bot.services import claude as claude_service
+    if not claude_service.anthropic_client:
+        return []
+
     context_part = f"Контекст чата: {chat_context}" if chat_context else ""
     prompt = f"""Извлеки важные факты о пользователе из этого диалога.
 Пользователь: {user_name or 'unknown'}
@@ -124,26 +125,13 @@ async def smart_extract_facts(
 Максимум 3 факта."""
 
     try:
-        _client = http_client or httpx.AsyncClient(timeout=10.0)
-        try:
-            response = await _client.post(
-                "https://api.perplexity.ai/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "sonar",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 100,
-                    "temperature": 0.1,
-                },
-            )
-        finally:
-            if _client is not http_client:
-                await _client.aclose()
-        response.raise_for_status()
-        result = response.json()["choices"][0]["message"]["content"].strip()
+        response = await claude_service.anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=100,
+            temperature=0.1,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result = response.content[0].text.strip() if response.content else ""
 
         if "НЕТ" in result.upper() or len(result) < 5:
             return []
@@ -206,6 +194,10 @@ async def extract_facts_from_conversation(
     if not messages or len(messages) < 3:
         return []
 
+    from bot.services import claude as claude_service
+    if not claude_service.anthropic_client:
+        return []
+
     conversation = "\n".join(reversed(messages))  # oldest first
     prompt = f"""Проанализируй эти сообщения из группового чата:
 
@@ -216,26 +208,13 @@ async def extract_facts_from_conversation(
 Если фактов нет — ответь НЕТ. Максимум 5 фактов."""
 
     try:
-        _client = http_client or httpx.AsyncClient(timeout=15.0)
-        try:
-            resp = await _client.post(
-                "https://api.perplexity.ai/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "sonar",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 150,
-                    "temperature": 0.1,
-                },
-            )
-        finally:
-            if _client is not http_client:
-                await _client.aclose()
-        resp.raise_for_status()
-        result = resp.json()["choices"][0]["message"]["content"].strip()
+        response = await claude_service.anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=150,
+            temperature=0.1,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result = response.content[0].text.strip() if response.content else ""
 
         if "НЕТ" in result.upper() or len(result) < 5:
             return []
