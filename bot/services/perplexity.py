@@ -222,15 +222,19 @@ async def query_perplexity(
     }
 
     try:
-        client = http_client or httpx.AsyncClient(timeout=30.0)
-        response = await client.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers={
-                "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
+        _client = http_client or httpx.AsyncClient(timeout=30.0)
+        try:
+            response = await _client.post(
+                "https://api.perplexity.ai/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        finally:
+            if _client is not http_client:
+                await _client.aclose()
         response.raise_for_status()
         data = response.json()
         elapsed_ms = (time.monotonic() - t0) * 1000
@@ -245,10 +249,19 @@ async def query_perplexity(
         logger.warning(f"Perplexity timeout after {(time.monotonic() - t0)*1000:.0f}ms")
         return "Слишком долго думаю, попробуй ещё раз)"
     except httpx.HTTPStatusError as e:
-        logger.error(f"Perplexity API error: {e.response.status_code} - {e.response.text}")
-        if e.response.status_code == 429:
+        status = e.response.status_code
+        logger.error(f"Perplexity API error: {status} - {e.response.text}")
+        if status == 401:
+            return "Ошибка авторизации API (401) — проверь PERPLEXITY_API_KEY)"
+        if status == 402:
+            return "Закончились кредиты Perplexity API (402) — пополни баланс)"
+        if status == 422:
+            return f"Ошибка запроса к API (422) — возможно, неверная модель или параметры)"
+        if status == 429:
             return "Много запросов, подожди минутку)"
-        return "Проблема с API, попробуй позже)"
+        if status >= 500:
+            return f"Сервер Perplexity временно недоступен ({status}), попробуй позже)"
+        return f"Проблема с API ({status}), попробуй позже)"
     except Exception as e:
         logger.error(f"Unexpected error querying Perplexity: {e}")
         return "Что-то пошло не так("
