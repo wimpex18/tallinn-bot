@@ -9,10 +9,8 @@ user's tone.
 import re
 import logging
 
-import httpx
-
 from config import (
-    PERPLEXITY_API_KEY,
+    ANTHROPIC_MODEL,
     STYLE_MIN_MESSAGES,
     STYLE_SUMMARY_TTL,
 )
@@ -117,7 +115,7 @@ async def get_style_summary(redis_client, user_id: int) -> str | None:
 
 
 async def generate_style_summary_llm(
-    redis_client, http_client: httpx.AsyncClient,
+    redis_client,
     user_id: int, user_name: str,
 ) -> str | None:
     """Use LLM to create a richer style description from recent messages.
@@ -126,6 +124,11 @@ async def generate_style_summary_llm(
     """
     if not redis_client:
         return None
+
+    from bot.services import claude as claude_service
+    if not claude_service.anthropic_client:
+        return None
+
     recent = await redis_client.lrange(f"user:{user_id}:recent_msgs", 0, 19)
     if len(recent) < STYLE_MIN_MESSAGES:
         return None
@@ -140,26 +143,13 @@ async def generate_style_summary_llm(
     )
 
     try:
-        _client = http_client or httpx.AsyncClient(timeout=10.0)
-        try:
-            resp = await _client.post(
-                "https://api.perplexity.ai/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "sonar",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 100,
-                    "temperature": 0.2,
-                },
-            )
-        finally:
-            if _client is not http_client:
-                await _client.aclose()
-        resp.raise_for_status()
-        result = resp.json()["choices"][0]["message"]["content"].strip()
+        response = await claude_service.anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=100,
+            temperature=0.2,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result = response.content[0].text.strip() if response.content else ""
         if "НЕТ" in result.upper() or len(result) < 10:
             return None
         # Cache for 24 h

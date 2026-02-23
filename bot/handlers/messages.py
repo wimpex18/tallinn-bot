@@ -15,7 +15,7 @@ from bot.utils.helpers import (
     send_typing, check_rate_limit, set_rate_limit, get_display_name,
 )
 from bot.services.url_fetcher import fetch_url_content
-from bot.services.perplexity import query_perplexity
+from bot.services.claude import query_claude
 from bot.services.memory import (
     get_user_facts, get_group_facts,
     save_user_fact, save_group_fact, save_user_interaction,
@@ -290,7 +290,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     timer.checkpoint("photos")
 
-    # ── Query Perplexity ─────────────────────────────────────────
+    # ── Query Claude ─────────────────────────────────────────────
     logger.info(
         f"Query from {user_id} ({user_name}): {question[:120]}... "
         f"[ref={'yes('+str(len(referenced_content))+'chars)' if referenced_content else 'no'}, "
@@ -299,7 +299,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if referenced_content:
         logger.info(f"Referenced content preview: {referenced_content[:200]}...")
 
-    answer = await query_perplexity(
+    # Send a placeholder message so we can stream the response into it
+    placeholder = await message.reply_text("...", reply_to_message_id=message.message_id)
+
+    answer = await query_claude(
         question=question,
         referenced_content=referenced_content,
         user_name=user_name,
@@ -308,9 +311,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         group_facts=group_facts,
         photo_urls=photo_urls if photo_urls else None,
         user_style=user_style,
+        telegram_bot=context.bot,
+        telegram_chat_id=chat_id,
+        telegram_message_id=placeholder.message_id,
     )
 
-    timer.checkpoint("perplexity")
+    timer.checkpoint("claude")
 
     # ── Post-processing ──────────────────────────────────────────
     set_rate_limit(user_id)
@@ -318,7 +324,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     add_to_context(chat_id, "assistant", "bot", answer)
     await save_user_interaction(user_id, user_name, user.username)
 
-    await message.reply_text(answer, reply_to_message_id=message.message_id)
     record_bot_replied(chat_id)
 
     timer.checkpoint("reply_sent")
