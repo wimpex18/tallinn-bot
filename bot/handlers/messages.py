@@ -21,7 +21,6 @@ from bot.services.memory import (
     save_user_fact, save_group_fact, save_user_interaction,
     smart_extract_facts, extract_facts_from_response,
     get_recent_chat_messages,
-    redis_client,
 )
 from bot.services.style import get_style_summary
 from bot.handlers.observer import record_bot_replied
@@ -185,21 +184,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     timer.checkpoint("parse")
 
-    # ── Fetch URL content ────────────────────────────────────────
+    # Build list of URLs to potentially fetch (cheap — no network call yet)
     urls_to_fetch = []
     if reply_msg:
         urls_to_fetch = get_all_urls(reply_msg)
     if not urls_to_fetch:
         urls_to_fetch = get_all_urls(message) or extract_urls(question or "")
-
-    if urls_to_fetch and referenced_content:
-        first_url = urls_to_fetch[0]
-        logger.info(f"Fetching URL content: {first_url}")
-        url_content = await fetch_url_content(first_url)
-        if url_content and len(url_content) > 100:
-            referenced_content += f"\n\n[Article content]:\n{url_content}"
-
-    timer.checkpoint("url_fetch")
 
     # ── Photo handling ───────────────────────────────────────────
     has_current_photo = has_photo(message)
@@ -214,7 +204,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not question and (has_current_photo or has_reply_photo):
         question = "что на фото?"
 
-    # Rate limit (checked after we know we will process)
+    # Rate limit (checked after we know we will process, before any network I/O)
     is_limited, remaining = check_rate_limit(user_id)
     if is_limited:
         # Still track in context so future replies have full history
@@ -224,6 +214,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Подожди {remaining} сек, не спеши)", reply_to_message_id=message.message_id,
         )
         return
+
+    # ── Fetch URL content (only if not rate limited) ─────────────
+    if urls_to_fetch and referenced_content:
+        first_url = urls_to_fetch[0]
+        logger.info(f"Fetching URL content: {first_url}")
+        url_content = await fetch_url_content(first_url)
+        if url_content and len(url_content) > 100:
+            referenced_content += f"\n\n[Article content]:\n{url_content}"
+
+    timer.checkpoint("url_fetch")
 
     await send_typing(context.bot, chat_id)
 

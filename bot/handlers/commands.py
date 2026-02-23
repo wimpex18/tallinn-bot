@@ -65,6 +65,9 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     fact = " ".join(context.args)
+    if len(fact) > 500:
+        await update.message.reply_text("Слишком длинно, напиши покороче (до 500 символов)")
+        return
     if user_name:
         fact = f"{user_name}: {fact}"
 

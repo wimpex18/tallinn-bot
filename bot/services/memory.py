@@ -124,20 +124,24 @@ async def smart_extract_facts(
 Максимум 3 факта."""
 
     try:
-        client = http_client or httpx.AsyncClient(timeout=10.0)
-        response = await client.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers={
-                "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "sonar",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 100,
-                "temperature": 0.1,
-            },
-        )
+        _client = http_client or httpx.AsyncClient(timeout=10.0)
+        try:
+            response = await _client.post(
+                "https://api.perplexity.ai/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "sonar",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 100,
+                    "temperature": 0.1,
+                },
+            )
+        finally:
+            if _client is not http_client:
+                await _client.aclose()
         response.raise_for_status()
         result = response.json()["choices"][0]["message"]["content"].strip()
 
@@ -212,20 +216,24 @@ async def extract_facts_from_conversation(
 Если фактов нет — ответь НЕТ. Максимум 5 фактов."""
 
     try:
-        client = http_client or httpx.AsyncClient(timeout=15.0)
-        resp = await client.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers={
-                "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "sonar",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 150,
-                "temperature": 0.1,
-            },
-        )
+        _client = http_client or httpx.AsyncClient(timeout=15.0)
+        try:
+            resp = await _client.post(
+                "https://api.perplexity.ai/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "sonar",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 150,
+                    "temperature": 0.1,
+                },
+            )
+        finally:
+            if _client is not http_client:
+                await _client.aclose()
         resp.raise_for_status()
         result = resp.json()["choices"][0]["message"]["content"].strip()
 
