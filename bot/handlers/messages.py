@@ -17,6 +17,7 @@ from bot.utils.helpers import (
     send_typing, check_rate_limit, set_rate_limit, get_display_name,
 )
 from bot.services.url_fetcher import fetch_url_content
+from bot.services.weather import is_weather_query, extract_weather_city, fetch_weather
 from bot.services.claude import query_claude
 from bot.services.memory import (
     get_user_facts, get_group_facts,
@@ -218,6 +219,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Подожди {remaining} сек, не спеши)", reply_to_message_id=message.message_id,
         )
         return
+
+    # ── Weather pre-fetch (real-time data Claude can't get on its own) ──
+    # Detect weather queries and inject live wttr.in data as referenced_content
+    # so Claude can give an accurate answer instead of pretending to search.
+    if not referenced_content and is_weather_query(question):
+        city = extract_weather_city(question) or "Tallinn"
+        logger.info(f"Weather query detected — fetching wttr.in data for '{city}'")
+        weather_data = await fetch_weather(city)
+        if weather_data:
+            referenced_content = weather_data
+        else:
+            logger.warning(f"Weather fetch failed for '{city}', continuing without data")
 
     # ── Fetch URL content (only if not rate limited) ─────────────
     if urls_to_fetch and referenced_content:
