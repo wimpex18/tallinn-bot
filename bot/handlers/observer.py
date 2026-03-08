@@ -135,7 +135,8 @@ async def observe_and_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user_name = get_display_name(user) or user.first_name or "user"
 
     # 1. Store message in Redis buffer (for proactive memory + style)
-    asyncio.create_task(_store_and_profile(chat_id, user_id, user_name, text))
+    thread_id = message.message_thread_id
+    asyncio.create_task(_store_and_profile(chat_id, user_id, user_name, text, thread_id))
 
     # 2. Increment "messages since last bot reply" counter
     _messages_since_reply[chat_id] = _messages_since_reply.get(chat_id, 0) + 1
@@ -188,10 +189,11 @@ async def observe_and_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def _store_and_profile(
     chat_id: int, user_id: int, user_name: str, text: str,
+    thread_id: int | None = None,
 ) -> None:
     """Background task: store recent message + update style counters."""
     try:
-        await store_recent_message(chat_id, user_id, user_name, text)
+        await store_recent_message(chat_id, user_id, user_name, text, thread_id=thread_id)
         await update_style_counters(memory_service.redis_client, user_id, text)
     except Exception as e:
         logger.error(f"Observer store/profile failed: {e}")

@@ -70,16 +70,20 @@ async def proactive_memory_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("[job] Proactive memory extraction starting")
 
     try:
-        # Find all chats that have recent messages
+        # Find all chat-thread buffers that have recent messages.
+        # Key format: chat:{chat_id}:{thread_id}:recent_msgs
         cursor = 0
         while True:
             cursor, keys = await memory_service.redis_client.scan(
-                cursor, match="chat:*:recent_msgs", count=50,
+                cursor, match="chat:*:*:recent_msgs", count=50,
             )
             for key in keys:
-                chat_id_str = key.split(":")[1]
+                parts = key.split(":")
+                # parts = ["chat", "<chat_id>", "<thread_id>", "recent_msgs"]
+                if len(parts) != 4:
+                    continue
                 try:
-                    chat_id = int(chat_id_str)
+                    chat_id = int(parts[1])
                 except ValueError:
                     continue
 
