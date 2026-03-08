@@ -16,7 +16,6 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REDIS_URL = os.getenv("REDIS_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "false").lower() == "true"
 
 # ── Rate limiting ────────────────────────────────────────────────────
 RATE_LIMIT_SECONDS = 5
