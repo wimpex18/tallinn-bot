@@ -6,9 +6,11 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config import BOT_USERNAME
+from config import BOT_USERNAME, THINKING_BUDGET_TOKENS, THINKING_THRESHOLD_CHARS
 from bot.middleware.timing import Timer
-from bot.utils.context import add_to_context, get_context_messages, evict_stale_data
+from bot.utils.context import (
+    add_to_context, get_context_messages, evict_stale_data, trim_context_for_api,
+)
 from bot.utils.helpers import (
     get_message_content, get_all_urls, extract_urls, extract_question,
     is_forwarded_message, has_photo, download_photo_as_base64,
@@ -101,6 +103,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+    # Thread ID for Telegram forum topics (None in regular chats)
+    thread_id = message.message_thread_id
     user = update.effective_user
     user_name = get_display_name(user)
 
@@ -112,7 +116,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # conversation history sent to the API (which caused duplication).
     if not should_respond(update, BOT_USERNAME, bot_id=context.bot.id):
         if msg_content and update.effective_chat.type != "private":
-            add_to_context(chat_id, "user", user_name or "user", msg_content)
+            add_to_context(chat_id, "user", user_name or "user", msg_content, thread_id=thread_id)
         return
 
     timer.checkpoint("routing")
@@ -209,7 +213,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if is_limited:
         # Still track in context so future replies have full history
         if msg_content and update.effective_chat.type != "private":
-            add_to_context(chat_id, "user", user_name or "user", msg_content)
+            add_to_context(chat_id, "user", user_name or "user", msg_content, thread_id=thread_id)
         await message.reply_text(
             f"Подожди {remaining} сек, не спеши)", reply_to_message_id=message.message_id,
         )
@@ -231,7 +235,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # IMPORTANT: get context BEFORE adding the current message, so the
     # current question is not duplicated in the conversation history
     # that we send to the API.
-    conv_context_msgs = get_context_messages(chat_id)
+    conv_context_msgs = get_context_messages(chat_id, thread_id)
 
     # Redis fallback: after a restart, in-memory context is empty.
     # Load recent messages from Redis so the bot still has chat history.
@@ -243,7 +247,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 # Merge all into a single "user" message because Redis
                 # doesn't store roles — creating separate entries for each
                 # would produce consecutive "user" messages which violates
-                # the Perplexity API's alternating-role requirement.
+                # the API's alternating-role requirement.
                 combined = "\n".join(reversed(recent))
                 conv_context_msgs.append({"role": "user", "content": combined})
                 logger.info(
@@ -253,12 +257,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as e:
             logger.warning(f"Redis context fallback failed: {e}")
 
+    # Trim long context before sending to API (OpenClaw-style compaction)
+    conv_context_msgs = trim_context_for_api(conv_context_msgs)
+
     # Now add the current user message to context (for future queries).
     if update.effective_chat.type != "private":
         if msg_content:
-            add_to_context(chat_id, "user", user_name or "user", msg_content)
+            add_to_context(chat_id, "user", user_name or "user", msg_content, thread_id=thread_id)
     else:
-        add_to_context(chat_id, "user", user_name or "user", question)
+        add_to_context(chat_id, "user", user_name or "user", question, thread_id=thread_id)
 
     async def _empty_list():
         return []
@@ -291,10 +298,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     timer.checkpoint("photos")
 
     # ── Query Claude ─────────────────────────────────────────────
+    # Enable extended thinking for complex / long questions
+    thinking_budget = THINKING_BUDGET_TOKENS if len(question) > THINKING_THRESHOLD_CHARS else 0
+
     logger.info(
         f"Query from {user_id} ({user_name}): {question[:120]}... "
         f"[ref={'yes('+str(len(referenced_content))+'chars)' if referenced_content else 'no'}, "
-        f"ctx_msgs={len(conv_context_msgs)}, photos={len(photo_urls)}]"
+        f"ctx_msgs={len(conv_context_msgs)}, photos={len(photo_urls)}, "
+        f"thinking={thinking_budget > 0}]"
     )
     if referenced_content:
         logger.info(f"Referenced content preview: {referenced_content[:200]}...")
@@ -314,6 +325,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         telegram_bot=context.bot,
         telegram_chat_id=chat_id,
         telegram_message_id=placeholder.message_id,
+        thinking_budget=thinking_budget,
     )
 
     timer.checkpoint("claude")
@@ -321,7 +333,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ── Post-processing ──────────────────────────────────────────
     set_rate_limit(user_id)
     # User message was already added to context before the API call.
-    add_to_context(chat_id, "assistant", "bot", answer)
+    add_to_context(chat_id, "assistant", "bot", answer, thread_id=thread_id)
     await save_user_interaction(user_id, user_name, user.username)
 
     record_bot_replied(chat_id)

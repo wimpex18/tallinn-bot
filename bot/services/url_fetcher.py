@@ -6,7 +6,7 @@ import logging
 
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
-from config import URL_CACHE_TTL, IMPERSONATE_PROFILES
+from config import URL_CACHE_TTL, IMPERSONATE_PROFILES, URL_MAX_CHARS, URL_HEAD_CHARS, URL_TAIL_CHARS
 from bot.utils.helpers import clean_url, extract_url_info
 from bot.utils.html_parser import (
     extract_metadata,
@@ -24,21 +24,38 @@ curl_session: CurlAsyncSession = None
 _url_cache: dict[str, tuple[str, float]] = {}
 
 
+def _truncate_content(content: str) -> str:
+    """Apply head+tail truncation to long content.
+
+    Keeps the opening (title, date, lead paragraph) and closing (prices,
+    contacts, conclusions) sections which carry the most useful information,
+    dropping the bulk of the middle.
+    """
+    if len(content) <= URL_MAX_CHARS:
+        return content
+    head = content[:URL_HEAD_CHARS]
+    tail = content[-URL_TAIL_CHARS:]
+    omitted = len(content) - URL_HEAD_CHARS - URL_TAIL_CHARS
+    return f"{head}\n\n[...{omitted} символов пропущено...]\n\n{tail}"
+
+
 def _extract_content_from_html(html: str, url: str) -> str:
-    """Combine metadata + article text from raw HTML."""
+    """Combine metadata + article text from raw HTML, then truncate if needed."""
     metadata = extract_metadata(html)
     metadata_text = format_metadata_text(metadata)
     page_text = extract_page_text(html)
 
     if metadata_text and len(metadata_text) > 50:
         if page_text and len(page_text) > 50:
-            return f"{metadata_text}\n\n[Page content]:\n{page_text}"
-        return metadata_text
+            combined = f"{metadata_text}\n\n[Page content]:\n{page_text}"
+        else:
+            combined = metadata_text
+    elif page_text and len(page_text) > 50:
+        combined = page_text
+    else:
+        return ""
 
-    if page_text and len(page_text) > 50:
-        return page_text
-
-    return ""
+    return _truncate_content(combined)
 
 
 async def _curl_fetch(url: str, impersonate: str) -> tuple[str | None, str | None]:
