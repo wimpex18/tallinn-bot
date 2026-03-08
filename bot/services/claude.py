@@ -24,15 +24,25 @@ anthropic_client: anthropic.AsyncAnthropic = None
 _STREAM_UPDATE_INTERVAL = 1.0
 
 # ── Built-in Anthropic server-side tools ──────────────────────────────
-# All three work together: code_execution enables dynamic filtering in
-# web_search and web_fetch, reducing token usage and improving accuracy.
-# code_execution is FREE when paired with web_search or web_fetch.
-# web_fetch is FREE (token costs only). web_search is $10/1000 searches.
+# web_search_20250305: stable, supports user_location + max_uses.
+# web_fetch_20250910: stable, fetch URLs from chat, tokens only cost.
+# NOTE: web_search/fetch_20260209 + code_execution_20250825 provide
+# dynamic filtering but require beta access — skip until available.
 # Requires ENABLE_WEB_SEARCH=true AND web search enabled in Anthropic Console.
 _SERVER_TOOLS: list[dict] = [
-    {"type": "web_search_20260209", "name": "web_search"},
-    {"type": "web_fetch_20260209", "name": "web_fetch"},
-    {"type": "code_execution_20250825", "name": "code_execution"},
+    {
+        "type": "web_search_20250305",
+        "name": "web_search",
+        "max_uses": 5,
+        "user_location": {
+            "type": "approximate",
+            "city": "Tallinn",
+            "region": "Harju",
+            "country": "EE",
+            "timezone": "Europe/Tallinn",
+        },
+    },
+    {"type": "web_fetch_20250910", "name": "web_fetch"},
 ]
 
 # Words that commonly follow prepositions (в/на/из) but are NOT location names.
