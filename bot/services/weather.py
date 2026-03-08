@@ -1,7 +1,6 @@
 """Real-time weather via wttr.in (no API key required)."""
 
 import re
-import json
 import logging
 
 import httpx
@@ -45,6 +44,37 @@ _CONDITIONS: dict[str, str] = {
     "Freezing fog": "морозный туман",
 }
 
+# Normalize common Russian inflected city names to the form wttr.in prefers
+_CITY_NORMALIZE: dict[str, str] = {
+    "таллинне": "Tallinn",
+    "таллинна": "Tallinn",
+    "таллинну": "Tallinn",
+    "таллинном": "Tallinn",
+    "таллинн": "Tallinn",
+    "таллин": "Tallinn",
+    "москве": "Moscow",
+    "москвы": "Moscow",
+    "москву": "Moscow",
+    "москва": "Moscow",
+    "питере": "Saint Petersburg",
+    "петербурге": "Saint Petersburg",
+    "петербурга": "Saint Petersburg",
+    "санкт-петербурге": "Saint Petersburg",
+    "риге": "Riga",
+    "риги": "Riga",
+    "хельсинки": "Helsinki",
+    "стокгольме": "Stockholm",
+    "берлине": "Berlin",
+    "берлина": "Berlin",
+    "лондоне": "London",
+    "лондона": "London",
+}
+
+
+def _normalize_city(city: str) -> str:
+    return _CITY_NORMALIZE.get(city.lower(), city)
+
+
 # Regex to extract a city from "погода в Таллинне" / "weather in Berlin" etc.
 _CITY_RE = re.compile(
     r'(?:погода?|temperature|weather|прогноз|forecast|дождь|снег|мороз|тепло|жарко|холодно)'
@@ -82,12 +112,26 @@ def extract_weather_city(text: str) -> str | None:
     return m.group(1) if m else None
 
 
-async def fetch_weather(city: str = "Tallinn") -> str | None:
-    """Fetch current weather + 2-day forecast from wttr.in.
+# Conditions that are always worth mentioning regardless of brevity
+_NOTABLE_CONDITIONS = {
+    "Blizzard", "Heavy snow", "Blowing snow",
+    "Heavy rain", "Moderate or heavy rain shower",
+    "Thunderstorm", "Thundery outbreaks possible",
+    "Freezing drizzle", "Freezing fog", "Ice pellets",
+}
 
-    Returns a compact formatted string ready to inject as referenced_content,
-    or None if the fetch fails (network error, unknown city, etc.).
+_STRONG_WIND_KMH = 30  # above this, always mention wind
+
+
+async def fetch_weather(city: str = "Tallinn") -> str | None:
+    """Fetch current weather from wttr.in.
+
+    Returns a compact single-line fact string for Claude to summarise,
+    e.g.: "[WEATHER: Tallinn] +3°C, солнечно; сегодня +1..+4°C"
+    Wind is included only when > 30 km/h. Tomorrow only when meaningfully
+    different from today. Claude is instructed to turn this into ≤1 sentence.
     """
+    city = _normalize_city(city)
     url = _WTTR_URL.format(city=city.replace(" ", "+"))
     try:
         async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
@@ -96,42 +140,39 @@ async def fetch_weather(city: str = "Tallinn") -> str | None:
             data = resp.json()
 
         current = data["current_condition"][0]
-        temp_c = current["temp_C"]
-        feels = current["FeelsLikeC"]
-        humidity = current["humidity"]
-        wind_kmph = current["windspeedKmph"]
-        wind_dir = current.get("winddir16Point", "")
+        temp_c = int(current["temp_C"])
+        wind_kmph = int(current["windspeedKmph"])
         desc_en = current["weatherDesc"][0]["value"]
         desc_ru = _CONDITIONS.get(desc_en, desc_en.lower())
 
-        lines = [
-            f"[Погода в {city} — актуальные данные от wttr.in]",
-            f"Сейчас: {temp_c}°C, {desc_ru}",
-            f"Ощущается: {feels}°C | влажность {humidity}% | ветер {wind_kmph} км/ч {wind_dir}",
-        ]
+        temp_str = f"+{temp_c}°C" if temp_c >= 0 else f"{temp_c}°C"
+        parts = [f"{temp_str}, {desc_ru}"]
 
+        # Always mention strong wind or notable conditions
+        notable = desc_en in _NOTABLE_CONDITIONS
+        if wind_kmph > _STRONG_WIND_KMH:
+            parts.append(f"ветер {wind_kmph} км/ч")
+
+        # Today's range
         today = data["weather"][0]
-        lines.append(
-            f"Сегодня: {today['mintempC']}…{today['maxtempC']}°C"
-        )
+        lo = int(today["mintempC"])
+        hi = int(today["maxtempC"])
+        lo_s = f"+{lo}" if lo >= 0 else str(lo)
+        hi_s = f"+{hi}" if hi >= 0 else str(hi)
+        parts.append(f"сегодня {lo_s}..{hi_s}°C")
 
+        # Tomorrow — only if it differs noticeably from today
         if len(data["weather"]) > 1:
             tmr = data["weather"][1]
             tmr_desc_en = tmr["hourly"][4]["weatherDesc"][0]["value"]
             tmr_desc_ru = _CONDITIONS.get(tmr_desc_en, tmr_desc_en.lower())
-            lines.append(
-                f"Завтра: {tmr['mintempC']}…{tmr['maxtempC']}°C, {tmr_desc_ru}"
-            )
+            tmr_lo = int(tmr["mintempC"])
+            tmr_hi = int(tmr["maxtempC"])
+            tmr_lo_s = f"+{tmr_lo}" if tmr_lo >= 0 else str(tmr_lo)
+            tmr_hi_s = f"+{tmr_hi}" if tmr_hi >= 0 else str(tmr_hi)
+            parts.append(f"завтра {tmr_lo_s}..{tmr_hi_s}°C {tmr_desc_ru}")
 
-        if len(data["weather"]) > 2:
-            d2 = data["weather"][2]
-            d2_desc_en = d2["hourly"][4]["weatherDesc"][0]["value"]
-            d2_desc_ru = _CONDITIONS.get(d2_desc_en, d2_desc_en.lower())
-            lines.append(
-                f"Послезавтра: {d2['mintempC']}…{d2['maxtempC']}°C, {d2_desc_ru}"
-            )
-
-        return "\n".join(lines)
+        return f"[WEATHER: {city}] " + "; ".join(parts)
 
     except Exception as e:
         logger.warning(f"Weather fetch failed for '{city}': {e}")
