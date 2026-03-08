@@ -24,13 +24,14 @@ anthropic_client: anthropic.AsyncAnthropic = None
 _STREAM_UPDATE_INTERVAL = 1.0
 
 # ── Built-in Anthropic web search tool ───────────────────────────────
-# Uses the server-side tool (no external API key needed — billed to Anthropic account).
-# The API handles the full search loop internally within a single call.
-# Requires ENABLE_WEB_SEARCH=true env var AND web search enabled in Anthropic Console.
+# web_search_20250305: basic server-side tool, no extra dependencies.
+# The API executes searches internally during a single call.
+# Requires ENABLE_WEB_SEARCH=true AND web search enabled in Anthropic Console.
+# NOTE: web_search_20260209 (dynamic filtering) also needs code_execution tool — avoid.
 _BUILTIN_WEB_SEARCH_TOOL: dict = {
-    "type": "web_search_20260209",
+    "type": "web_search_20250305",
     "name": "web_search",
-    "max_uses": 3,
+    "max_uses": 5,
     "user_location": {
         "type": "approximate",
         "city": "Tallinn",
@@ -139,13 +140,17 @@ async def query_claude(
         'Пример: "как настроение?" → "у меня норм, а у тебя как?" '
         'а НЕ "Настроение — это общее эмоциональное состояние..."\n\n'
         'По умолчанию ты помогаешь с вопросами про Таллинн, Эстонию. '
-        'У тебя есть инструмент web_search — используй его когда нужна актуальная информация: '
-        'отзывы о заведениях, текущие события, расписание, цены, новости. '
-        'Запросы делай на английском или эстонском — так лучше находится информация о Таллинне. '
-        'Не сообщай пользователю что ты ищешь и не пиши "сейчас поищу" — '
-        'просто вызови инструмент и ответь по результатам. '
-        'Если поиск не дал полезного результата — скажи честно и порекомендуй '
-        'Google Maps, Tripadvisor или Facebook Events. '
+        'У тебя есть инструмент web_search — ВСЕГДА используй его для актуальных данных:\n'
+        '• Погода: "Tallinn weather today" или "weather in [город]"\n'
+        '• Курсы валют: "EUR to USD rate today", "euro kurs segodnya"\n'
+        '• Новости: "Tallinn news today", "Estonia news [тема]"\n'
+        '• События/концерты: "Tallinn events this weekend", "concerts Tallinn [месяц] [год]"\n'
+        '• Заведения/отзывы: "[название] Tallinn reviews", "[название] Tallinn"\n'
+        '• Расписание/цены: "[заведение или сервис] Tallinn hours price"\n'
+        'Запросы на английском или эстонском дают лучшие результаты по Таллинну. '
+        'Для других городов используй язык, релевантный этому месту. '
+        'Не пиши "сейчас поищу" — просто используй инструмент и отвечай по результатам. '
+        'Если поиск не дал полезного результата — скажи честно. '
         '\n\n'
         'КРИТИЧЕСКИ ВАЖНО — ГЕОГРАФИЯ ЗАПРОСА:\n'
         'Если пользователь спрашивает о КОНКРЕТНОМ городе или стране (Малага, Берлин, Москва, '
@@ -153,11 +158,8 @@ async def query_claude(
         'Правила поиска для Таллинна (английский/эстонский) НЕ применяются к другим городам — '
         'для них ищи на языке, релевантном этому городу. '
         'Пример: «погода в Малаге» → ищи «Malaga weather», а НЕ «Tallinn weather».\n\n'
-        'Если видишь "[WEATHER: город] ..." — это актуальные данные погоды. '
-        'Ответь ОДНИМ коротким предложением: температура + условие (солнечно/облачно/дождь/снег). '
-        'Упоминай ветер ТОЛЬКО если он сильный (указан в данных). '
-        'Ни при каких обстоятельствах не копируй сырые данные, не пиши таблицы и ASCII-арт. '
-        'Не упоминай wttr.in. Пример хорошего ответа: «Сейчас +3°C, солнечно, днём до +6».\n\n'
+        'При ответе на вопрос о погоде: один короткий ответ — температура + условие. '
+        'Упоминай ветер только если сильный. Не копируй сырые данные и не пиши таблицы.\n\n'
         'Если видишь "[PAGE NOT ACCESSIBLE]" — страница не загрузилась. '
         'СТРОГО ЗАПРЕЩЕНО угадывать содержание по URL-адресу или частям ссылки. '
         'Если не нашёл — честно скажи что страница недоступна и ты не смог найти информацию. '
