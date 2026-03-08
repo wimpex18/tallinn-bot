@@ -160,17 +160,25 @@ async def smart_extract_facts(
 
 async def store_recent_message(
     chat_id: int, user_id: int, user_name: str, text: str,
+    thread_id: int | None = None,
 ) -> None:
-    """Push a message into per-chat and per-user recent-message lists in Redis."""
+    """Push a message into per-chat-thread and per-user recent-message lists in Redis.
+
+    Key format: chat:{chat_id}:{thread_id}:recent_msgs
+    thread_id=0 for non-topic (regular) group chats.
+    This mirrors the in-memory context key so the Redis fallback after
+    a restart restores the correct per-topic history.
+    """
     if not redis_client:
         return
     try:
         entry = f"{user_name}: {text[:300]}"
+        chat_key = f"chat:{chat_id}:{thread_id or 0}:recent_msgs"
         pipe = redis_client.pipeline()
-        # Per-chat buffer (for proactive memory extraction)
-        pipe.lpush(f"chat:{chat_id}:recent_msgs", entry)
-        pipe.ltrim(f"chat:{chat_id}:recent_msgs", 0, 29)  # keep 30
-        # Per-user buffer (for style analysis)
+        # Per-chat-thread buffer (for proactive memory + restart recovery)
+        pipe.lpush(chat_key, entry)
+        pipe.ltrim(chat_key, 0, 29)  # keep 30
+        # Per-user buffer (for style analysis — not thread-scoped)
         pipe.lpush(f"user:{user_id}:recent_msgs", text[:300])
         pipe.ltrim(f"user:{user_id}:recent_msgs", 0, STYLE_RECENT_MESSAGES_KEPT - 1)
         await pipe.execute()
@@ -178,12 +186,15 @@ async def store_recent_message(
         logger.error(f"Failed to store recent message: {e}")
 
 
-async def get_recent_chat_messages(chat_id: int, count: int = 20) -> list[str]:
-    """Get the last N messages from a chat (newest first)."""
+async def get_recent_chat_messages(
+    chat_id: int, count: int = 20, thread_id: int | None = None,
+) -> list[str]:
+    """Get the last N messages from a chat thread (newest first)."""
     if not redis_client:
         return []
     try:
-        return await redis_client.lrange(f"chat:{chat_id}:recent_msgs", 0, count - 1)
+        key = f"chat:{chat_id}:{thread_id or 0}:recent_msgs"
+        return await redis_client.lrange(key, 0, count - 1)
     except Exception as e:
         logger.error(f"Failed to get recent chat messages: {e}")
         return []

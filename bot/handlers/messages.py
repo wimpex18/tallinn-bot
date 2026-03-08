@@ -77,14 +77,17 @@ async def _extract_and_save_facts(
         if not facts:
             facts = extract_facts_from_response(question, answer, user_name)
 
+        # Always save per-user — even in group chats.
+        # Previously group-chat facts went into the shared group bucket (30 slots
+        # for all members combined).  With 5 people each generating facts, older
+        # facts got evicted after ~6 interactions per person.
+        # Now each person gets their own 20-slot bucket so memories are isolated
+        # and never crowd each other out.
         for fact in facts:
-            if chat_id == user_id:
-                await save_user_fact(user_id, fact)
-            else:
-                await save_group_fact(chat_id, fact)
+            await save_user_fact(user_id, fact)
 
         if facts:
-            logger.info(f"Learned facts: {facts}")
+            logger.info(f"Learned facts for user {user_id} ({user_name}): {facts}")
     except Exception as e:
         logger.error(f"Background fact extraction failed: {e}")
 
@@ -254,7 +257,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Load recent messages from Redis so the bot still has chat history.
     if not conv_context_msgs and update.effective_chat.type != "private":
         try:
-            recent = await get_recent_chat_messages(chat_id, 15)
+            recent = await get_recent_chat_messages(chat_id, 15, thread_id=thread_id)
             if recent:
                 # Redis stores newest-first; reverse to oldest-first.
                 # Merge all into a single "user" message because Redis
