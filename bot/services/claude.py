@@ -23,23 +23,17 @@ anthropic_client: anthropic.AsyncAnthropic = None
 # Stream update interval: update Telegram message at most every N seconds
 _STREAM_UPDATE_INTERVAL = 1.0
 
-# ── Built-in Anthropic web search tool ───────────────────────────────
-# web_search_20250305: basic server-side tool, no extra dependencies.
-# The API executes searches internally during a single call.
+# ── Built-in Anthropic server-side tools ──────────────────────────────
+# All three work together: code_execution enables dynamic filtering in
+# web_search and web_fetch, reducing token usage and improving accuracy.
+# code_execution is FREE when paired with web_search or web_fetch.
+# web_fetch is FREE (token costs only). web_search is $10/1000 searches.
 # Requires ENABLE_WEB_SEARCH=true AND web search enabled in Anthropic Console.
-# NOTE: web_search_20260209 (dynamic filtering) also needs code_execution tool — avoid.
-_BUILTIN_WEB_SEARCH_TOOL: dict = {
-    "type": "web_search_20250305",
-    "name": "web_search",
-    "max_uses": 5,
-    "user_location": {
-        "type": "approximate",
-        "city": "Tallinn",
-        "region": "Harju",
-        "country": "EE",
-        "timezone": "Europe/Tallinn",
-    },
-}
+_SERVER_TOOLS: list[dict] = [
+    {"type": "web_search_20260209", "name": "web_search"},
+    {"type": "web_fetch_20260209", "name": "web_fetch"},
+    {"type": "code_execution_20250825", "name": "code_execution"},
+]
 
 # Words that commonly follow prepositions (в/на/из) but are NOT location names.
 _NON_LOCATION_WORDS = {
@@ -140,13 +134,16 @@ async def query_claude(
         'Пример: "как настроение?" → "у меня норм, а у тебя как?" '
         'а НЕ "Настроение — это общее эмоциональное состояние..."\n\n'
         'По умолчанию ты помогаешь с вопросами про Таллинн, Эстонию. '
-        'У тебя есть инструмент web_search — ВСЕГДА используй его для актуальных данных:\n'
+        'У тебя есть инструменты web_search и web_fetch.\n'
+        'web_search — ВСЕГДА используй для актуальных данных:\n'
         '• Погода: "Tallinn weather today" или "weather in [город]"\n'
         '• Курсы валют: "EUR to USD rate today", "euro kurs segodnya"\n'
         '• Новости: "Tallinn news today", "Estonia news [тема]"\n'
         '• События/концерты: "Tallinn events this weekend", "concerts Tallinn [месяц] [год]"\n'
         '• Заведения/отзывы: "[название] Tallinn reviews", "[название] Tallinn"\n'
         '• Расписание/цены: "[заведение или сервис] Tallinn hours price"\n'
+        'web_fetch — используй для чтения конкретных ссылок, которые пользователь кидает в чат. '
+        'Если пользователь прислал URL, используй web_fetch чтобы прочитать страницу и пересказать содержимое.\n'
         'Запросы на английском или эстонском дают лучшие результаты по Таллинну. '
         'Для других городов используй язык, релевантный этому месту. '
         'Не пиши "сейчас поищу" — просто используй инструмент и отвечай по результатам. '
@@ -291,7 +288,7 @@ async def query_claude(
         return "Бот не готов, попробуй чуть позже("
 
     streaming = bool(telegram_bot and telegram_chat_id and telegram_message_id)
-    tools = [_BUILTIN_WEB_SEARCH_TOOL] if ENABLE_WEB_SEARCH else None
+    tools = _SERVER_TOOLS if ENABLE_WEB_SEARCH else None
 
     try:
         if streaming:
@@ -375,6 +372,7 @@ async def _blocking_response(
         kwargs["temperature"] = 1.0  # required for extended thinking
     if tools:
         kwargs["tools"] = tools
+        kwargs["max_tokens"] = max(kwargs["max_tokens"], 4096)
 
     response = await client.messages.create(**kwargs)
     # Skip thinking/tool blocks — find the first text block
@@ -418,6 +416,7 @@ async def _stream_response(
         kwargs["temperature"] = 1.0  # required for extended thinking
     if tools:
         kwargs["tools"] = tools
+        kwargs["max_tokens"] = max(kwargs["max_tokens"], 4096)
 
     async with client.messages.stream(**kwargs) as stream:
         async for chunk in stream.text_stream:
