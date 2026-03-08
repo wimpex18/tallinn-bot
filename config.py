@@ -25,17 +25,24 @@ CONTEXT_SIZE = 50            # increased from 20 — Claude handles long context
 CONTEXT_MAX_AGE = 3600       # 1 hour — evict stale contexts
 RATE_LIMIT_MAX_AGE = 300     # 5 min — evict stale rate-limit entries
 EVICTION_INTERVAL = 300      # run eviction every 5 min
+CONTEXT_COMPACT_THRESHOLD = 15  # trim API context when it exceeds this many turns
+CONTEXT_COMPACT_KEEP = 10       # keep this many recent turns after trimming
 
 # ── URL fetching ─────────────────────────────────────────────────────
 URL_CACHE_TTL = 300          # 5 min cache per URL
 FETCH_TIMEOUT = 20           # seconds per fetch attempt
 IMPERSONATE_PROFILES = ["chrome", "safari"]
+URL_MAX_CHARS = 8000         # total character limit for fetched content
+URL_HEAD_CHARS = 3000        # characters kept from the start (title, lead, date)
+URL_TAIL_CHARS = 2000        # characters kept from the end (conclusions, contacts)
 
 # ── Anthropic API ─────────────────────────────────────────────────────
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
 ANTHROPIC_TIMEOUT = 60.0
 ANTHROPIC_MAX_TOKENS = 1024
 ANTHROPIC_TEMPERATURE = 0.3
+THINKING_BUDGET_TOKENS = 5000   # extended thinking token budget (0 = disabled)
+THINKING_THRESHOLD_CHARS = 300  # enable thinking for questions longer than this
 
 # ── Telegram connection pool (critical for performance) ──────────────
 # PTB v21.9 defaults to pool_size=1 which causes severe bottlenecks.

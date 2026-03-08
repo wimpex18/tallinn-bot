@@ -166,7 +166,8 @@ async def observe_and_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     # Generate and send
-    conv_context = get_context_string(chat_id)
+    thread_id = message.message_thread_id
+    conv_context = get_context_string(chat_id, thread_id)
     comment = await _generate_spontaneous_comment(conv_context, text, user_name)
 
     if comment:
@@ -179,7 +180,7 @@ async def observe_and_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         # Track the spontaneous reply in conversation context so
         # follow-up questions can reference what the bot just said.
-        add_to_context(chat_id, "assistant", "bot", comment)
+        add_to_context(chat_id, "assistant", "bot", comment, thread_id=thread_id)
 
         await message.reply_text(comment, reply_to_message_id=message.message_id)
         logger.info(f"[spontaneous] Replied in chat {chat_id}: {comment[:60]}...")

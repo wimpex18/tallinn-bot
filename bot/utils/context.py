@@ -1,53 +1,74 @@
-"""Chat conversation context and in-memory eviction."""
+"""Chat conversation context and in-memory eviction.
+
+Context is keyed by (chat_id, thread_id) so Telegram forum topics each get
+their own isolated history.  thread_id=0 is used for non-topic chats.
+"""
 
 import time
 import logging
 from collections import defaultdict
 
-from config import CONTEXT_SIZE, CONTEXT_MAX_AGE, RATE_LIMIT_MAX_AGE, EVICTION_INTERVAL
+from config import (
+    CONTEXT_SIZE, CONTEXT_MAX_AGE, RATE_LIMIT_MAX_AGE, EVICTION_INTERVAL,
+    CONTEXT_COMPACT_THRESHOLD, CONTEXT_COMPACT_KEEP,
+)
 
 logger = logging.getLogger(__name__)
 
+# Context key: (chat_id, thread_id) — thread_id=0 for non-topic chats
+_CtxKey = tuple[int, int]
+
+
+def _key(chat_id: int, thread_id: int | None = None) -> _CtxKey:
+    return (chat_id, thread_id or 0)
+
+
 # In-memory stores
-chat_context: dict[int, list[dict]] = defaultdict(list)
+chat_context: dict[_CtxKey, list[dict]] = defaultdict(list)
 user_last_query: dict[int, float] = defaultdict(float)
 _last_eviction: float = 0.0
 
 
-def add_to_context(chat_id: int, role: str, name: str, content: str) -> None:
+def add_to_context(
+    chat_id: int, role: str, name: str, content: str,
+    thread_id: int | None = None,
+) -> None:
     """Add a message to the chat context."""
-    chat_context[chat_id].append({
+    k = _key(chat_id, thread_id)
+    chat_context[k].append({
         "role": role,
         "name": name,
         "content": content[:1000],
         "time": time.time(),
     })
-    if len(chat_context[chat_id]) > CONTEXT_SIZE:
-        chat_context[chat_id] = chat_context[chat_id][-CONTEXT_SIZE:]
+    if len(chat_context[k]) > CONTEXT_SIZE:
+        chat_context[k] = chat_context[k][-CONTEXT_SIZE:]
 
 
-def get_context_string(chat_id: int) -> str:
+def get_context_string(chat_id: int, thread_id: int | None = None) -> str:
     """Get recent conversation context as a string."""
-    if not chat_context[chat_id]:
+    k = _key(chat_id, thread_id)
+    if not chat_context[k]:
         return ""
     lines = []
-    for msg in chat_context[chat_id][-CONTEXT_SIZE:]:
+    for msg in chat_context[k][-CONTEXT_SIZE:]:
         name = msg.get("name", "user")
         lines.append(f"{name}: {msg['content']}")
     return "\n".join(lines)
 
 
-def get_context_messages(chat_id: int) -> list[dict]:
+def get_context_messages(chat_id: int, thread_id: int | None = None) -> list[dict]:
     """Get recent conversation as a list of {role, content} for the API.
 
     Merges consecutive same-role messages and maps to user/assistant roles.
     Returns at most CONTEXT_SIZE messages.
     """
-    if not chat_context[chat_id]:
+    k = _key(chat_id, thread_id)
+    if not chat_context[k]:
         return []
 
     api_msgs = []
-    for msg in chat_context[chat_id][-CONTEXT_SIZE:]:
+    for msg in chat_context[k][-CONTEXT_SIZE:]:
         role = "assistant" if msg["role"] == "assistant" else "user"
         name = msg.get("name", "user")
         text = msg["content"]
@@ -69,6 +90,30 @@ def get_context_messages(chat_id: int) -> list[dict]:
     return api_msgs
 
 
+def trim_context_for_api(messages: list[dict]) -> list[dict]:
+    """Trim a long context list to CONTEXT_COMPACT_KEEP recent turns.
+
+    Inspired by OpenClaw's session compaction lifecycle.  When the context
+    list exceeds CONTEXT_COMPACT_THRESHOLD entries, drops the oldest
+    (messages[0 .. -CONTEXT_COMPACT_KEEP]) and prepends a single placeholder
+    so the model knows history was omitted.  No LLM call — pure windowing.
+    """
+    if len(messages) <= CONTEXT_COMPACT_THRESHOLD:
+        return messages
+
+    omitted = len(messages) - CONTEXT_COMPACT_KEEP
+    recent = list(messages[-CONTEXT_COMPACT_KEEP:])
+    placeholder = f"[Контекст: пропущено {omitted} ранних сообщений беседы]"
+
+    # Merge placeholder into the first user turn to preserve alternating roles
+    if recent and recent[0]["role"] == "user":
+        recent[0] = {**recent[0], "content": placeholder + "\n" + recent[0]["content"]}
+    else:
+        recent.insert(0, {"role": "user", "content": placeholder})
+
+    return recent
+
+
 def evict_stale_data() -> None:
     """Remove stale entries from in-memory dicts.
 
@@ -81,11 +126,11 @@ def evict_stale_data() -> None:
     _last_eviction = now
 
     stale_chats = [
-        cid for cid, msgs in chat_context.items()
+        k for k, msgs in chat_context.items()
         if msgs and now - msgs[-1].get("time", 0) > CONTEXT_MAX_AGE
     ]
-    for cid in stale_chats:
-        del chat_context[cid]
+    for k in stale_chats:
+        del chat_context[k]
 
     stale_users = [
         uid for uid, ts in user_last_query.items()

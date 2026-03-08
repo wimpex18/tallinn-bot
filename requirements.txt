@@ -1,7 +1,7 @@
 python-telegram-bot[webhooks,job-queue]==22.6
-anthropic>=0.40.0
+anthropic>=0.84.0
 httpx==0.28.1
 curl_cffi>=0.14,<0.15
 trafilatura>=2.0
 python-dotenv==1.2.1
-redis==7.2.0
+redis>=7.1.0,<8.0

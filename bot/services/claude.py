@@ -11,6 +11,7 @@ from config import (
     ANTHROPIC_MODEL,
     ANTHROPIC_MAX_TOKENS,
     ANTHROPIC_TEMPERATURE,
+    THINKING_BUDGET_TOKENS,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,7 @@ async def query_claude(
     telegram_bot=None,
     telegram_chat_id: int = None,
     telegram_message_id: int = None,
+    thinking_budget: int = 0,
 ) -> str:
     """Query Claude with multi-turn context, memory, photos, and optional streaming.
 
@@ -105,7 +107,11 @@ async def query_claude(
     """
     t0 = time.monotonic()
 
-    system_prompt = (
+    # ── Static system prompt (cached across calls) ───────────────────
+    # This ~3 KB block is identical for every user/chat, so we mark it
+    # with cache_control="ephemeral".  Cache hits cost ~10 % of normal
+    # input tokens, saving significant cost when traffic is steady.
+    _STATIC_SYSTEM = (
         'Отвечай на русском. Используй "ты". Кратко, 2-4 предложения. Без эмодзи. '
         'Ты общаешься как живой человек в чате, НЕ как энциклопедия и НЕ как ассистент. '
         'На болтовню и простые вопросы (привет, как дела, как настроение, что делаешь) '
@@ -156,12 +162,20 @@ async def query_claude(
         '→ ищи «Malaga weather next week», а НЕ спрашивай где находится пользователь.'
     )
 
+    # Build system as a list of content blocks so we can apply cache_control
+    # to the static base and keep user-specific context uncached.
+    system_content: list[dict] = [
+        {"type": "text", "text": _STATIC_SYSTEM, "cache_control": {"type": "ephemeral"}},
+    ]
+    dynamic_parts = []
     if user_facts:
-        system_prompt += f"\n\nТы помнишь про этого человека: {', '.join(user_facts[:5])}"
+        dynamic_parts.append(f"Ты помнишь про этого человека: {', '.join(user_facts[:5])}")
     if group_facts:
-        system_prompt += f"\n\nТы помнишь про эту группу: {', '.join(group_facts[:5])}"
+        dynamic_parts.append(f"Ты помнишь про эту группу: {', '.join(group_facts[:5])}")
     if user_style:
-        system_prompt += f"\n\n{user_style}"
+        dynamic_parts.append(user_style)
+    if dynamic_parts:
+        system_content.append({"type": "text", "text": "\n\n".join(dynamic_parts)})
 
     # Auto-append Tallinn context for place/event queries when not replying
     # to an existing bot message (which already carries location context).
@@ -255,11 +269,14 @@ async def query_claude(
     try:
         if streaming:
             answer = await _stream_response(
-                _client, system_prompt, messages,
+                _client, system_content, messages,
                 telegram_bot, telegram_chat_id, telegram_message_id,
+                thinking_budget=thinking_budget,
             )
         else:
-            answer = await _blocking_response(_client, system_prompt, messages)
+            answer = await _blocking_response(
+                _client, system_content, messages, thinking_budget=thinking_budget,
+            )
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         logger.info(f"Claude responded in {elapsed_ms:.0f}ms ({len(answer)} chars)")
@@ -309,45 +326,61 @@ async def query_claude(
 
 async def _blocking_response(
     client: anthropic.AsyncAnthropic,
-    system_prompt: str,
+    system_content: list[dict],
     messages: list[dict],
+    thinking_budget: int = 0,
 ) -> str:
     """Non-streaming Claude call — returns the full response text."""
-    response = await client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=ANTHROPIC_MAX_TOKENS,
-        temperature=ANTHROPIC_TEMPERATURE,
-        system=system_prompt,
-        messages=messages,
-    )
-    text = response.content[0].text if response.content else ""
+    kwargs: dict = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
+        "temperature": ANTHROPIC_TEMPERATURE,
+        "system": system_content,
+        "messages": messages,
+    }
+    if thinking_budget > 0:
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+        kwargs["max_tokens"] = max(ANTHROPIC_MAX_TOKENS, thinking_budget + 2048)
+        kwargs["temperature"] = 1.0  # required for extended thinking
+
+    response = await client.messages.create(**kwargs)
+    # Skip thinking blocks — find the first text block
+    text = next((b.text for b in response.content if hasattr(b, "text")), "")
     return _clean_response(text)
 
 
 async def _stream_response(
     client: anthropic.AsyncAnthropic,
-    system_prompt: str,
+    system_content: list[dict],
     messages: list[dict],
     telegram_bot,
     chat_id: int,
     message_id: int,
+    thinking_budget: int = 0,
 ) -> str:
     """Stream Claude response and pipe chunks into Telegram via editMessageText.
 
     Edits the message at most once per _STREAM_UPDATE_INTERVAL seconds to stay
     within Telegram rate limits, then does a clean final edit on completion.
+    The text_stream iterator automatically skips thinking blocks.
     Returns the fully accumulated, cleaned response text.
     """
     accumulated = ""
     last_edit_time = 0.0
 
-    async with client.messages.stream(
-        model=ANTHROPIC_MODEL,
-        max_tokens=ANTHROPIC_MAX_TOKENS,
-        temperature=ANTHROPIC_TEMPERATURE,
-        system=system_prompt,
-        messages=messages,
-    ) as stream:
+    kwargs: dict = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
+        "temperature": ANTHROPIC_TEMPERATURE,
+        "system": system_content,
+        "messages": messages,
+    }
+    if thinking_budget > 0:
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+        kwargs["max_tokens"] = max(ANTHROPIC_MAX_TOKENS, thinking_budget + 2048)
+        kwargs["temperature"] = 1.0  # required for extended thinking
+
+    async with client.messages.stream(**kwargs) as stream:
         async for chunk in stream.text_stream:
             accumulated += chunk
             now = time.monotonic()

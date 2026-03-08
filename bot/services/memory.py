@@ -1,5 +1,6 @@
 """Redis-backed persistent memory for user and group facts."""
 
+import json
 import time
 import re
 import logging
@@ -102,7 +103,11 @@ def extract_facts_from_response(question: str, answer: str, user_name: str) -> l
 async def smart_extract_facts(
     question: str, answer: str, user_name: str, chat_context: str = None,
 ) -> list[str]:
-    """Use LLM to extract important facts from conversation."""
+    """Use LLM to extract important facts from conversation.
+
+    Returns structured JSON output for reliable parsing instead of fragile
+    line-by-line text parsing.
+    """
     if not question or len(question) < 10:
         return []
 
@@ -120,29 +125,31 @@ async def smart_extract_facts(
 {context_part}
 
 Выдай ТОЛЬКО факты о человеке (интересы, предпочтения, планы, работа, и т.д.)
-Формат: один факт на строку, коротко (3-7 слов)
-Если фактов нет - напиши "НЕТ"
-Максимум 3 факта."""
+Каждый факт — 3-7 слов. Максимум 3 факта.
+Отвечай ТОЛЬКО валидным JSON: {{"facts": ["факт 1", "факт 2"]}} или {{"facts": []}} если фактов нет."""
 
     try:
         response = await claude_service.anthropic_client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=100,
+            max_tokens=150,
             temperature=0.1,
             messages=[{"role": "user", "content": prompt}],
         )
-        result = response.content[0].text.strip() if response.content else ""
+        raw = response.content[0].text.strip() if response.content else ""
 
-        if "НЕТ" in result.upper() or len(result) < 5:
+        try:
+            data = json.loads(raw)
+            raw_facts = data.get("facts", [])
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning(f"Failed to parse JSON facts, skipping: {raw[:80]}")
             return []
 
         facts = []
-        for line in result.split("\n"):
-            line = line.strip().lstrip("-•").strip()
-            if 3 < len(line) < 100:
-                if user_name and not line.startswith(user_name):
-                    line = f"{user_name}: {line}"
-                facts.append(line)
+        for fact in raw_facts:
+            if isinstance(fact, str) and 3 < len(fact) < 100:
+                if user_name and not fact.startswith(user_name):
+                    fact = f"{user_name}: {fact}"
+                facts.append(fact)
         return facts[:3]
     except Exception as e:
         logger.error(f"Failed to extract facts: {e}")
@@ -204,26 +211,26 @@ async def extract_facts_from_conversation(
 {conversation}
 
 Извлеки важные факты о людях: интересы, предпочтения, планы, работа, настроение,
-отношения. Формат: "Имя: факт" — один факт на строку, коротко (3-7 слов).
-Если фактов нет — ответь НЕТ. Максимум 5 фактов."""
+отношения. Каждый факт в формате "Имя: факт", 3-7 слов. Максимум 5 фактов.
+Отвечай ТОЛЬКО валидным JSON: {{"facts": ["Имя: факт", "Имя: факт"]}} или {{"facts": []}} если фактов нет."""
 
     try:
         response = await claude_service.anthropic_client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=150,
+            max_tokens=200,
             temperature=0.1,
             messages=[{"role": "user", "content": prompt}],
         )
-        result = response.content[0].text.strip() if response.content else ""
+        raw = response.content[0].text.strip() if response.content else ""
 
-        if "НЕТ" in result.upper() or len(result) < 5:
+        try:
+            data = json.loads(raw)
+            raw_facts = data.get("facts", [])
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning(f"Failed to parse JSON facts from conversation: {raw[:80]}")
             return []
 
-        facts = []
-        for line in result.split("\n"):
-            line = line.strip().lstrip("-•0123456789.").strip()
-            if 5 < len(line) < 120:
-                facts.append(line)
+        facts = [f for f in raw_facts if isinstance(f, str) and 5 < len(f) < 120]
         return facts[:5]
     except Exception as e:
         logger.error(f"Proactive fact extraction failed: {e}")
