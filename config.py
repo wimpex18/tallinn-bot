@@ -42,7 +42,7 @@ ANTHROPIC_TIMEOUT = 60.0
 ANTHROPIC_MAX_TOKENS = 1024
 ANTHROPIC_TEMPERATURE = 0.3
 THINKING_BUDGET_TOKENS = 5000   # extended thinking token budget (0 = disabled)
-THINKING_THRESHOLD_CHARS = 300  # enable thinking for questions longer than this
+THINKING_THRESHOLD_CHARS = 150  # enable thinking for questions longer than this
 
 # ── Telegram connection pool (critical for performance) ──────────────
 # PTB v21.9 defaults to pool_size=1 which causes severe bottlenecks.

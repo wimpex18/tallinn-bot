@@ -314,8 +314,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     timer.checkpoint("photos")
 
     # ── Query Claude ─────────────────────────────────────────────
-    # Enable extended thinking for complex / long questions
-    thinking_budget = THINKING_BUDGET_TOKENS if len(question) > THINKING_THRESHOLD_CHARS else 0
+    # Enable extended thinking for complex / research-type questions.
+    # Two triggers:
+    #   1. Length > THINKING_THRESHOLD_CHARS (long = likely complex)
+    #   2. Research/recommendation keywords regardless of length
+    _RESEARCH_KEYWORDS = {
+        "поищи", "поиск", "найди", "ищи", "отзывы", "отзыв",
+        "рекоменд", "посоветуй", "советуй", "подскажи",
+        "сравни", "compare", "лучший", "лучшие", "топ",
+        "куда сходить", "что посмотреть", "стоит ли",
+    }
+    question_words = set(question.lower().split())
+    is_research = bool(question_words & _RESEARCH_KEYWORDS)
+    thinking_budget = (
+        THINKING_BUDGET_TOKENS
+        if (len(question) > THINKING_THRESHOLD_CHARS or is_research)
+        else 0
+    )
 
     logger.info(
         f"Query from {user_id} ({user_name}): {question[:120]}... "
