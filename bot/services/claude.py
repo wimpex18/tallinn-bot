@@ -12,7 +12,6 @@ from config import (
     ANTHROPIC_MAX_TOKENS,
     ANTHROPIC_TEMPERATURE,
     THINKING_BUDGET_TOKENS,
-    ENABLE_WEB_SEARCH,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,18 +23,13 @@ anthropic_client: anthropic.AsyncAnthropic = None
 _STREAM_UPDATE_INTERVAL = 1.0
 
 # ── Built-in Anthropic server-side tools ──────────────────────────────
-# web_search_20260209 + web_fetch_20260209: latest versions with dynamic
-#   filtering — Claude writes code to post-process results before they
-#   enter context (better accuracy, fewer tokens).
-# code_execution_20250825: enables the dynamic filtering above.
-#   FREE when used alongside web_search/fetch _20260209. No beta header
-#   or Console toggle required — standard GA tool on the Claude API.
-# web_fetch is FREE (tokens only). web_search is $10/1000 searches.
-# Requires ENABLE_WEB_SEARCH=true AND web search enabled in Anthropic Console.
+# web_search_20260209: latest version, always active — model decides when to search.
+# web_fetch_20260209: free (tokens only), fetches URLs users share in chat.
+# web_search costs $10/1000 searches. Web search must be enabled in Anthropic Console.
+# Note: code_execution_20250825 (dynamic filtering) omitted — requires preview access.
 _SERVER_TOOLS: list[dict] = [
     {"type": "web_search_20260209", "name": "web_search"},
-    {"type": "web_fetch_20260209", "name": "web_fetch"},
-    {"type": "code_execution_20250825", "name": "code_execution"},
+    {"type": "web_fetch_20260209",  "name": "web_fetch"},
 ]
 
 # Words that commonly follow prepositions (в/на/из) but are NOT location names.
@@ -291,7 +285,7 @@ async def query_claude(
         return "Бот не готов, попробуй чуть позже("
 
     streaming = bool(telegram_bot and telegram_chat_id and telegram_message_id)
-    tools = _SERVER_TOOLS if ENABLE_WEB_SEARCH else None
+    tools = _SERVER_TOOLS
 
     try:
         if streaming:
