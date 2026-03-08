@@ -1,4 +1,4 @@
-"""Anthropic Claude API client with streaming support."""
+"""Anthropic Claude API client with streaming and built-in web search support."""
 
 import re
 import time
@@ -12,6 +12,7 @@ from config import (
     ANTHROPIC_MAX_TOKENS,
     ANTHROPIC_TEMPERATURE,
     THINKING_BUDGET_TOKENS,
+    ENABLE_WEB_SEARCH,
 )
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,23 @@ anthropic_client: anthropic.AsyncAnthropic = None
 
 # Stream update interval: update Telegram message at most every N seconds
 _STREAM_UPDATE_INTERVAL = 1.0
+
+# ── Built-in Anthropic web search tool ───────────────────────────────
+# Uses the server-side tool (no external API key needed — billed to Anthropic account).
+# The API handles the full search loop internally within a single call.
+# Requires ENABLE_WEB_SEARCH=true env var AND web search enabled in Anthropic Console.
+_BUILTIN_WEB_SEARCH_TOOL: dict = {
+    "type": "web_search_20260209",
+    "name": "web_search",
+    "max_uses": 3,
+    "user_location": {
+        "type": "approximate",
+        "city": "Tallinn",
+        "region": "Harju",
+        "country": "EE",
+        "timezone": "Europe/Tallinn",
+    },
+}
 
 # Words that commonly follow prepositions (в/на/из) but are NOT location names.
 _NON_LOCATION_WORDS = {
@@ -121,14 +139,13 @@ async def query_claude(
         'Пример: "как настроение?" → "у меня норм, а у тебя как?" '
         'а НЕ "Настроение — это общее эмоциональное состояние..."\n\n'
         'По умолчанию ты помогаешь с вопросами про Таллинн, Эстонию. '
-        'ВАЖНО: у тебя НЕТ доступа к интернету в реальном времени и НЕТ функции поиска. '
-        'Никогда не пиши "сейчас поищу", "ищу...", "поищу для тебя" — это вводит в заблуждение, '
-        'потому что ты не можешь выполнить поиск. '
-        'Если спрашивают свежие отзывы, текущие события или актуальные данные — честно скажи, '
-        'что у тебя нет доступа к актуальной информации, и порекомендуй конкретный источник: '
-        'Google Maps / Tripadvisor для отзывов, Facebook Events / visitestonia.com для событий, '
-        'tallinn.ee / piletilevi.ee для концертов. '
-        'Если вопрос о Таллинне и ты знаешь ответ из своих знаний (до обрезки) — отвечай. '
+        'У тебя есть инструмент web_search — используй его когда нужна актуальная информация: '
+        'отзывы о заведениях, текущие события, расписание, цены, новости. '
+        'Запросы делай на английском или эстонском — так лучше находится информация о Таллинне. '
+        'Не сообщай пользователю что ты ищешь и не пиши "сейчас поищу" — '
+        'просто вызови инструмент и ответь по результатам. '
+        'Если поиск не дал полезного результата — скажи честно и порекомендуй '
+        'Google Maps, Tripadvisor или Facebook Events. '
         '\n\n'
         'КРИТИЧЕСКИ ВАЖНО — ГЕОГРАФИЯ ЗАПРОСА:\n'
         'Если пользователь спрашивает о КОНКРЕТНОМ городе или стране (Малага, Берлин, Москва, '
@@ -272,6 +289,7 @@ async def query_claude(
         return "Бот не готов, попробуй чуть позже("
 
     streaming = bool(telegram_bot and telegram_chat_id and telegram_message_id)
+    tools = [_BUILTIN_WEB_SEARCH_TOOL] if ENABLE_WEB_SEARCH else None
 
     try:
         if streaming:
@@ -279,10 +297,13 @@ async def query_claude(
                 _client, system_content, messages,
                 telegram_bot, telegram_chat_id, telegram_message_id,
                 thinking_budget=thinking_budget,
+                tools=tools,
             )
         else:
             answer = await _blocking_response(
-                _client, system_content, messages, thinking_budget=thinking_budget,
+                _client, system_content, messages,
+                thinking_budget=thinking_budget,
+                tools=tools,
             )
 
         elapsed_ms = (time.monotonic() - t0) * 1000
@@ -336,6 +357,7 @@ async def _blocking_response(
     system_content: list[dict],
     messages: list[dict],
     thinking_budget: int = 0,
+    tools: list | None = None,
 ) -> str:
     """Non-streaming Claude call — returns the full response text."""
     kwargs: dict = {
@@ -349,9 +371,11 @@ async def _blocking_response(
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
         kwargs["max_tokens"] = max(ANTHROPIC_MAX_TOKENS, thinking_budget + 2048)
         kwargs["temperature"] = 1.0  # required for extended thinking
+    if tools:
+        kwargs["tools"] = tools
 
     response = await client.messages.create(**kwargs)
-    # Skip thinking blocks — find the first text block
+    # Skip thinking/tool blocks — find the first text block
     text = next((b.text for b in response.content if hasattr(b, "text")), "")
     return _clean_response(text)
 
@@ -364,12 +388,16 @@ async def _stream_response(
     chat_id: int,
     message_id: int,
     thinking_budget: int = 0,
+    tools: list | None = None,
 ) -> str:
     """Stream Claude response and pipe chunks into Telegram via editMessageText.
 
     Edits the message at most once per _STREAM_UPDATE_INTERVAL seconds to stay
     within Telegram rate limits, then does a clean final edit on completion.
-    The text_stream iterator automatically skips thinking blocks.
+    The text_stream iterator automatically skips thinking and server_tool_use blocks.
+    When the built-in web_search tool is passed, the API executes searches internally
+    during the stream (pause then resumes). If stop_reason is pause_turn the response
+    is continued automatically.
     Returns the fully accumulated, cleaned response text.
     """
     accumulated = ""
@@ -386,6 +414,8 @@ async def _stream_response(
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
         kwargs["max_tokens"] = max(ANTHROPIC_MAX_TOKENS, thinking_budget + 2048)
         kwargs["temperature"] = 1.0  # required for extended thinking
+    if tools:
+        kwargs["tools"] = tools
 
     async with client.messages.stream(**kwargs) as stream:
         async for chunk in stream.text_stream:
@@ -394,6 +424,25 @@ async def _stream_response(
             if (now - last_edit_time) >= _STREAM_UPDATE_INTERVAL and accumulated.strip():
                 await _safe_edit(telegram_bot, chat_id, message_id, accumulated + "▌")
                 last_edit_time = now
+
+        final_message = await stream.get_final_message()
+
+    # Handle pause_turn: API paused mid-turn (rare, usually during very long searches).
+    # Continue by sending the accumulated response back as the assistant turn.
+    if final_message.stop_reason == "pause_turn":
+        logger.info("Claude returned pause_turn — continuing turn")
+        continuation_messages = list(messages) + [
+            {"role": "assistant", "content": final_message.content},
+        ]
+        continuation_kwargs = dict(kwargs)
+        continuation_kwargs["messages"] = continuation_messages
+        async with client.messages.stream(**continuation_kwargs) as stream2:
+            async for chunk in stream2.text_stream:
+                accumulated += chunk
+                now = time.monotonic()
+                if (now - last_edit_time) >= _STREAM_UPDATE_INTERVAL and accumulated.strip():
+                    await _safe_edit(telegram_bot, chat_id, message_id, accumulated + "▌")
+                    last_edit_time = now
 
     final_text = _clean_response(accumulated)
     await _safe_edit(telegram_bot, chat_id, message_id, final_text)
