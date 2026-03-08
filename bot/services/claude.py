@@ -24,16 +24,18 @@ anthropic_client: anthropic.AsyncAnthropic = None
 _STREAM_UPDATE_INTERVAL = 1.0
 
 # ── Built-in Anthropic server-side tools ──────────────────────────────
-# web_search_20260209: latest version. Supports dynamic filtering
-#   when code_execution_20250825 is also present (requires beta access;
-#   omitted here). Without it, behaves as standard web search.
-# web_fetch_20260209: latest version, fetch URLs shared in chat.
-#   Dynamic filtering also activates with code_execution when available.
+# web_search_20260209 + web_fetch_20260209: latest versions with dynamic
+#   filtering — Claude writes code to post-process results before they
+#   enter context (better accuracy, fewer tokens).
+# code_execution_20250825: enables the dynamic filtering above.
+#   FREE when used alongside web_search/fetch _20260209. No beta header
+#   or Console toggle required — standard GA tool on the Claude API.
 # web_fetch is FREE (tokens only). web_search is $10/1000 searches.
 # Requires ENABLE_WEB_SEARCH=true AND web search enabled in Anthropic Console.
 _SERVER_TOOLS: list[dict] = [
     {"type": "web_search_20260209", "name": "web_search"},
     {"type": "web_fetch_20260209", "name": "web_fetch"},
+    {"type": "code_execution_20250825", "name": "code_execution"},
 ]
 
 # Words that commonly follow prepositions (в/на/из) but are NOT location names.
