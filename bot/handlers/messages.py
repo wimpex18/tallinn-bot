@@ -2,9 +2,17 @@
 
 import asyncio
 import logging
+from typing import Optional
 
 from telegram import Update
 from telegram.ext import ContextTypes
+
+# ── Album buffering ────────────────────────────────────────────────────
+# Telegram delivers each photo in a media group (album) as a separate update
+# with the same media_group_id.  We buffer them for 0.8 s then process all
+# photos in a single Claude call so the model sees the full album at once.
+
+_album_buffer: dict[str, dict] = {}  # media_group_id → {updates, context, task}
 
 from config import BOT_USERNAME, THINKING_BUDGET_TOKENS, THINKING_THRESHOLD_CHARS
 from bot.middleware.timing import Timer
@@ -92,10 +100,55 @@ async def _extract_and_save_facts(
         logger.error(f"Background fact extraction failed: {e}")
 
 
+# ── Album buffering helpers ───────────────────────────────────────────
+
+async def _flush_album(group_id: str) -> None:
+    """Wait briefly for all album photos to arrive, then process together."""
+    await asyncio.sleep(0.8)
+    entry = _album_buffer.pop(group_id, None)
+    if not entry:
+        return
+    updates: list = entry["updates"]
+    ctx = entry["context"]
+    # Prefer the update that carries a caption; otherwise use the last one
+    primary = updates[-1]
+    for u in updates:
+        if u.message and u.message.caption:
+            primary = u
+            break
+    await _process_message(primary, ctx, album_updates=updates)
+
+
 # ── Main handler ─────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming messages with full timing instrumentation."""
+    """Route message: buffer album photos, pass everything else directly."""
+    message = update.message
+    if not message:
+        return
+
+    # Album: collect all photos before processing
+    if message.photo and message.media_group_id:
+        group_id = str(message.media_group_id)
+        entry = _album_buffer.setdefault(
+            group_id, {"updates": [], "context": context, "task": None}
+        )
+        entry["updates"].append(update)
+        # Reset the flush timer on each new photo
+        if entry["task"] and not entry["task"].done():
+            entry["task"].cancel()
+        entry["task"] = asyncio.create_task(_flush_album(group_id))
+        return
+
+    await _process_message(update, context)
+
+
+async def _process_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    album_updates: Optional[list] = None,
+) -> None:
+    """Handle a single message (or the merged primary update of an album)."""
     message = update.message
     if not message:
         return
@@ -210,7 +263,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not question and referenced_content:
         question = "о чём это?"
     if not question and (has_current_photo or has_reply_photo):
-        question = "что на фото?"
+        question = "что на фотографиях?" if album_updates and len(album_updates) > 1 else "что на фото?"
 
     # Rate limit (checked after we know we will process, before any network I/O)
     is_limited, remaining = check_rate_limit(user_id)
@@ -299,17 +352,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # ── Photos ───────────────────────────────────────────────────
     photo_urls = []
-    if has_photo(message):
+    seen_file_ids: set[str] = set()
+
+    if album_updates:
+        # Download all photos from every message in the album
+        for au in album_updates:
+            if au.message and au.message.photo:
+                photo = au.message.photo[-1]
+                if photo.file_id not in seen_file_ids:
+                    seen_file_ids.add(photo.file_id)
+                    photo_url = await download_photo_as_base64(photo, context.bot)
+                    if photo_url:
+                        photo_urls.append(photo_url)
+    elif has_photo(message):
         photo = message.photo[-1]
+        seen_file_ids.add(photo.file_id)
         photo_url = await download_photo_as_base64(photo, context.bot)
         if photo_url:
             photo_urls.append(photo_url)
 
     if reply_msg and has_photo(reply_msg):
         photo = reply_msg.photo[-1]
-        photo_url = await download_photo_as_base64(photo, context.bot)
-        if photo_url:
-            photo_urls.append(photo_url)
+        if photo.file_id not in seen_file_ids:
+            photo_url = await download_photo_as_base64(photo, context.bot)
+            if photo_url:
+                photo_urls.append(photo_url)
 
     timer.checkpoint("photos")
 
