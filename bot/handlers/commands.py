@@ -13,6 +13,7 @@ from bot.services.memory import (
     save_group_fact, get_group_facts,
     redis_client,
 )
+from bot.utils.context import clear_context
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -48,7 +49,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Память:\n"
         "/memory - посмотреть что помню\n"
         "/remember <факт> - запомнить\n"
-        "/forget - забыть всё"
+        "/forget - забыть всё\n"
+        "/clear - очистить историю разговора"
     )
 
 
@@ -158,6 +160,14 @@ async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"Готово! Просканировано: {stats.get('scanned', 0)}, "
         f"удалено: {stats.get('deleted', 0)}"
     )
+
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /clear — wipe in-memory conversation context for this chat."""
+    chat_id = update.effective_chat.id
+    thread_id = update.message.message_thread_id
+    clear_context(chat_id, thread_id)
+    await update.message.reply_text("Контекст разговора очищен. Начинаем с чистого листа)")
 
 
 async def quiet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -37,7 +37,7 @@ from config import (
 )
 from bot.handlers.commands import (
     start_command, help_command, remember_command, forget_command, memory_command,
-    cleanup_command, quiet_command,
+    cleanup_command, quiet_command, clear_command,
 )
 from bot.handlers.messages import handle_message
 from bot.handlers.observer import observe_and_learn
@@ -262,6 +262,7 @@ def main() -> None:
     application.add_handler(CommandHandler("memory", memory_command))
     application.add_handler(CommandHandler("cleanup", cleanup_command))
     application.add_handler(CommandHandler("quiet", quiet_command))
+    application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(MessageHandler(
         (filters.TEXT | filters.FORWARDED | filters.PHOTO) & ~filters.COMMAND,
         handle_message,
