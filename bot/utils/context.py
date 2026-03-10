@@ -114,6 +114,13 @@ def trim_context_for_api(messages: list[dict]) -> list[dict]:
     return recent
 
 
+def clear_context(chat_id: int, thread_id: int | None = None) -> None:
+    """Clear the in-memory conversation history for a chat/thread."""
+    k = _key(chat_id, thread_id)
+    if k in chat_context:
+        del chat_context[k]
+
+
 def evict_stale_data() -> None:
     """Remove stale entries from in-memory dicts.
 
