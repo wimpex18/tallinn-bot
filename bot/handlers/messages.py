@@ -2,9 +2,7 @@
 
 import asyncio
 import logging
-from typing import Optional
-
-from telegram import Update
+from telegram import Update, ReplyParameters
 from telegram.ext import ContextTypes
 
 # ── Album buffering ────────────────────────────────────────────────────
@@ -146,7 +144,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def _process_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    album_updates: Optional[list] = None,
+    album_updates: list | None = None,
 ) -> None:
     """Handle a single message (or the merged primary update of an album)."""
     message = update.message
@@ -257,7 +255,7 @@ async def _process_message(
     has_reply_photo = reply_msg and has_photo(reply_msg)
 
     if not question and not referenced_content and not has_current_photo and not has_reply_photo:
-        await message.reply_text("Чё спросить хотел?", reply_to_message_id=message.message_id)
+        await message.reply_text("Чё спросить хотел?", reply_parameters=ReplyParameters(message_id=message.message_id))
         return
 
     if not question and referenced_content:
@@ -272,7 +270,7 @@ async def _process_message(
         if msg_content and update.effective_chat.type != "private":
             add_to_context(chat_id, "user", user_name or "user", msg_content, thread_id=thread_id)
         await message.reply_text(
-            f"Подожди {remaining} сек, не спеши)", reply_to_message_id=message.message_id,
+            f"Подожди {remaining} сек, не спеши)", reply_parameters=ReplyParameters(message_id=message.message_id),
         )
         return
 
@@ -390,7 +388,7 @@ async def _process_message(
         logger.info(f"Referenced content preview: {referenced_content[:200]}...")
 
     # Send a placeholder message so we can stream the response into it
-    placeholder = await message.reply_text("...", reply_to_message_id=message.message_id)
+    placeholder = await message.reply_text("...", reply_parameters=ReplyParameters(message_id=message.message_id))
 
     answer = await query_claude(
         question=question,
