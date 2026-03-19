@@ -17,7 +17,7 @@ import logging
 import zoneinfo
 from datetime import datetime
 
-from telegram import Update
+from telegram import Update, ReplyParameters
 from telegram.ext import ContextTypes
 
 from config import (
@@ -183,7 +183,7 @@ async def observe_and_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # follow-up questions can reference what the bot just said.
         add_to_context(chat_id, "assistant", "bot", comment, thread_id=thread_id)
 
-        await message.reply_text(comment, reply_to_message_id=message.message_id)
+        await message.reply_text(comment, reply_parameters=ReplyParameters(message_id=message.message_id))
         logger.info(f"[spontaneous] Replied in chat {chat_id}: {comment[:60]}...")
 
 
