@@ -12,7 +12,7 @@ logger = logging.getLogger("tallinn_bot")
 
 # ── Environment variables ────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REDIS_URL = os.getenv("REDIS_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
@@ -36,13 +36,11 @@ URL_MAX_CHARS = 8000         # total character limit for fetched content
 URL_HEAD_CHARS = 3000        # characters kept from the start (title, lead, date)
 URL_TAIL_CHARS = 2000        # characters kept from the end (conclusions, contacts)
 
-# ── Anthropic API ─────────────────────────────────────────────────────
-ANTHROPIC_MODEL = "claude-sonnet-4-6"
-ANTHROPIC_TIMEOUT = 60.0
-ANTHROPIC_MAX_TOKENS = 1024
-ANTHROPIC_TEMPERATURE = 0.3
-THINKING_BUDGET_TOKENS = 5000   # extended thinking token budget (0 = disabled)
-THINKING_THRESHOLD_CHARS = 150  # enable thinking for questions longer than this
+# ── Mistral API ───────────────────────────────────────────────────────
+MISTRAL_MODEL = "mistral-large-latest"
+MISTRAL_TIMEOUT = 60.0
+MISTRAL_MAX_TOKENS = 1024
+MISTRAL_TEMPERATURE = 0.3
 
 # ── Telegram connection pool (critical for performance) ──────────────
 # PTB v21.9 defaults to pool_size=1 which causes severe bottlenecks.

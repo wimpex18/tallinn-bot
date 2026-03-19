@@ -15,7 +15,7 @@ import datetime
 import zoneinfo
 import logging
 
-import anthropic
+from mistralai import Mistral
 import redis.asyncio as aioredis
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from telegram import Update
@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 from config import (
-    TELEGRAM_TOKEN, ANTHROPIC_API_KEY, BOT_USERNAME, REDIS_URL, WEBHOOK_SECRET,
+    TELEGRAM_TOKEN, MISTRAL_API_KEY, BOT_USERNAME, REDIS_URL, WEBHOOK_SECRET,
     TELEGRAM_POOL_SIZE, TELEGRAM_POOL_TIMEOUT,
     TELEGRAM_READ_TIMEOUT, TELEGRAM_WRITE_TIMEOUT, TELEGRAM_CONNECT_TIMEOUT,
     PROACTIVE_MEMORY_INTERVAL,
@@ -160,16 +160,16 @@ async def refresh_style_profiles_job(context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def init_clients(application) -> None:
     """Initialize global HTTP clients, async Redis, and schedule jobs."""
-    # Anthropic async client (SDK manages its own HTTP connection pool)
-    claude_service.anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-    logger.info("Anthropic client initialized")
+    # Mistral client
+    claude_service.mistral_client = Mistral(api_key=MISTRAL_API_KEY)
+    logger.info("Mistral client initialized")
 
     # curl_cffi for URL fetching (browser TLS impersonation)
     url_fetcher_service.curl_session = CurlAsyncSession(
         timeout=20, allow_redirects=True, max_clients=10,
     )
 
-    logger.info("HTTP clients initialized (anthropic SDK + curl_cffi for URL fetching)")
+    logger.info("HTTP clients initialized (mistralai SDK + curl_cffi for URL fetching)")
 
     # Async Redis
     if REDIS_URL:
@@ -210,8 +210,8 @@ async def init_clients(application) -> None:
 
 async def cleanup_clients(application) -> None:
     """Cleanup global HTTP clients and Redis on shutdown."""
-    if claude_service.anthropic_client:
-        await claude_service.anthropic_client.close()
+    if claude_service.mistral_client:
+        claude_service.mistral_client = None
     if url_fetcher_service.curl_session:
         await url_fetcher_service.curl_session.close()
     if memory_service.redis_client:
@@ -224,8 +224,8 @@ async def cleanup_clients(application) -> None:
 def main() -> None:
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_TOKEN environment variable is required")
-    if not ANTHROPIC_API_KEY:
-        raise ValueError("ANTHROPIC_API_KEY environment variable is required")
+    if not MISTRAL_API_KEY:
+        raise ValueError("MISTRAL_API_KEY environment variable is required")
     if not BOT_USERNAME:
         raise ValueError("BOT_USERNAME environment variable is required")
 

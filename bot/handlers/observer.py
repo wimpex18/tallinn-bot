@@ -22,7 +22,7 @@ from telegram.ext import ContextTypes
 
 from config import (
     BOT_USERNAME,
-    ANTHROPIC_MODEL,
+    MISTRAL_MODEL,
     SPONTANEOUS_REPLY_PROBABILITY,
     SPONTANEOUS_REPLY_KEYWORD_BOOST,
     SPONTANEOUS_REPLY_COOLDOWN,
@@ -207,7 +207,7 @@ async def _generate_spontaneous_comment(
     Returns None if the LLM decides to stay silent.
     """
     from bot.services import claude as claude_service
-    if not claude_service.anthropic_client:
+    if not claude_service.mistral_client:
         return None
 
     prompt = (
@@ -220,13 +220,13 @@ async def _generate_spontaneous_comment(
     )
 
     try:
-        response = await claude_service.anthropic_client.messages.create(
-            model=ANTHROPIC_MODEL,
+        response = await claude_service.mistral_client.chat.complete_async(
+            model=MISTRAL_MODEL,
             max_tokens=80,
             temperature=0.7,
             messages=[{"role": "user", "content": prompt}],
         )
-        result = response.content[0].text.strip() if response.content else ""
+        result = response.choices[0].message.content.strip() if response.choices else ""
 
         if not result or "НЕТ" in result.upper() or len(result) < 3:
             return None
