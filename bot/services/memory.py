@@ -5,7 +5,7 @@ import time
 import re
 import logging
 
-from config import STYLE_RECENT_MESSAGES_KEPT, ANTHROPIC_MODEL
+from config import STYLE_RECENT_MESSAGES_KEPT, MISTRAL_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ async def smart_extract_facts(
         return []
 
     from bot.services import claude as claude_service
-    if not claude_service.anthropic_client:
+    if not claude_service.mistral_client:
         return []
 
     context_part = f"Контекст чата: {chat_context}" if chat_context else ""
@@ -129,13 +129,13 @@ async def smart_extract_facts(
 Отвечай ТОЛЬКО валидным JSON: {{"facts": ["факт 1", "факт 2"]}} или {{"facts": []}} если фактов нет."""
 
     try:
-        response = await claude_service.anthropic_client.messages.create(
-            model=ANTHROPIC_MODEL,
+        response = await claude_service.mistral_client.chat.complete_async(
+            model=MISTRAL_MODEL,
             max_tokens=150,
             temperature=0.1,
             messages=[{"role": "user", "content": prompt}],
         )
-        raw = response.content[0].text.strip() if response.content else ""
+        raw = response.choices[0].message.content.strip() if response.choices else ""
 
         try:
             data = json.loads(raw)
@@ -213,7 +213,7 @@ async def extract_facts_from_conversation(
         return []
 
     from bot.services import claude as claude_service
-    if not claude_service.anthropic_client:
+    if not claude_service.mistral_client:
         return []
 
     conversation = "\n".join(reversed(messages))  # oldest first
@@ -226,13 +226,13 @@ async def extract_facts_from_conversation(
 Отвечай ТОЛЬКО валидным JSON: {{"facts": ["Имя: факт", "Имя: факт"]}} или {{"facts": []}} если фактов нет."""
 
     try:
-        response = await claude_service.anthropic_client.messages.create(
-            model=ANTHROPIC_MODEL,
+        response = await claude_service.mistral_client.chat.complete_async(
+            model=MISTRAL_MODEL,
             max_tokens=200,
             temperature=0.1,
             messages=[{"role": "user", "content": prompt}],
         )
-        raw = response.content[0].text.strip() if response.content else ""
+        raw = response.choices[0].message.content.strip() if response.choices else ""
 
         try:
             data = json.loads(raw)

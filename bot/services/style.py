@@ -10,7 +10,7 @@ import re
 import logging
 
 from config import (
-    ANTHROPIC_MODEL,
+    MISTRAL_MODEL,
     STYLE_MIN_MESSAGES,
     STYLE_SUMMARY_TTL,
 )
@@ -126,7 +126,7 @@ async def generate_style_summary_llm(
         return None
 
     from bot.services import claude as claude_service
-    if not claude_service.anthropic_client:
+    if not claude_service.mistral_client:
         return None
 
     recent = await redis_client.lrange(f"user:{user_id}:recent_msgs", 0, 19)
@@ -143,13 +143,13 @@ async def generate_style_summary_llm(
     )
 
     try:
-        response = await claude_service.anthropic_client.messages.create(
-            model=ANTHROPIC_MODEL,
+        response = await claude_service.mistral_client.chat.complete_async(
+            model=MISTRAL_MODEL,
             max_tokens=100,
             temperature=0.2,
             messages=[{"role": "user", "content": prompt}],
         )
-        result = response.content[0].text.strip() if response.content else ""
+        result = response.choices[0].message.content.strip() if response.choices else ""
         if "НЕТ" in result.upper() or len(result) < 10:
             return None
         # Cache for 24 h

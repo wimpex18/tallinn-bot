@@ -14,7 +14,7 @@ from telegram.ext import ContextTypes
 
 _album_buffer: dict[str, dict] = {}  # media_group_id → {updates, context, task}
 
-from config import BOT_USERNAME, THINKING_BUDGET_TOKENS, THINKING_THRESHOLD_CHARS
+from config import BOT_USERNAME
 from bot.middleware.timing import Timer
 from bot.utils.context import (
     add_to_context, get_context_messages, evict_stale_data, trim_context_for_api,
@@ -380,30 +380,11 @@ async def _process_message(
 
     timer.checkpoint("photos")
 
-    # ── Query Claude ─────────────────────────────────────────────
-    # Enable extended thinking for complex / research-type questions.
-    # Two triggers:
-    #   1. Length > THINKING_THRESHOLD_CHARS (long = likely complex)
-    #   2. Research/recommendation keywords regardless of length
-    _RESEARCH_KEYWORDS = {
-        "поищи", "поиск", "найди", "ищи", "отзывы", "отзыв",
-        "рекоменд", "посоветуй", "советуй", "подскажи",
-        "сравни", "compare", "лучший", "лучшие", "топ",
-        "куда сходить", "что посмотреть", "стоит ли",
-    }
-    question_words = set(question.lower().split())
-    is_research = bool(question_words & _RESEARCH_KEYWORDS)
-    thinking_budget = (
-        THINKING_BUDGET_TOKENS
-        if (len(question) > THINKING_THRESHOLD_CHARS or is_research)
-        else 0
-    )
-
+    # ── Query Mistral ─────────────────────────────────────────────
     logger.info(
         f"Query from {user_id} ({user_name}): {question[:120]}... "
         f"[ref={'yes('+str(len(referenced_content))+'chars)' if referenced_content else 'no'}, "
-        f"ctx_msgs={len(conv_context_msgs)}, photos={len(photo_urls)}, "
-        f"thinking={thinking_budget > 0}]"
+        f"ctx_msgs={len(conv_context_msgs)}, photos={len(photo_urls)}]"
     )
     if referenced_content:
         logger.info(f"Referenced content preview: {referenced_content[:200]}...")
@@ -423,7 +404,6 @@ async def _process_message(
         telegram_bot=context.bot,
         telegram_chat_id=chat_id,
         telegram_message_id=placeholder.message_id,
-        thinking_budget=thinking_budget,
     )
 
     timer.checkpoint("claude")
