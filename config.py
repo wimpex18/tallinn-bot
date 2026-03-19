@@ -37,7 +37,7 @@ URL_HEAD_CHARS = 3000        # characters kept from the start (title, lead, date
 URL_TAIL_CHARS = 2000        # characters kept from the end (conclusions, contacts)
 
 # ── Mistral API ───────────────────────────────────────────────────────
-MISTRAL_MODEL = "mistral-large-latest"
+MISTRAL_MODEL = "mistral-small-2603"
 MISTRAL_TIMEOUT = 60.0
 MISTRAL_MAX_TOKENS = 1024
 MISTRAL_TEMPERATURE = 0.3
