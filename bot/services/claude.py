@@ -20,9 +20,6 @@ mistral_client: Mistral = None
 # Stream update interval: update Telegram message at most every N seconds
 _STREAM_UPDATE_INTERVAL = 1.0
 
-# Built-in Mistral web search tool — model decides when to use it
-_WEB_SEARCH_TOOLS = [{"type": "web_search"}]
-
 # Words that commonly follow prepositions (в/на/из) but are NOT location names.
 _NON_LOCATION_WORDS = {
     # Time words
@@ -110,17 +107,10 @@ async def query_claude(
         'Пример: "как настроение?" → "у меня норм, а у тебя как?" '
         'а НЕ "Настроение — это общее эмоциональное состояние..."\n\n'
         'По умолчанию ты помогаешь с вопросами про Таллинн, Эстонию. '
-        'У тебя есть инструмент web_search для получения актуальной информации.\n'
-        'ВСЕГДА используй web_search для:\n'
-        '• Погода: "Tallinn weather today" или "weather in [город]"\n'
-        '• Курсы валют: "EUR to USD rate today"\n'
-        '• Новости: "Tallinn news today", "Estonia news [тема]"\n'
-        '• События/концерты: "Tallinn events this weekend"\n'
-        '• Заведения/отзывы: "[название] Tallinn reviews"\n'
-        '• Расписание/цены: "[заведение] Tallinn hours price"\n'
-        'Запросы на английском или эстонском дают лучшие результаты по Таллинну. '
-        'Не пиши "сейчас поищу" — просто ищи и отвечай по результатам. '
-        'Если поиск не дал полезного результата — скажи честно.\n\n'
+        'Если в сообщении есть блок с данными о погоде, расписании или другой актуальной информацией — '
+        'используй эти данные для ответа. '
+        'Для вопросов о текущих событиях, расписаниях и ценах, по которым нет данных — '
+        'честно скажи что у тебя нет актуальной информации и предложи проверить на сайте.\n\n'
         'КРИТИЧЕСКИ ВАЖНО — ГЕОГРАФИЯ ЗАПРОСА:\n'
         'Если пользователь спрашивает о КОНКРЕТНОМ городе или стране (Малага, Берлин, Москва, '
         'Барселона и т.д.) — отвечай ИМЕННО про тот город/страну. НЕ подменяй его Таллинном.\n\n'
@@ -269,7 +259,6 @@ async def _blocking_response(client: Mistral, messages: list[dict]) -> str:
         max_tokens=MISTRAL_MAX_TOKENS,
         temperature=MISTRAL_TEMPERATURE,
         messages=messages,
-        tools=_WEB_SEARCH_TOOLS,
     )
     text = response.choices[0].message.content or ""
     return _clean_response(text)
@@ -291,7 +280,6 @@ async def _stream_response(
         max_tokens=MISTRAL_MAX_TOKENS,
         temperature=MISTRAL_TEMPERATURE,
         messages=messages,
-        tools=_WEB_SEARCH_TOOLS,
     ) as stream:
         async for event in stream:
             chunk = event.data.choices[0].delta.content
