@@ -242,11 +242,14 @@ async def query_claude(
         elif status == 429:
             logger.warning("Mistral API rate limit hit (429)")
             err = "Слишком много запросов, подожди минутку (429)"
+        elif status == 400:
+            logger.error(f"Mistral API bad request (400): {exc}")
+            err = "Ошибка запроса к Mistral (400) — проверь логи Render"
         elif status and status >= 500:
             logger.warning(f"Mistral API server error ({status})")
             err = f"Сервер перегружен, попробуй через минуту ({status})"
         else:
-            logger.error(f"Unexpected error querying Mistral: {exc}")
+            logger.error(f"Unexpected error querying Mistral: {exc}", exc_info=True)
             err = "Что-то пошло не так("
         await _safe_edit(telegram_bot, telegram_chat_id, telegram_message_id, err)
         return err
