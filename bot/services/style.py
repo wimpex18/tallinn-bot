@@ -2,7 +2,7 @@
 
 Analyses messages to build a style profile per user (formality, slang, profanity,
 message length, emoji usage, etc.) and generates a natural-language summary
-that gets injected into the Perplexity system prompt so the bot mirrors each
+that gets injected into the Mistral system prompt so the bot mirrors each
 user's tone.
 """
 
