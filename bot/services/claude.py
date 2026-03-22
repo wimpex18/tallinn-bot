@@ -4,7 +4,7 @@ import re
 import time
 import logging
 
-from mistralai import Mistral
+from mistralai.client import Mistral
 
 from config import (
     MISTRAL_MODEL,

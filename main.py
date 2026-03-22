@@ -15,7 +15,7 @@ import datetime
 import zoneinfo
 import logging
 
-from mistralai import Mistral
+from mistralai.client import Mistral
 import redis.asyncio as aioredis
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from telegram import Update
