@@ -249,7 +249,7 @@ async def query_claude(
             logger.warning(f"Mistral API server error ({status})")
             err = f"Сервер перегружен, попробуй через минуту ({status})"
         else:
-            logger.error(f"Unexpected error querying Mistral: {exc}", exc_info=True)
+            logger.error(f"Unexpected error querying Mistral [{type(exc).__name__}]: {exc!r}", exc_info=True)
             err = "Что-то пошло не так("
         await _safe_edit(telegram_bot, telegram_chat_id, telegram_message_id, err)
         return err
@@ -278,12 +278,13 @@ async def _stream_response(
     accumulated = ""
     last_edit_time = 0.0
 
-    async with client.chat.stream(
+    res = await client.chat.stream_async(
         model=MISTRAL_MODEL,
         max_tokens=MISTRAL_MAX_TOKENS,
         temperature=MISTRAL_TEMPERATURE,
         messages=messages,
-    ) as stream:
+    )
+    async with res as stream:
         async for event in stream:
             chunk = event.data.choices[0].delta.content
             if chunk:
