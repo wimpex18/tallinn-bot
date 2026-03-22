@@ -278,7 +278,7 @@ async def _stream_response(
     accumulated = ""
     last_edit_time = 0.0
 
-    async with client.chat.stream_async(
+    async with client.chat.stream(
         model=MISTRAL_MODEL,
         max_tokens=MISTRAL_MAX_TOKENS,
         temperature=MISTRAL_TEMPERATURE,
