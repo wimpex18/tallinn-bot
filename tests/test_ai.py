@@ -77,6 +77,34 @@ async def test_query_ai_no_client_returns_friendly_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_query_ai_system_prompt_forbids_hostility_toward_group(monkeypatch):
+    fake_client = _make_fake_client()
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    await ai.query_ai(
+        question="привет",
+        user_style="часто использует лёгкий мат как манеру речи — можно отвечать так же "
+        "неформально и с юмором, но НЕ грубить и НЕ выражать раздражение/враждебность",
+    )
+
+    system_text = fake_client.chat.complete_async.call_args.kwargs["messages"][0]["content"]
+    assert "НЕЛЬЗЯ оскорблять" in system_text
+    assert "НЕЛЬЗЯ выражать" in system_text
+
+
+@pytest.mark.asyncio
+async def test_query_ai_system_prompt_grounds_recent_updates(monkeypatch):
+    fake_client = _make_fake_client()
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    await ai.query_ai(question="расскажи про твои последние обновления")
+
+    system_text = fake_client.chat.complete_async.call_args.kwargs["messages"][0]["content"]
+    assert "НЕДАВНИЕ ОБНОВЛЕНИЯ" in system_text
+    assert "прокачался" in system_text
+
+
+@pytest.mark.asyncio
 async def test_query_ai_debate_topic_adds_system_addendum(monkeypatch):
     fake_client = _make_fake_client()
     monkeypatch.setattr(ai, "mistral_client", fake_client)
