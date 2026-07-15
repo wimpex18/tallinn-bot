@@ -7,9 +7,14 @@ import time
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from bot.utils.context import user_last_query
-from config import RATE_LIMIT_SECONDS, USERNAME_TO_NAME
+from config import BOT_DISPLAY_NAMES, RATE_LIMIT_SECONDS, USERNAME_TO_NAME
 
 logger = logging.getLogger(__name__)
+
+_BOT_NAME_RE = re.compile(
+    r'\b(?:' + '|'.join(re.escape(name) for name in BOT_DISPLAY_NAMES) + r')\b',
+    re.IGNORECASE,
+)
 
 
 # ── Rate limiting ────────────────────────────────────────────────────
@@ -135,6 +140,18 @@ def extract_question(text: str, bot_username: str) -> str:
     if not text:
         return ""
     return text.replace(f"@{bot_username}", "").strip()
+
+
+def mentions_bot_by_name(text: str) -> bool:
+    """Whole-word, case-insensitive check for the bot's plain-text names (BOT_DISPLAY_NAMES).
+
+    Lets people address the bot in a group by name ("Сэм, погода?") without an
+    @mention or a reply. Word-boundary matching means it won't fire on
+    substrings like "Сэмплы" or "Samsung".
+    """
+    if not text:
+        return False
+    return bool(_BOT_NAME_RE.search(text))
 
 
 def get_message_content(message) -> str:

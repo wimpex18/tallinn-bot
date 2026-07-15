@@ -40,6 +40,7 @@ from bot.utils.helpers import (
     get_message_content,
     has_photo,
     is_forwarded_message,
+    mentions_bot_by_name,
     send_typing,
     set_rate_limit,
 )
@@ -82,6 +83,9 @@ def should_respond(update: Update, bot_username: str, bot_id: int = None) -> boo
             return True
 
     if content and f"@{bot_username}" in content:
+        return True
+
+    if content and mentions_bot_by_name(content):
         return True
 
     return False

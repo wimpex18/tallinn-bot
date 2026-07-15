@@ -61,6 +61,23 @@ def test_is_cloudflare_block_false_for_normal_page():
     assert is_cloudflare_block(html) is False
 
 
+def test_is_cloudflare_block_strong_indicator_alone_is_sufficient():
+    html = "<html><body>Ray ID: 8f3a9c2b1234</body></html>"
+    assert is_cloudflare_block(html) is True
+
+
+def test_is_cloudflare_block_single_generic_phrase_is_not_a_false_positive():
+    # A legitimate page that happens to say "please wait" (e.g. a queue notice)
+    # shouldn't be misclassified as a Cloudflare challenge on its own.
+    html = "<html><body><p>Your order is processing, please wait a moment.</p></body></html>"
+    assert is_cloudflare_block(html) is False
+
+
+def test_is_cloudflare_block_two_generic_phrases_together_still_detected():
+    html = "<html><body>Just a moment, please wait while we verify your request.</body></html>"
+    assert is_cloudflare_block(html) is True
+
+
 def test_extract_page_text_strips_script_and_style_in_fallback():
     html = (
         "<html><body>"

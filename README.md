@@ -21,7 +21,9 @@ is the fallback that survives restarts.
 ### Handler groups
 
 - **Group 0** (default): commands (`/start`, `/summary`, `/debate`, ...) and the main message handler,
-  which only reacts to messages that are @-mentions, replies to the bot, or private-chat messages.
+  which only reacts to messages that are @-mentions, replies to the bot, plain-text mentions of the
+  bot's name (`BOT_DISPLAY_NAMES` in `config.py` — "Sam"/"Сэм" by default, whole-word/case-insensitive
+  via `mentions_bot_by_name()` in `bot/utils/helpers.py`), or private-chat messages.
 - **Group 1** (silent observer): runs on *every* group message regardless of whether the bot was
   addressed. It stores the message into Redis, updates the sender's style profile, and — at a small
   default probability — reacts with an emoji to keep the bot feeling present without being spammy.
@@ -141,6 +143,14 @@ client — nothing hits a live Telegram or Mistral connection.
   (`beta.conversations.start_async` with a `WebSearchTool`), *not* Chat Completions — Mistral's
   `web_search` connector is only available there, which is why it's a separate call whose result
   gets fed back into `query_ai()` as `referenced_content`, the same pattern used for weather data.
+- `bot/services/url_fetcher.py` — fetches shared links in three tiers: (1) `curl_cffi` with browser
+  TLS/JA3 impersonation (`IMPERSONATE_PROFILES` in `config.py`, tried in parallel, generic
+  `"chrome"`/`"safari"` aliases so they always track the latest supported browser fingerprint); (2) if
+  every profile fails or gets Cloudflare-block-detected, a best-effort fallback through
+  `bot/services/search.py`'s Mistral-mediated web search, asking it to open and summarize the URL
+  directly — different infra/IP than this process, so it clears a different class of bot-protection
+  (not guaranteed; paywalls and heavily JS-gated sites can still beat both); (3) a non-fetching
+  URL-heuristic string as the last resort so the model at least knows the URL exists.
 - `bot/services/memory.py` — all Redis reads/writes. Every write path refreshes its own key's TTL.
 - `bot/utils/context.py` — in-memory conversation window per `(chat_id, thread_id)`, with
   role-merging and a simple age/turn-count-based compaction pass before sending to the API.
