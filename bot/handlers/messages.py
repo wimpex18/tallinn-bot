@@ -6,9 +6,11 @@ import logging
 from telegram import ReplyParameters, Update
 from telegram.ext import ContextTypes
 
+from bot.handlers import actions as action_handlers
 from bot.handlers.observer import record_bot_replied
 from bot.middleware.timing import Timer
 from bot.services.ai import query_ai
+from bot.services.intent import detect_action_intent
 from bot.services.memory import (
     extract_facts_from_response,
     get_debate_topic,
@@ -27,6 +29,7 @@ from bot.utils.context import (
     add_to_context,
     evict_stale_data,
     get_context_messages,
+    get_context_string,
     trim_context_for_api,
 )
 from bot.utils.helpers import (
@@ -202,6 +205,33 @@ async def _process_message(
     question = extract_question(get_message_content(message), BOT_USERNAME)
     referenced_content = None
     reply_msg = message.reply_to_message
+
+    # ── Natural-language action routing (summary/debate/factcheck/poll) ──
+    # If this looks like a request to run one of these, do it directly instead
+    # of just chatting about it — skips the rest of the pipeline below.
+    conv_context_for_intent = get_context_string(chat_id, thread_id)
+    intent = await detect_action_intent(question, conv_context_for_intent)
+    if intent:
+        if intent.action == "summary":
+            await action_handlers.do_summary(update, context)
+            return
+        if intent.action == "debate" and intent.topic:
+            await action_handlers.do_debate(update, context, intent.topic)
+            return
+        if intent.action == "factcheck":
+            claim = intent.claim or (get_message_content(reply_msg) if reply_msg else None)
+            if claim:
+                await action_handlers.do_factcheck(update, context, claim)
+                return
+        if intent.action == "poll":
+            await action_handlers.do_poll_suggest(update, context)
+            return
+        # Resolved to debate/factcheck but couldn't pin down a topic/claim —
+        # fall through to a normal conversational reply rather than a
+        # command-usage hint; a natural sentence that doesn't fully qualify
+        # should just get a natural reply.
+
+    timer.checkpoint("intent")
 
     # Case 1: User replies to another message (reply to bot OR @mention in reply)
     if reply_msg:

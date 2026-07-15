@@ -127,3 +127,65 @@ async def test_suggest_poll_returns_none_when_no_topic_found(monkeypatch):
 
     result = await ai.suggest_poll("обсуждение")
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_classify_intent_parses_debate_action(monkeypatch):
+    client = _make_fake_client('{"action": "debate", "topic": "IPA vs lager", "claim": null}')
+    monkeypatch.setattr(ai, "mistral_client", client)
+
+    result = await ai.classify_intent("не хочу дебатировать но всё же")
+    assert result == {"action": "debate", "topic": "IPA vs lager", "claim": None}
+
+
+@pytest.mark.asyncio
+async def test_classify_intent_factcheck_with_claim(monkeypatch):
+    client = _make_fake_client('{"action": "factcheck", "topic": null, "claim": "в Таллинне живёт 500 тысяч человек"}')
+    monkeypatch.setattr(ai, "mistral_client", client)
+
+    result = await ai.classify_intent("а это точно так?")
+    assert result["action"] == "factcheck"
+    assert "500 тысяч" in result["claim"]
+
+
+@pytest.mark.asyncio
+async def test_classify_intent_none_action_returns_none(monkeypatch):
+    client = _make_fake_client('{"action": "none", "topic": null, "claim": null}')
+    monkeypatch.setattr(ai, "mistral_client", client)
+
+    result = await ai.classify_intent("просто болтаю")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_classify_intent_invalid_json_returns_none(monkeypatch):
+    client = _make_fake_client("not json")
+    monkeypatch.setattr(ai, "mistral_client", client)
+
+    result = await ai.classify_intent("что-то")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_classify_intent_unknown_action_returns_none(monkeypatch):
+    client = _make_fake_client('{"action": "delete_everything", "topic": null, "claim": null}')
+    monkeypatch.setattr(ai, "mistral_client", client)
+
+    result = await ai.classify_intent("что-то")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_classify_intent_no_client_returns_none(monkeypatch):
+    monkeypatch.setattr(ai, "mistral_client", None)
+    result = await ai.classify_intent("что-то")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_classify_intent_empty_question_returns_none(monkeypatch):
+    client = _make_fake_client('{"action": "summary", "topic": null, "claim": null}')
+    monkeypatch.setattr(ai, "mistral_client", client)
+
+    result = await ai.classify_intent("")
+    assert result is None

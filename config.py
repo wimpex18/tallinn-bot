@@ -61,6 +61,35 @@ SEARCH_TRIGGER_KEYWORDS = [
     "search for", "search the web", "погугли",
 ]
 
+# ── Natural-language action triggers (bot/services/intent.py) ────────
+# Tier 1 ("strong"): specific phrases that execute the matching action
+# immediately, no extra Mistral call. Tier 2 ("weak"): looser stems that,
+# without a tier-1 match, spend one extra Mistral call to disambiguate
+# ("is this actually a request, and for what?"). See bot/services/intent.py.
+INTENT_STRONG_SUMMARY = [
+    "о чём говорили", "о чём тут говорили", "что обсуждали", "что тут обсуждали",
+    "что я пропустил", "что произошло пока меня не было",
+    "скинь саммари", "сделай саммари", "нужно саммари",
+    "перескажи разговор", "перескажи что было", "перескажи о чём",
+]
+INTENT_WEAK_SUMMARY = ["саммари", "тлдр", "tldr", "резюме"]
+
+# Trigger phrases for debate — everything after the phrase (minus a leading
+# "про"/"о"/"на тему") is captured as the topic.
+INTENT_STRONG_DEBATE = [
+    "давай подебатируем", "подебатируем", "давай поспорим", "поспорим", "устроим дебаты",
+]
+INTENT_WEAK_DEBATE = ["дебат", "оппонент", "поспор"]
+
+INTENT_STRONG_FACTCHECK = ["проверь факт", "фактчек", "факт-чек", "это точно правда что"]
+INTENT_WEAK_FACTCHECK = ["фактчек", "факт-чек", "правда ли"]
+
+INTENT_STRONG_POLL = [
+    "сделай опрос", "создай опрос", "запусти голосование", "нужен опрос",
+    "давайте проголосуем", "сделай голосование", "заведи опрос",
+]
+INTENT_WEAK_POLL = ["опрос", "голосование", "проголосу"]
+
 # ── Debate mode ───────────────────────────────────────────────────────
 DEBATE_MODE_TTL = 1800   # 30 min — how long /debate keeps the adversarial persona active
 
@@ -70,7 +99,10 @@ REACTION_EMOJI = ["👍", "😁", "🔥", "🤔", "😂", "👏"]
 REACTION_PROBABILITY = 0.05      # small chance per message, default ON (unlike text replies)
 REACTION_KEYWORD_BOOST = 0.10    # extra chance when INTERESTING_TOPICS keywords are present
 
-# Daily fun/icebreaker prompt (JobQueue), skipped for quiet-mode chats
+# Daily fun/icebreaker prompt (JobQueue), skipped for quiet-mode chats.
+# Off by default — the bot should only speak when spoken to (or reacted to
+# with an emoji, see REACTION_PROBABILITY above); this was too intrusive.
+DAILY_PROMPT_ENABLED = False
 DAILY_PROMPT_HOUR = 18  # 18:00 Tallinn time — evening, likely active chat
 DAILY_PROMPTS = [
     "Какое место в Таллинне вы бы показали другу, который приехал на один день?",

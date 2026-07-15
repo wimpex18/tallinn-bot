@@ -37,23 +37,29 @@ is the fallback that survives restarts.
 - **Style refresh** (daily, 14:00 Tallinn time): regenerates natural-language style summaries for
   active users so the bot's tone stays adapted to how each person actually talks.
 - **Daily prompt** (daily, 18:00 Tallinn time): posts a random icebreaker/trivia question to
-  recently-active, non-quiet chats.
+  recently-active, non-quiet chats. **Disabled by default** (`DAILY_PROMPT_ENABLED = False` in
+  `config.py`) — the bot should only speak when spoken to (or, occasionally, react with an emoji).
 
 ## Commands
 
-| Command | Description |
-|---|---|
-| `/start`, `/help` | Intro and usage guide |
-| `/summary`, `/tldr [N]` | Summarize the last N (default 30) buffered messages |
-| `/debate <topic>` | Bot takes an adversarial stance on `<topic>` for 30 minutes |
-| `/factcheck` | Verify a claim (reply to a message, or `/factcheck <claim>`) via live web search |
-| `/poll Q \| A \| B \| C` | Send a native Telegram poll |
-| `/poll suggest` | Ask the bot to propose a poll from the recent discussion |
-| `/remember <fact>` | Save a fact (per-user in DM, per-group in groups) |
-| `/forget` | Wipe saved facts (group chats: admin-only) |
-| `/memory` | Show what the bot remembers |
-| `/clear` | Reset conversation context (and end debate mode) for this chat/thread |
-| `/quiet` | Toggle emoji-reaction engagement for this chat (admin-only) |
+| Command | Description | Also works by just asking |
+|---|---|---|
+| `/start`, `/help` | Intro and usage guide | — |
+| `/summary`, `/tldr [N]` | Summarize the last N (default 30) buffered messages | "о чём тут говорили?" |
+| `/debate <topic>` | Bot takes an adversarial stance on `<topic>` for 30 minutes | "давай поспорим про X" |
+| `/factcheck` | Verify a claim (reply to a message, or `/factcheck <claim>`) via live web search | "проверь факт: X" |
+| `/poll Q \| A \| B \| C` | Send a native Telegram poll (manual only, no natural-language equivalent) | — |
+| `/poll suggest` | Ask the bot to propose a poll from the recent discussion | "сделай опрос" |
+| `/remember <fact>` | Save a fact (per-user in DM, per-group in groups) | — |
+| `/forget` | Wipe saved facts (group chats: admin-only) | — |
+| `/memory` | Show what the bot remembers | — |
+| `/clear` | Reset conversation context (and end debate mode) for this chat/thread | — |
+| `/quiet` | Toggle emoji-reaction engagement for this chat (admin-only) | — |
+
+The four natural-language triggers above are handled by `bot/services/intent.py` — see
+"Architecture notes" below for how it decides when a plain sentence means one of these. The bot can
+also describe its own features conversationally (e.g. "что ты умеешь?") since `bot/services/ai.py`'s
+system prompt includes a short capabilities summary.
 
 The bot also responds to forwarded posts/photos (including forwards from channels — it captures and
 cites the original source), shared links, images (menus, flyers, screenshots — anything), voice
@@ -138,7 +144,18 @@ client — nothing hits a live Telegram or Mistral connection.
 
 - `config.py` — every tunable constant lives here (rate limits, TTLs, prompts, keyword lists).
 - `bot/services/ai.py` — the Mistral client, main `query_ai()` entry point (streaming + blocking),
-  plus `summarize_conversation()` and `suggest_poll()`.
+  plus `summarize_conversation()`, `suggest_poll()`, and `classify_intent()`.
+- `bot/services/intent.py` — decides whether a plain-language message means "run /summary" (etc.)
+  in three tiers: (1) a specific phrase match ("о чём говорили", "сделай опрос") resolves for free,
+  no LLM call; (2) no phrase match and no loose signal word either — the common case, plain chat —
+  returns `None` for free, same cost as today; (3) a loose signal word is present but no clean
+  phrase match (e.g. "дебат" appears but not in a recognized trigger) — spends one extra Mistral
+  call (`ai.classify_intent`) to disambiguate and to fill in a topic/claim a phrase match found the
+  trigger for but not the parameter (e.g. "давай поспорим" with no topic in the sentence).
+- `bot/handlers/actions.py` — `do_summary()`/`do_debate()`/`do_factcheck()`/`do_poll_suggest()`, the
+  actual work behind those four commands, called both by `bot/handlers/commands.py`'s slash-command
+  handlers (parsing `context.args`) and by `messages.py`'s natural-language routing (parsing
+  `intent.py`'s output) — the logic exists exactly once regardless of how it was triggered.
 - `bot/services/search.py` — live web search. Uses Mistral's **Conversations/Agents API**
   (`beta.conversations.start_async` with a `WebSearchTool`), *not* Chat Completions — Mistral's
   `web_search` connector is only available there, which is why it's a separate call whose result
@@ -154,6 +171,8 @@ client — nothing hits a live Telegram or Mistral connection.
 - `bot/services/memory.py` — all Redis reads/writes. Every write path refreshes its own key's TTL.
 - `bot/utils/context.py` — in-memory conversation window per `(chat_id, thread_id)`, with
   role-merging and a simple age/turn-count-based compaction pass before sending to the API.
-- `bot/handlers/messages.py` — the main pipeline: routing, reply/forward/URL/photo parsing, weather
-  and web-search pre-fetch, context assembly, the `query_ai()` call, and post-processing.
+- `bot/handlers/messages.py` — the main pipeline: routing, natural-language action-intent routing
+  (`intent.py` → `actions.py`, short-circuits the rest of the pipeline on a match),
+  reply/forward/URL/photo parsing, weather and web-search pre-fetch, context assembly, the
+  `query_ai()` call, and post-processing.
 - `bot/handlers/observer.py` — handler group 1, runs on every group message unconditionally.

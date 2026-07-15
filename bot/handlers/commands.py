@@ -2,7 +2,7 @@
 
 import logging
 
-from telegram import ReplyParameters, Update
+from telegram import Update
 from telegram.ext import ContextTypes
 
 from bot.services.memory import (
@@ -11,9 +11,9 @@ from bot.services.memory import (
     save_group_fact,
     save_user_fact,
 )
-from bot.utils.context import clear_context, get_context_string
-from bot.utils.helpers import get_message_content, send_typing
-from config import DEBATE_MODE_TTL, USERNAME_TO_NAME
+from bot.utils.context import clear_context
+from bot.utils.helpers import get_message_content
+from config import USERNAME_TO_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +49,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- 'подробнее про это'\n"
         "- 'какой вариант лучше?'\n"
         "- 'что посоветуешь из меню?'\n\n"
-        "Групповые фишки:\n"
-        "/summary или /tldr - краткое саммари последнего обсуждения\n"
-        "/debate <тема> - включить режим дебатов на 30 мин\n"
-        "/factcheck - проверить факт (reply на сообщение или /factcheck <утверждение>)\n"
-        "/poll Вопрос | Вариант 1 | Вариант 2 - создать опрос\n"
-        "/poll suggest - предложить опрос по недавнему обсуждению\n\n"
+        "Групповые фишки (командой или просто по-человечески, без /):\n"
+        "/summary или /tldr - краткое саммари обсуждения (\"о чём тут говорили?\")\n"
+        "/debate <тема> - режим дебатов на 30 мин (\"давай поспорим про удалёнку\")\n"
+        "/factcheck - проверить факт (\"проверь, правда ли что...\")\n"
+        "/poll Вопрос | Вариант 1 | Вариант 2 - создать опрос вручную\n"
+        "/poll suggest - предложить опрос по обсуждению (\"сделай опрос\")\n\n"
         "Память:\n"
         "/memory - посмотреть что помню\n"
         "/remember <факт> - запомнить\n"
@@ -186,9 +186,6 @@ async def quiet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /summary and /tldr — summarize recent buffered chat messages."""
-    chat_id = update.effective_chat.id
-    thread_id = update.message.message_thread_id
-
     count = 30
     if context.args:
         try:
@@ -196,39 +193,21 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except ValueError:
             pass
 
-    from bot.services.ai import summarize_conversation
-    from bot.services.memory import get_recent_chat_messages
-
-    messages = await get_recent_chat_messages(chat_id, count, thread_id=thread_id)
-    if not messages:
-        await update.message.reply_text("Пока нечего суммировать — в чате было тихо.")
-        return
-
-    await send_typing(context.bot, chat_id)
-    summary = await summarize_conversation(messages)
-    await update.message.reply_text(summary)
+    from bot.handlers.actions import do_summary
+    await do_summary(update, context, count=count)
 
 
 async def debate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /debate <topic> — bot takes an adversarial stance for a limited time."""
-    chat_id = update.effective_chat.id
-    thread_id = update.message.message_thread_id
-
     if not context.args:
         await update.message.reply_text(
             "Использование: /debate <тема>\nНапример: /debate удалёнка лучше офиса"
         )
         return
 
-    topic = " ".join(context.args)[:300]
-    from bot.services.memory import set_debate_mode
-    await set_debate_mode(chat_id, topic, thread_id=thread_id, ttl=DEBATE_MODE_TTL)
-
-    minutes = DEBATE_MODE_TTL // 60
-    await update.message.reply_text(
-        f"Режим дебатов включён на {minutes} мин. Тема: «{topic}». "
-        f"Обращайся ко мне — буду топить за другую сторону) /clear чтобы выключить раньше."
-    )
+    topic = " ".join(context.args)
+    from bot.handlers.actions import do_debate
+    await do_debate(update, context, topic)
 
 
 async def factcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -247,21 +226,8 @@ async def factcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    await send_typing(context.bot, update.effective_chat.id)
-
-    from bot.services.ai import query_ai
-    from bot.services.search import search_web
-
-    search_result = await search_web(f"Проверь факт: {claim}")
-    if not search_result:
-        await message.reply_text("Не получилось проверить — попробуй позже(")
-        return
-
-    answer = await query_ai(
-        question=f"Проверь это утверждение на достоверность и дай короткий вердикт: {claim}",
-        referenced_content=search_result,
-    )
-    await message.reply_text(answer, reply_parameters=ReplyParameters(message_id=message.message_id))
+    from bot.handlers.actions import do_factcheck
+    await do_factcheck(update, context, claim)
 
 
 async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -272,26 +238,8 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     raw = " ".join(context.args) if context.args else ""
 
     if raw.strip().lower() == "suggest":
-        from bot.services.ai import suggest_poll
-
-        conv_context = get_context_string(chat_id, thread_id)
-        if not conv_context:
-            await message.reply_text("Пока не с чем работать — обсудите что-нибудь, и я предложу опрос)")
-            return
-
-        await send_typing(context.bot, chat_id)
-        suggestion = await suggest_poll(conv_context)
-        if not suggestion:
-            await message.reply_text("Не придумал опрос из последнего обсуждения(")
-            return
-
-        await context.bot.send_poll(
-            chat_id=chat_id,
-            question=suggestion["question"],
-            options=suggestion["options"],
-            is_anonymous=False,
-            message_thread_id=thread_id,
-        )
+        from bot.handlers.actions import do_poll_suggest
+        await do_poll_suggest(update, context)
         return
 
     parts = [p.strip() for p in raw.split("|") if p.strip()]
