@@ -40,6 +40,26 @@ is the fallback that survives restarts.
   recently-active, non-quiet chats. **Disabled by default** (`DAILY_PROMPT_ENABLED = False` in
   `config.py`) — the bot should only speak when spoken to (or, occasionally, react with an emoji).
 
+### Group chat robustness
+
+A handful of behaviors worth knowing about for a busy multi-person chat:
+
+- **Editing a message doesn't re-trigger the bot.** Telegram routes edited messages through the
+  same handlers as new ones by default; `main.py`'s handlers explicitly exclude
+  `filters.UpdateType.EDITED` so fixing a typo in your question doesn't produce a second reply
+  (or double-count style/reaction stats in the silent observer).
+- **Follow-up questions are scoped to the person who asked them.** The in-memory conversation
+  window (`bot/utils/context.py`) is shared per `(chat_id, thread_id)` across everyone in the
+  chat, but the "answer an unqualified follow-up as a continuation of the bot's last reply" prompt
+  rule only applies when the current asker is the same person the bot's last reply (in that
+  chat/thread) was addressed to — tracked via `set_last_bot_reply_target()`/
+  `get_last_bot_reply_target()`. Without this, two people asking the bot unrelated things back to
+  back could get a reply that's accidentally about the other person's topic.
+- **External content is framed as untrusted data, not instructions.** Fetched web pages, search
+  results, and forwarded posts get fed to the model as reference material — the system prompt
+  explicitly tells it not to follow anything that reads like a command inside that content (a
+  defense against a forwarded link or page containing a prompt-injection attempt).
+
 ## Commands
 
 | Command | Description | Also works by just asking |
@@ -51,7 +71,8 @@ is the fallback that survives restarts.
 | `/poll Q \| A \| B \| C` | Send a native Telegram poll (manual only, no natural-language equivalent) | — |
 | `/poll suggest` | Ask the bot to propose a poll from the recent discussion | "сделай опрос" |
 | `/remember <fact>` | Save a fact (per-user in DM, per-group in groups) | — |
-| `/forget` | Wipe saved facts (group chats: admin-only) | — |
+| `/forget` | Wipe saved facts. In a DM, wipes your own. In a group, wipes the *shared group* facts — admin-only | — |
+| `/forget me` | Wipe only your own remembered facts — works for anyone, in DMs or groups, no admin needed | — |
 | `/memory` | Show what the bot remembers | — |
 | `/clear` | Reset conversation context (and end debate mode) for this chat/thread | — |
 | `/quiet` | Toggle emoji-reaction engagement for this chat (admin-only) | — |
@@ -169,8 +190,16 @@ client — nothing hits a live Telegram or Mistral connection.
   (not guaranteed; paywalls and heavily JS-gated sites can still beat both); (3) a non-fetching
   URL-heuristic string as the last resort so the model at least knows the URL exists.
 - `bot/services/memory.py` — all Redis reads/writes. Every write path refreshes its own key's TTL.
+  Per-user facts (`user:{id}:facts`) are global to the person, not scoped to a chat — the same
+  bucket is used whether they're in a DM or any group — which is why `/forget me` (any group
+  member, self-service) and admin-only bare `/forget` (the group's shared `group:{chat_id}:facts`
+  bucket) in `commands.py::forget_command` are two genuinely different operations.
 - `bot/utils/context.py` — in-memory conversation window per `(chat_id, thread_id)`, with
-  role-merging and a simple age/turn-count-based compaction pass before sending to the API.
+  role-merging and a simple age/turn-count-based compaction pass before sending to the API. Also
+  tracks `last_bot_reply_target` per `(chat_id, thread_id)` — who the bot's most recent reply there
+  was addressed to — so `messages.py` can tell `ai.py` when an unqualified follow-up is from a
+  *different* person than the last exchange, scoping the "implicit continuation" prompt rule
+  correctly instead of letting it bleed across unrelated conversations in a busy group.
 - `bot/handlers/messages.py` — the main pipeline: routing, natural-language action-intent routing
   (`intent.py` → `actions.py`, short-circuits the rest of the pipeline on a match),
   reply/forward/URL/photo parsing, weather and web-search pre-fetch, context assembly, the

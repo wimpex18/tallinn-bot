@@ -30,6 +30,11 @@ def _key(chat_id: int, thread_id: int | None = None) -> _CtxKey:
 # In-memory stores
 chat_context: dict[_CtxKey, list[dict]] = defaultdict(list)
 user_last_query: dict[int, float] = defaultdict(float)
+# Who the bot's most recent reply in a chat/thread was addressed to — lets the
+# "implicit continuation" prompt rule (a follow-up with no explicit reply/mention
+# means the same topic as the bot's last answer) be scoped to the same asker,
+# instead of bleeding across different people's unrelated exchanges in a group.
+last_bot_reply_target: dict[_CtxKey, tuple[int, str]] = {}
 _last_eviction: float = 0.0
 
 
@@ -47,6 +52,20 @@ def add_to_context(
     })
     if len(chat_context[k]) > CONTEXT_SIZE:
         chat_context[k] = chat_context[k][-CONTEXT_SIZE:]
+
+
+def set_last_bot_reply_target(
+    chat_id: int, user_id: int, user_name: str, thread_id: int | None = None,
+) -> None:
+    """Record who the bot's most recent reply in this chat/thread was addressed to."""
+    last_bot_reply_target[_key(chat_id, thread_id)] = (user_id, user_name or "")
+
+
+def get_last_bot_reply_target(
+    chat_id: int, thread_id: int | None = None,
+) -> tuple[int, str] | None:
+    """Who the bot's most recent reply in this chat/thread was addressed to, if known."""
+    return last_bot_reply_target.get(_key(chat_id, thread_id))
 
 
 def get_context_string(chat_id: int, thread_id: int | None = None) -> str:
@@ -123,6 +142,7 @@ def clear_context(chat_id: int, thread_id: int | None = None) -> None:
     k = _key(chat_id, thread_id)
     if k in chat_context:
         del chat_context[k]
+    last_bot_reply_target.pop(k, None)
 
 
 def evict_stale_data() -> None:
@@ -142,6 +162,7 @@ def evict_stale_data() -> None:
     ]
     for k in stale_chats:
         del chat_context[k]
+        last_bot_reply_target.pop(k, None)
 
     stale_users = [
         uid for uid, ts in user_last_query.items()

@@ -58,7 +58,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Память:\n"
         "/memory - посмотреть что помню\n"
         "/remember <факт> - запомнить\n"
-        "/forget - забыть всё\n"
+        "/forget - забыть всё (в группе только админ)\n"
+        "/forget me - забыть только твоё (в группе доступно всем)\n"
         "/clear - очистить историю разговора"
     )
 
@@ -91,28 +92,45 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /forget.
+
+    - In a DM: wipes the caller's own remembered facts (self-service, no gate).
+    - In a group with `/forget me`: any member wipes only their OWN facts
+      (per-user facts are stored globally per user_id, not per-chat, so this
+      is the only way to self-service-clear them without an admin involved).
+    - In a group with bare `/forget`: admin-only, wipes the shared group facts.
+    """
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+    is_private = update.effective_chat.type == "private"
+    wants_own_facts_only = is_private or (
+        context.args and context.args[0].lower() in ("me", "меня")
+    )
 
-    if update.effective_chat.type != "private":
+    if not wants_own_facts_only:
         member = await context.bot.get_chat_member(chat_id, user_id)
         if member.status not in ["creator", "administrator"]:
-            await update.message.reply_text("Только админ может это делать)")
+            await update.message.reply_text(
+                "Только админ может забыть всё про группу) "
+                "Хочешь забыть только своё — напиши /forget me"
+            )
             return
 
     from bot.services import memory
-    if memory.redis_client:
-        try:
-            if update.effective_chat.type == "private":
-                await memory.redis_client.delete(f"user:{user_id}:facts")
-            else:
-                await memory.redis_client.delete(f"group:{chat_id}:facts")
-            await update.message.reply_text("Забыл всё)")
-        except Exception as e:
-            logger.error(f"Failed to forget: {e}")
-            await update.message.reply_text("Не получилось забыть(")
-    else:
+    if not memory.redis_client:
         await update.message.reply_text("Память не подключена(")
+        return
+
+    try:
+        if wants_own_facts_only:
+            await memory.redis_client.delete(f"user:{user_id}:facts")
+            await update.message.reply_text("Забыл всё, что помнил про тебя)")
+        else:
+            await memory.redis_client.delete(f"group:{chat_id}:facts")
+            await update.message.reply_text("Забыл всё)")
+    except Exception as e:
+        logger.error(f"Failed to forget: {e}")
+        await update.message.reply_text("Не получилось забыть(")
 
 
 async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

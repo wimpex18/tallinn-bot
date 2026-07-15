@@ -105,6 +105,41 @@ async def test_query_ai_system_prompt_grounds_recent_updates(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_query_ai_system_prompt_warns_about_untrusted_external_content(monkeypatch):
+    fake_client = _make_fake_client()
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    await ai.query_ai(question="о чём эта статья?")
+
+    system_text = fake_client.chat.complete_async.call_args.kwargs["messages"][0]["content"]
+    assert "БЕЗОПАСНОСТЬ" in system_text
+    assert "WEB SEARCH" in system_text
+
+
+@pytest.mark.asyncio
+async def test_query_ai_no_different_user_hint_by_default(monkeypatch):
+    fake_client = _make_fake_client()
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    await ai.query_ai(question="привет")
+
+    system_text = fake_client.chat.complete_async.call_args.kwargs["messages"][0]["content"]
+    assert "адресован другому человеку" not in system_text
+
+
+@pytest.mark.asyncio
+async def test_query_ai_different_user_hint_added_when_set(monkeypatch):
+    fake_client = _make_fake_client()
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    await ai.query_ai(question="а это точно так?", last_reply_different_user="Alice")
+
+    system_text = fake_client.chat.complete_async.call_args.kwargs["messages"][0]["content"]
+    assert "адресован другому человеку" in system_text
+    assert "Alice" in system_text
+
+
+@pytest.mark.asyncio
 async def test_query_ai_debate_topic_adds_system_addendum(monkeypatch):
     fake_client = _make_fake_client()
     monkeypatch.setattr(ai, "mistral_client", fake_client)
