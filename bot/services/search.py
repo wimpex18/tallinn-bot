@@ -9,20 +9,28 @@ instead of being returned raw.
 """
 
 import logging
+import re
 
 from mistralai.client.models.websearchtool import WebSearchTool
 
+from bot.utils.helpers import mask_quoted_spans
 from config import MISTRAL_MODEL, SEARCH_TRIGGER_KEYWORDS
 
 logger = logging.getLogger(__name__)
 
 
 def is_search_trigger(text: str) -> bool:
-    """Return True if the text explicitly asks the bot to search the web."""
+    """Return True if the text explicitly asks the bot to search the web.
+
+    Quoted spans are masked first (a quoted "найди" is an example being
+    mentioned, not a command — e.g. an announcement listing usage examples),
+    and matches require a leading word boundary so a keyword only fires as
+    a real word/stem, not as a substring buried inside an unrelated word.
+    """
     if not text:
         return False
-    text_lower = text.lower()
-    return any(kw in text_lower for kw in SEARCH_TRIGGER_KEYWORDS)
+    text_lower = mask_quoted_spans(text.lower())
+    return any(re.search(r'\b' + re.escape(kw), text_lower) for kw in SEARCH_TRIGGER_KEYWORDS)
 
 
 async def search_web(query: str) -> str | None:

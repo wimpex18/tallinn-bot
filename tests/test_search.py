@@ -20,6 +20,23 @@ def test_is_search_trigger_empty():
     assert search.is_search_trigger(None) is False
 
 
+def test_is_search_trigger_ignores_quoted_example():
+    # Same false-positive class as the intent.py bug: quoting a trigger word
+    # as a usage example shouldn't fire a real (costly) web search.
+    text = 'в боте теперь можно написать "найди бар" и он поищет'
+    assert search.is_search_trigger(text) is False
+
+
+def test_is_search_trigger_ignores_substring_inside_unrelated_word():
+    # "search for" is a real substring of "research for" — must not
+    # false-trigger on the unrelated word "research".
+    assert search.is_search_trigger("we're doing research for a paper") is False
+
+
+def test_is_search_trigger_still_matches_real_word():
+    assert search.is_search_trigger("найди что-нибудь интересное") is True
+
+
 def _make_response(text_chunks, reference_urls=None):
     content = [SimpleNamespace(type="text", text=t) for t in text_chunks]
     for url in reference_urls or []:

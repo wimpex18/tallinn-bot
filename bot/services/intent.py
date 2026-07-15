@@ -15,6 +15,7 @@ Three tiers, in order — see README's "Architecture notes" for the rationale:
 import re
 from dataclasses import dataclass
 
+from bot.utils.helpers import mask_quoted_spans
 from config import (
     INTENT_STRONG_DEBATE,
     INTENT_STRONG_FACTCHECK,
@@ -27,16 +28,6 @@ from config import (
 )
 
 _TOPIC_CONNECTORS = ("про ", "о ", "на тему ")
-
-# A phrase inside quotes is being mentioned/quoted, not issued as a command —
-# e.g. an announcement listing example phrases like «сделай саммари» shouldn't
-# itself trigger a summary. Blank quoted spans out before phrase-matching
-# (same length, so index math in _extract_remainder stays valid).
-_QUOTE_SPAN_RE = re.compile(r'«[^»]+»|"[^"]+"|“[^”]+”|„[^“]+“')
-
-
-def _mask_quoted_spans(text: str) -> str:
-    return _QUOTE_SPAN_RE.sub(lambda m: " " * len(m.group(0)), text)
 
 
 @dataclass
@@ -93,7 +84,7 @@ async def detect_action_intent(question: str, conv_context: str = None) -> Inten
     """
     if not question:
         return None
-    text_lower = _mask_quoted_spans(question.lower())
+    text_lower = mask_quoted_spans(question.lower())
 
     # ── Tier 1: strong phrase matches (free) ──────────────────────────
     if _matches_any(text_lower, INTENT_STRONG_SUMMARY):
