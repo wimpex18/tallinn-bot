@@ -140,7 +140,15 @@ async def query_ai(
         '2. Заменить местоимение/неявную ссылку в вопросе этим конкретным названием\n\n'
         'НЕЯВНЫЕ ПРОДОЛЖЕНИЯ (без местоимений):\n'
         'Если пользователь задаёт уточняющий вопрос БЕЗ явного упоминания предмета, '
-        'он относится к ТОМУ ЖЕ месту/теме/городу из предыдущего ответа бота.'
+        'он относится к ТОМУ ЖЕ месту/теме/городу из предыдущего ответа бота.\n\n'
+        'ЧТО ТЫ УМЕЕШЬ (если спросят "что ты умеешь" или похожее — отвечай по-человечески, '
+        'не списком функций, а как будто рассказываешь другу):\n'
+        'Читаешь фото, голосовые сообщения и пересланные посты (в том числе с сайтов, которые '
+        'блокируют ботов), помнишь факты про людей и группу, подстраиваешь тон под собеседника, '
+        'ищешь свежую инфу в интернете. По запросу (не обязательно командой, можно просто по-человечески '
+        'попросить): пересказать разговор («о чём тут говорили?»), устроить дебаты по теме '
+        '(«давай поспорим про...»), проверить факт («проверь, правда ли что...»), сделать опрос '
+        '(«сделай опрос»).'
     )
 
     dynamic_parts = [_STATIC_SYSTEM]
@@ -428,4 +436,60 @@ async def suggest_poll(context_text: str) -> dict | None:
         return None
     except Exception as exc:
         logger.warning(f"Poll suggestion failed: {exc}")
+        return None
+
+
+_INTENT_ACTIONS = {"summary", "debate", "factcheck", "poll"}
+
+
+async def classify_intent(question: str, conv_context: str = None) -> dict | None:
+    """Tier-3 fallback: ask the LLM whether a message is a request to run one of
+    the group-chat actions (summarize/debate/factcheck/poll).
+
+    Only called by bot/services/intent.py when its free keyword tiers see a
+    loose signal word but can't tell on their own — most messages never reach
+    this. Returns {"action": ..., "topic": str|None, "claim": str|None} or
+    None if it's not one of these (just normal chat).
+    """
+    _client = mistral_client
+    if _client is None or not question:
+        return None
+
+    context_part = f"\n\nКонтекст чата:\n{conv_context}" if conv_context else ""
+    prompt = (
+        "Пользователь написал боту в групповом чате. Определи, просит ли он выполнить "
+        "одно из четырёх действий, или это обычный вопрос/болтовня.\n\n"
+        f"Сообщение: {question}{context_part}\n\n"
+        'Действия:\n'
+        '"summary" — пересказать/резюмировать обсуждение\n'
+        '"debate" — устроить дебаты по теме (укажи тему в "topic")\n'
+        '"factcheck" — проверить конкретное утверждение на достоверность (укажи его в "claim")\n'
+        '"poll" — сделать опрос\n'
+        '"none" — если это НЕ запрос ни одного из этих действий\n\n'
+        'Отвечай ТОЛЬКО валидным JSON: {"action": "summary"|"debate"|"factcheck"|"poll"|"none", '
+        '"topic": "..." или null, "claim": "..." или null}'
+    )
+    try:
+        response = await _client.chat.complete_async(
+            model=MISTRAL_MODEL, max_tokens=120, temperature=0.1,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        await record_call()
+        raw = response.choices[0].message.content.strip() if response.choices else ""
+        data = json.loads(raw)
+        action = data.get("action")
+        if action not in _INTENT_ACTIONS:
+            return None
+        topic = data.get("topic")
+        claim = data.get("claim")
+        return {
+            "action": action,
+            "topic": str(topic)[:300] if topic else None,
+            "claim": str(claim)[:500] if claim else None,
+        }
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        logger.warning("Intent classification: model did not return valid JSON")
+        return None
+    except Exception as exc:
+        logger.warning(f"Intent classification failed: {exc}")
         return None

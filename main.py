@@ -51,6 +51,7 @@ from bot.services import url_fetcher as url_fetcher_service
 from bot.services.style import generate_style_summary_llm
 from config import (
     BOT_USERNAME,
+    DAILY_PROMPT_ENABLED,
     DAILY_PROMPT_HOUR,
     DAILY_PROMPTS,
     MISTRAL_API_KEY,
@@ -266,13 +267,17 @@ async def init_clients(application) -> None:
             time=datetime.time(14, 0, tzinfo=TALLINN_TZ),
             name="refresh_styles",
         )
-        # Daily fun/icebreaker prompt
-        jq.run_daily(
-            daily_prompt_job,
-            time=datetime.time(DAILY_PROMPT_HOUR, 0, tzinfo=TALLINN_TZ),
-            name="daily_prompt",
-        )
-        logger.info("JobQueue: proactive_memory + refresh_styles + daily_prompt scheduled")
+        # Daily fun/icebreaker prompt — off by default (DAILY_PROMPT_ENABLED),
+        # the bot should only speak when spoken to.
+        if DAILY_PROMPT_ENABLED:
+            jq.run_daily(
+                daily_prompt_job,
+                time=datetime.time(DAILY_PROMPT_HOUR, 0, tzinfo=TALLINN_TZ),
+                name="daily_prompt",
+            )
+            logger.info("JobQueue: proactive_memory + refresh_styles + daily_prompt scheduled")
+        else:
+            logger.info("JobQueue: proactive_memory + refresh_styles scheduled (daily_prompt disabled)")
     else:
         logger.warning("JobQueue not available — install python-telegram-bot[job-queue]")
 
