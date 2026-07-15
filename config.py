@@ -14,6 +14,9 @@ logger = logging.getLogger("tallinn_bot")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
+# Plain-text names that also trigger a response in group chats (in addition to
+# @mentions and replies) — e.g. "Сэм, погода на завтра?" with no @-mention.
+BOT_DISPLAY_NAMES = ["Sam", "Сэм"]
 REDIS_URL = os.getenv("REDIS_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 # Random path segment for the webhook URL — intentionally independent of

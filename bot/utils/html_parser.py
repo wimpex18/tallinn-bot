@@ -217,10 +217,20 @@ def extract_page_text(html: str) -> str:
 
 
 def is_cloudflare_block(html: str) -> bool:
-    """Detect Cloudflare bot protection page."""
-    indicators = [
-        'just a moment', 'checking your browser', 'cloudflare',
-        'ray id', 'please wait', 'ddos protection', 'enable javascript',
-    ]
+    """Detect Cloudflare (or similar) bot-protection challenge pages.
+
+    Specific markers ('cloudflare', 'ray id', ...) are treated as sufficient on
+    their own. Generic phrases ('please wait', 'enable javascript', ...) are
+    common enough in ordinary page copy — a loading spinner, an SPA notice —
+    that a single match isn't reliable on its own; those only count as a block
+    when at least two of them show up together.
+    """
     html_lower = html.lower()
-    return any(ind in html_lower for ind in indicators)
+
+    strong_indicators = ['cloudflare', 'ray id', 'checking your browser', 'ddos protection']
+    if any(ind in html_lower for ind in strong_indicators):
+        return True
+
+    weak_indicators = ['just a moment', 'please wait', 'enable javascript']
+    weak_matches = sum(1 for ind in weak_indicators if ind in html_lower)
+    return weak_matches >= 2

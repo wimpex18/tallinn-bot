@@ -45,13 +45,19 @@ def _extract_content_from_html(html: str, url: str) -> str:
     metadata_text = format_metadata_text(metadata)
     page_text = extract_page_text(html)
 
-    if metadata_text and len(metadata_text) > 50:
-        if page_text and len(page_text) > 50:
-            combined = f"{metadata_text}\n\n[Page content]:\n{page_text}"
-        else:
-            combined = metadata_text
-    elif page_text and len(page_text) > 50:
+    has_page_text = bool(page_text and len(page_text) > 50)
+
+    if metadata_text and has_page_text:
+        # Always prepend metadata (even a short one, like just a title) when we
+        # also have real page text — a short title shouldn't get dropped just
+        # because it alone wouldn't clear the "is this substantial" bar below.
+        combined = f"{metadata_text}\n\n[Page content]:\n{page_text}"
+    elif has_page_text:
         combined = page_text
+    elif metadata_text and len(metadata_text) > 50:
+        # No usable page text — only fall back to metadata alone if there's
+        # enough of it (multiple fields) to be worth returning by itself.
+        combined = metadata_text
     else:
         return ""
 
@@ -87,10 +93,36 @@ async def _curl_fetch(url: str, impersonate: str) -> tuple[str | None, str | Non
         return None, str(e)
 
 
+async def _fetch_via_mistral_search(url: str) -> str | None:
+    """Best-effort fallback: ask Mistral's web-search-enabled model to open and
+    summarize the URL directly, for when our own TLS-impersonating fetch got
+    blocked or came back empty.
+
+    This runs from a different network (Mistral's infra, not this process), so
+    it can succeed against a different class of bot-protection than curl_cffi
+    impersonation can — not a guaranteed bypass (paywalls and heavily
+    JS-gated sites can still defeat both), but worth trying before giving up
+    on getting real content entirely.
+    """
+    try:
+        from bot.services.search import search_web
+        query = (
+            f"Открой страницу {url} и подробно перескажи её содержание: "
+            f"заголовок, дату, основные факты, цены и контакты если есть."
+        )
+        return await search_web(query)
+    except Exception as exc:
+        logger.warning(f"Mistral-mediated fetch failed for {url}: {exc}")
+        return None
+
+
 async def fetch_url_content(url: str) -> str:
     """Fetch webpage content using curl_cffi with browser TLS impersonation.
 
     Tries multiple impersonation profiles in parallel, returns first success.
+    Falls back to a Mistral-mediated open-and-summarize attempt (different
+    infra/IP, so it clears a different class of bot-protection) before
+    finally falling back to a non-fetching URL heuristic.
     """
     clean_url_str = clean_url(url)
 
@@ -151,10 +183,19 @@ async def fetch_url_content(url: str) -> str:
 
     elapsed_ms = (time.monotonic() - t0) * 1000
 
-    if result is None:
-        logger.error(f"Failed to fetch {clean_url_str} ({elapsed_ms:.0f}ms)")
-        url_info = extract_url_info(clean_url_str)
-        result = url_info if url_info else ""
+    if not result:
+        logger.warning(
+            f"Direct fetch failed for {clean_url_str} ({elapsed_ms:.0f}ms), "
+            f"trying Mistral-mediated fetch"
+        )
+        mistral_result = await _fetch_via_mistral_search(clean_url_str)
+        if mistral_result:
+            result = mistral_result
+            logger.info(f"Mistral-mediated fetch succeeded for {clean_url_str} ({len(result)} chars)")
+        else:
+            logger.error(f"Mistral-mediated fetch also failed for {clean_url_str}, falling back to URL heuristic")
+            url_info = extract_url_info(clean_url_str)
+            result = url_info if url_info else ""
     else:
         logger.info(f"Fetched {len(result)} chars from {clean_url_str} in {elapsed_ms:.0f}ms")
 

@@ -12,6 +12,7 @@ from bot.utils.helpers import (
     get_forward_origin_info,
     get_message_content,
     is_forwarded_message,
+    mentions_bot_by_name,
     set_rate_limit,
 )
 
@@ -132,3 +133,27 @@ def test_get_display_name_uses_username_mapping():
 def test_get_display_name_falls_back_to_first_name():
     user = SimpleNamespace(username="totally_unknown_user", first_name="Alex")
     assert get_display_name(user) == "Alex"
+
+
+def test_mentions_bot_by_name_matches_latin():
+    assert mentions_bot_by_name("hey Sam, what's up") is True
+    assert mentions_bot_by_name("SAM!") is True
+
+
+def test_mentions_bot_by_name_matches_cyrillic():
+    assert mentions_bot_by_name("Сэм, погода на завтра?") is True
+    assert mentions_bot_by_name("сэм привет") is True
+
+
+def test_mentions_bot_by_name_no_match_on_substring():
+    assert mentions_bot_by_name("Сэмплы отличные") is False
+    assert mentions_bot_by_name("I bought a Samsung phone") is False
+
+
+def test_mentions_bot_by_name_no_match_unrelated_text():
+    assert mentions_bot_by_name("какая погода сегодня?") is False
+
+
+def test_mentions_bot_by_name_empty_text():
+    assert mentions_bot_by_name("") is False
+    assert mentions_bot_by_name(None) is False
