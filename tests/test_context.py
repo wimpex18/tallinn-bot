@@ -4,6 +4,9 @@ from bot.utils.context import (
     clear_context,
     get_context_messages,
     get_context_string,
+    get_last_bot_reply_target,
+    last_bot_reply_target,
+    set_last_bot_reply_target,
     trim_context_for_api,
 )
 
@@ -85,3 +88,26 @@ def test_clear_context_removes_entry():
     assert (chat_id, 0) in chat_context
     clear_context(chat_id)
     assert (chat_id, 0) not in chat_context
+
+
+def test_last_bot_reply_target_roundtrip():
+    chat_id = 116
+    assert get_last_bot_reply_target(chat_id) is None
+    set_last_bot_reply_target(chat_id, 42, "Alice")
+    assert get_last_bot_reply_target(chat_id) == (42, "Alice")
+
+
+def test_last_bot_reply_target_isolated_per_thread():
+    chat_id = 117
+    set_last_bot_reply_target(chat_id, 1, "Alice", thread_id=1)
+    set_last_bot_reply_target(chat_id, 2, "Bob", thread_id=2)
+    assert get_last_bot_reply_target(chat_id, thread_id=1) == (1, "Alice")
+    assert get_last_bot_reply_target(chat_id, thread_id=2) == (2, "Bob")
+
+
+def test_clear_context_removes_last_bot_reply_target():
+    chat_id = 118
+    set_last_bot_reply_target(chat_id, 1, "Alice")
+    assert (chat_id, 0) in last_bot_reply_target
+    clear_context(chat_id)
+    assert (chat_id, 0) not in last_bot_reply_target

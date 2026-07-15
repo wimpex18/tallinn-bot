@@ -340,16 +340,22 @@ def main() -> None:
     application.add_handler(CommandHandler("debate", debate_command))
     application.add_handler(CommandHandler("factcheck", factcheck_command))
     application.add_handler(CommandHandler("poll", poll_command))
-    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_message))
+    # ~filters.UpdateType.EDITED on the two handlers below: without it, PTB routes
+    # Telegram's edited_message updates through the same handlers as new messages
+    # (a typo fix would re-trigger a full second reply, and double-count style/
+    # reaction stats in the observer).
     application.add_handler(MessageHandler(
-        (filters.TEXT | filters.FORWARDED | filters.PHOTO) & ~filters.COMMAND,
+        (filters.VOICE | filters.AUDIO) & ~filters.UpdateType.EDITED, handle_voice_message,
+    ))
+    application.add_handler(MessageHandler(
+        (filters.TEXT | filters.FORWARDED | filters.PHOTO) & ~filters.COMMAND & ~filters.UpdateType.EDITED,
         handle_message,
     ))
 
     # ── Handler group 1: silent observer (runs on EVERY group message) ──
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS & ~filters.UpdateType.EDITED,
             observe_and_learn,
         ),
         group=1,

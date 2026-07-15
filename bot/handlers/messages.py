@@ -30,6 +30,8 @@ from bot.utils.context import (
     evict_stale_data,
     get_context_messages,
     get_context_string,
+    get_last_bot_reply_target,
+    set_last_bot_reply_target,
     trim_context_for_api,
 )
 from bot.utils.helpers import (
@@ -470,6 +472,15 @@ async def _process_message(
     if referenced_content:
         logger.info(f"Referenced content preview: {referenced_content[:200]}...")
 
+    # If this isn't an explicit reply, and the bot's last reply in this chat/thread
+    # went to someone else, tell the model — so it doesn't treat an unrelated
+    # follow-up from a different person as a continuation of that other exchange.
+    last_reply_different_user = None
+    if update.effective_chat.type != "private" and not reply_msg:
+        last_target = get_last_bot_reply_target(chat_id, thread_id)
+        if last_target and last_target[0] != user_id:
+            last_reply_different_user = last_target[1]
+
     # Send a placeholder message so we can stream the response into it
     placeholder = await message.reply_text("...", reply_parameters=ReplyParameters(message_id=message.message_id))
 
@@ -486,6 +497,7 @@ async def _process_message(
         telegram_chat_id=chat_id,
         telegram_message_id=placeholder.message_id,
         debate_topic=debate_topic,
+        last_reply_different_user=last_reply_different_user,
     )
 
     timer.checkpoint("ai")
@@ -494,6 +506,8 @@ async def _process_message(
     set_rate_limit(user_id)
     # User message was already added to context before the API call.
     add_to_context(chat_id, "assistant", "bot", answer, thread_id=thread_id)
+    if update.effective_chat.type != "private":
+        set_last_bot_reply_target(chat_id, user_id, user_name or "", thread_id=thread_id)
     await save_user_interaction(user_id, user_name, user.username)
 
     record_bot_replied(chat_id)
