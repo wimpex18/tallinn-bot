@@ -93,6 +93,25 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"  # WEBHOOK_SECRET
 Both are optional (the bot falls back to a per-process random path and logs a warning), but should
 be set for any real deployment.
 
+## Deployment
+
+Render is the only deployment tool this project uses — there's no separate CD pipeline. `render.yaml`
+in the repo root is a [Render Blueprint](https://render.com/docs/blueprint-spec): it declares one
+`web` service (`runtime: python`, `buildCommand: pip install -r requirements.txt`,
+`startCommand: python main.py`) plus the env var names it expects (values with `sync: false` are
+secrets you set once in the Render dashboard, not stored in the repo).
+
+Once the Render service is connected to this GitHub repo (via Render's GitHub App, set up from the
+Render dashboard when the service was first created), Render watches the branch it's configured to
+deploy from — normally `master` — and **auto-deploys on every push to that branch**: it pulls the
+new commit, re-runs `buildCommand`, and restarts the service with `startCommand`. Nothing needs to
+run on this side to trigger it; merging a PR into `master` is what ships it. `.github/workflows/ci.yml`
+(pytest + ruff) is a separate, unrelated check that runs on GitHub and does not deploy anything —
+it only gates PRs if you turn on branch protection requiring it to pass.
+
+If you ever need to check *which* commit is actually live, or force a redeploy without a new
+commit, that's done from the Render dashboard (Manual Deploy) or the Render CLI — not from GitHub.
+
 ## Costs
 
 Everything runs on Mistral's free tier except voice-message transcription (Voxtral,
