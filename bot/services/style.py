@@ -6,14 +6,17 @@ that gets injected into the Mistral system prompt so the bot mirrors each
 user's tone.
 """
 
-import re
 import logging
+import re
 
 from config import (
     MISTRAL_MODEL,
+    REDIS_KEY_TTL_DAYS,
     STYLE_MIN_MESSAGES,
     STYLE_SUMMARY_TTL,
 )
+
+_KEY_TTL_SECONDS = REDIS_KEY_TTL_DAYS * 86400
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,7 @@ async def update_style_counters(redis_client, user_id: int, text: str) -> None:
         if signals["uses_caps"]:
             pipe.hincrby(key, "caps_count", 1)
         pipe.hincrbyfloat(key, "total_msg_length", signals["msg_length"])
+        pipe.expire(key, _KEY_TTL_SECONDS)
         await pipe.execute()
     except Exception as e:
         logger.error(f"Failed to update style counters for user {user_id}: {e}")
@@ -125,8 +129,8 @@ async def generate_style_summary_llm(
     if not redis_client:
         return None
 
-    from bot.services import claude as claude_service
-    if not claude_service.mistral_client:
+    from bot.services import ai as ai_service
+    if not ai_service.mistral_client:
         return None
 
     recent = await redis_client.lrange(f"user:{user_id}:recent_msgs", 0, 19)
@@ -143,7 +147,7 @@ async def generate_style_summary_llm(
     )
 
     try:
-        response = await claude_service.mistral_client.chat.complete_async(
+        response = await ai_service.mistral_client.chat.complete_async(
             model=MISTRAL_MODEL,
             max_tokens=100,
             temperature=0.2,

@@ -2,39 +2,57 @@
 
 import asyncio
 import logging
-from telegram import Update, ReplyParameters
+
+from telegram import ReplyParameters, Update
 from telegram.ext import ContextTypes
+
+from bot.handlers.observer import record_bot_replied
+from bot.middleware.timing import Timer
+from bot.services.ai import query_ai
+from bot.services.memory import (
+    extract_facts_from_response,
+    get_debate_topic,
+    get_group_facts,
+    get_recent_chat_messages,
+    get_user_facts,
+    save_user_fact,
+    save_user_interaction,
+    smart_extract_facts,
+)
+from bot.services.search import is_search_trigger, search_web
+from bot.services.style import get_style_summary
+from bot.services.url_fetcher import fetch_url_content
+from bot.services.weather import extract_weather_city, fetch_weather, is_weather_query
+from bot.utils.context import (
+    add_to_context,
+    evict_stale_data,
+    get_context_messages,
+    trim_context_for_api,
+)
+from bot.utils.helpers import (
+    check_rate_limit,
+    download_photo_as_base64,
+    extract_question,
+    extract_urls,
+    get_all_urls,
+    get_display_name,
+    get_forward_origin_info,
+    get_message_content,
+    has_photo,
+    is_forwarded_message,
+    send_typing,
+    set_rate_limit,
+)
+from config import BOT_USERNAME
+
+logger = logging.getLogger(__name__)
 
 # ── Album buffering ────────────────────────────────────────────────────
 # Telegram delivers each photo in a media group (album) as a separate update
 # with the same media_group_id.  We buffer them for 0.8 s then process all
-# photos in a single Claude call so the model sees the full album at once.
+# photos in a single AI call so the model sees the full album at once.
 
 _album_buffer: dict[str, dict] = {}  # media_group_id → {updates, context, task}
-
-from config import BOT_USERNAME
-from bot.middleware.timing import Timer
-from bot.utils.context import (
-    add_to_context, get_context_messages, evict_stale_data, trim_context_for_api,
-)
-from bot.utils.helpers import (
-    get_message_content, get_all_urls, extract_urls, extract_question,
-    is_forwarded_message, has_photo, download_photo_as_base64,
-    send_typing, check_rate_limit, set_rate_limit, get_display_name,
-)
-from bot.services.url_fetcher import fetch_url_content
-from bot.services.weather import is_weather_query, extract_weather_city, fetch_weather
-from bot.services.claude import query_claude
-from bot.services.memory import (
-    get_user_facts, get_group_facts,
-    save_user_fact, save_group_fact, save_user_interaction,
-    smart_extract_facts, extract_facts_from_response,
-    get_recent_chat_messages,
-)
-from bot.services.style import get_style_summary
-from bot.handlers.observer import record_bot_replied
-
-logger = logging.getLogger(__name__)
 
 
 # ── Routing ──────────────────────────────────────────────────────────
@@ -190,6 +208,9 @@ async def _process_message(
             f"has_text={bool(reply_msg.text)}, has_caption={bool(reply_msg.caption)}, "
             f"content_len={len(reply_content) if reply_content else 0}"
         )
+        reply_is_forwarded = is_forwarded_message(reply_msg)
+        reply_origin_info = get_forward_origin_info(reply_msg) if reply_is_forwarded else None
+
         if reply_content:
             reply_author = get_display_name(reply_msg.from_user) if reply_msg.from_user else "unknown"
             if not reply_author:
@@ -203,8 +224,10 @@ async def _process_message(
                 and reply_msg.from_user.username == BOT_USERNAME
             )
 
-            if is_forwarded_message(reply_msg):
+            if reply_is_forwarded:
                 referenced_content = f"[Forwarded post]: {reply_content}"
+                if reply_origin_info:
+                    referenced_content = f"{reply_origin_info}\n{referenced_content}"
                 if reply_urls:
                     referenced_content += f"\n[URLs in post]: {', '.join(reply_urls[:5])}"
             elif reply_urls:
@@ -223,17 +246,27 @@ async def _process_message(
                 )
             else:
                 referenced_content = f"[Message from {reply_author}]: {reply_content}"
+        elif reply_origin_info:
+            # Reply to a bare forwarded photo/media with no caption — still worth
+            # telling the model where it came from.
+            referenced_content = reply_origin_info
 
     # Case 2: Current message is forwarded
     if is_forwarded_message(message) and not referenced_content:
         content = get_message_content(message)
+        origin_info = get_forward_origin_info(message)
         if content:
             msg_urls = get_all_urls(message)
             referenced_content = f"[Forwarded post]: {content}"
+            if origin_info:
+                referenced_content = f"{origin_info}\n{referenced_content}"
             if msg_urls:
                 referenced_content += f"\n[URLs in post]: {', '.join(msg_urls[:5])}"
             if not question:
                 question = "расскажи об этом"
+        elif origin_info:
+            # Bare forwarded photo/media with no caption.
+            referenced_content = origin_info
 
     # Case 3: Current message has URLs (no reply)
     if not referenced_content and question:
@@ -258,10 +291,10 @@ async def _process_message(
         await message.reply_text("Чё спросить хотел?", reply_parameters=ReplyParameters(message_id=message.message_id))
         return
 
-    if not question and referenced_content:
-        question = "о чём это?"
     if not question and (has_current_photo or has_reply_photo):
         question = "что на фотографиях?" if album_updates and len(album_updates) > 1 else "что на фото?"
+    elif not question and referenced_content:
+        question = "о чём это?"
 
     # Rate limit (checked after we know we will process, before any network I/O)
     is_limited, remaining = check_rate_limit(user_id)
@@ -274,9 +307,9 @@ async def _process_message(
         )
         return
 
-    # ── Weather pre-fetch (real-time data Claude can't get on its own) ──
+    # ── Weather pre-fetch (real-time data the model can't get on its own) ──
     # Detect weather queries and inject live wttr.in data as referenced_content
-    # so Claude can give an accurate answer instead of pretending to search.
+    # so the model can give an accurate answer instead of pretending to search.
     if not referenced_content and is_weather_query(question):
         city = extract_weather_city(question) or "Tallinn"
         logger.info(f"Weather query detected — fetching wttr.in data for '{city}'")
@@ -285,6 +318,18 @@ async def _process_message(
             referenced_content = weather_data
         else:
             logger.warning(f"Weather fetch failed for '{city}', continuing without data")
+
+    # ── Web search pre-fetch (explicit "найди"/"search" style triggers) ──
+    # Runs a live Mistral web search and injects the cited result as
+    # referenced_content, same pattern as weather — keeps the search result
+    # flowing through the bot's normal persona/formatting pass.
+    if not referenced_content and is_search_trigger(question):
+        logger.info(f"Search trigger detected in question: {question[:80]}")
+        search_result = await search_web(question)
+        if search_result:
+            referenced_content = search_result
+        else:
+            logger.warning("Web search returned no result, continuing without it")
 
     # ── Fetch URL content (only if not rate limited) ─────────────
     if urls_to_fetch and referenced_content:
@@ -339,8 +384,11 @@ async def _process_message(
 
     user_facts_coro = get_user_facts(user_id)
     group_facts_coro = get_group_facts(chat_id) if chat_id != user_id else _empty_list()
+    debate_topic_coro = get_debate_topic(chat_id, thread_id)
 
-    user_facts, group_facts = await asyncio.gather(user_facts_coro, group_facts_coro)
+    user_facts, group_facts, debate_topic = await asyncio.gather(
+        user_facts_coro, group_facts_coro, debate_topic_coro,
+    )
 
     # Fetch per-user communication style (for tone adaptation)
     from bot.services import memory as mem_svc
@@ -378,11 +426,12 @@ async def _process_message(
 
     timer.checkpoint("photos")
 
-    # ── Query Mistral ─────────────────────────────────────────────
+    # ── Query the AI service ────────────────────────────────────────
     logger.info(
         f"Query from {user_id} ({user_name}): {question[:120]}... "
         f"[ref={'yes('+str(len(referenced_content))+'chars)' if referenced_content else 'no'}, "
-        f"ctx_msgs={len(conv_context_msgs)}, photos={len(photo_urls)}]"
+        f"ctx_msgs={len(conv_context_msgs)}, photos={len(photo_urls)}, "
+        f"debate={'yes' if debate_topic else 'no'}]"
     )
     if referenced_content:
         logger.info(f"Referenced content preview: {referenced_content[:200]}...")
@@ -390,7 +439,7 @@ async def _process_message(
     # Send a placeholder message so we can stream the response into it
     placeholder = await message.reply_text("...", reply_parameters=ReplyParameters(message_id=message.message_id))
 
-    answer = await query_claude(
+    answer = await query_ai(
         question=question,
         referenced_content=referenced_content,
         user_name=user_name,
@@ -402,9 +451,10 @@ async def _process_message(
         telegram_bot=context.bot,
         telegram_chat_id=chat_id,
         telegram_message_id=placeholder.message_id,
+        debate_topic=debate_topic,
     )
 
-    timer.checkpoint("claude")
+    timer.checkpoint("ai")
 
     # ── Post-processing ──────────────────────────────────────────
     set_rate_limit(user_id)

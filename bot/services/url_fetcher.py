@@ -1,19 +1,19 @@
 """URL fetching with curl_cffi (browser TLS impersonation) and content extraction."""
 
-import time
 import asyncio
 import logging
+import time
 
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
-from config import URL_CACHE_TTL, IMPERSONATE_PROFILES, URL_MAX_CHARS, URL_HEAD_CHARS, URL_TAIL_CHARS
 from bot.utils.helpers import clean_url, extract_url_info
 from bot.utils.html_parser import (
     extract_metadata,
-    format_metadata_text,
     extract_page_text,
+    format_metadata_text,
     is_cloudflare_block,
 )
+from config import IMPERSONATE_PROFILES, URL_CACHE_TTL, URL_HEAD_CHARS, URL_MAX_CHARS, URL_TAIL_CHARS
 
 logger = logging.getLogger(__name__)
 

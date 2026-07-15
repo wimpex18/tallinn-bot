@@ -1,16 +1,24 @@
-"""Redis-backed persistent memory for user and group facts."""
+"""Redis-backed persistent memory for user and group facts.
+
+Every write path refreshes a whole-key TTL (REDIS_KEY_TTL_DAYS) instead of
+relying on a periodic full-keyspace scan to notice staleness — Redis expires
+untouched keys on its own, so there is no separate cleanup job to run.
+"""
 
 import json
-import time
-import re
 import logging
+import re
+import time
+from datetime import UTC
 
-from config import STYLE_RECENT_MESSAGES_KEPT, MISTRAL_MODEL
+from config import MISTRAL_MODEL, REDIS_KEY_TTL_DAYS, STYLE_RECENT_MESSAGES_KEPT
 
 logger = logging.getLogger(__name__)
 
 # Initialized in main.py post_init
 redis_client = None
+
+_KEY_TTL_SECONDS = REDIS_KEY_TTL_DAYS * 86400
 
 
 async def save_user_fact(user_id: int, fact: str) -> None:
@@ -19,7 +27,10 @@ async def save_user_fact(user_id: int, fact: str) -> None:
         return
     try:
         key = f"user:{user_id}:facts"
-        await redis_client.zadd(key, {fact: time.time()})
+        pipe = redis_client.pipeline()
+        pipe.zadd(key, {fact: time.time()})
+        pipe.expire(key, _KEY_TTL_SECONDS)
+        await pipe.execute()
         count = await redis_client.zcard(key)
         if count > 20:
             await redis_client.zremrangebyrank(key, 0, -(20 + 1))
@@ -44,7 +55,10 @@ async def save_group_fact(chat_id: int, fact: str) -> None:
         return
     try:
         key = f"group:{chat_id}:facts"
-        await redis_client.zadd(key, {fact: time.time()})
+        pipe = redis_client.pipeline()
+        pipe.zadd(key, {fact: time.time()})
+        pipe.expire(key, _KEY_TTL_SECONDS)
+        await pipe.execute()
         count = await redis_client.zcard(key)
         if count > 30:
             await redis_client.zremrangebyrank(key, 0, -(30 + 1))
@@ -68,13 +82,16 @@ async def save_user_interaction(user_id: int, user_name: str, username: str) -> 
     if not redis_client or not user_name:
         return
     try:
-        from datetime import datetime, timezone
+        from datetime import datetime
         key = f"user:{user_id}:profile"
-        await redis_client.hset(key, mapping={
+        pipe = redis_client.pipeline()
+        pipe.hset(key, mapping={
             "name": user_name,
             "username": username or "",
-            "last_seen": datetime.now(timezone.utc).isoformat(),
+            "last_seen": datetime.now(UTC).isoformat(),
         })
+        pipe.expire(key, _KEY_TTL_SECONDS)
+        await pipe.execute()
     except Exception as e:
         logger.error(f"Failed to save user interaction: {e}")
 
@@ -111,8 +128,8 @@ async def smart_extract_facts(
     if not question or len(question) < 10:
         return []
 
-    from bot.services import claude as claude_service
-    if not claude_service.mistral_client:
+    from bot.services import ai as ai_service
+    if not ai_service.mistral_client:
         return []
 
     context_part = f"Контекст чата: {chat_context}" if chat_context else ""
@@ -129,7 +146,7 @@ async def smart_extract_facts(
 Отвечай ТОЛЬКО валидным JSON: {{"facts": ["факт 1", "факт 2"]}} или {{"facts": []}} если фактов нет."""
 
     try:
-        response = await claude_service.mistral_client.chat.complete_async(
+        response = await ai_service.mistral_client.chat.complete_async(
             model=MISTRAL_MODEL,
             max_tokens=150,
             temperature=0.1,
@@ -174,13 +191,16 @@ async def store_recent_message(
     try:
         entry = f"{user_name}: {text[:300]}"
         chat_key = f"chat:{chat_id}:{thread_id or 0}:recent_msgs"
+        user_key = f"user:{user_id}:recent_msgs"
         pipe = redis_client.pipeline()
         # Per-chat-thread buffer (for proactive memory + restart recovery)
         pipe.lpush(chat_key, entry)
         pipe.ltrim(chat_key, 0, 29)  # keep 30
+        pipe.expire(chat_key, _KEY_TTL_SECONDS)
         # Per-user buffer (for style analysis — not thread-scoped)
-        pipe.lpush(f"user:{user_id}:recent_msgs", text[:300])
-        pipe.ltrim(f"user:{user_id}:recent_msgs", 0, STYLE_RECENT_MESSAGES_KEPT - 1)
+        pipe.lpush(user_key, text[:300])
+        pipe.ltrim(user_key, 0, STYLE_RECENT_MESSAGES_KEPT - 1)
+        pipe.expire(user_key, _KEY_TTL_SECONDS)
         await pipe.execute()
     except Exception as e:
         logger.error(f"Failed to store recent message: {e}")
@@ -212,8 +232,8 @@ async def extract_facts_from_conversation(
     if not messages or len(messages) < 3:
         return []
 
-    from bot.services import claude as claude_service
-    if not claude_service.mistral_client:
+    from bot.services import ai as ai_service
+    if not ai_service.mistral_client:
         return []
 
     conversation = "\n".join(reversed(messages))  # oldest first
@@ -226,7 +246,7 @@ async def extract_facts_from_conversation(
 Отвечай ТОЛЬКО валидным JSON: {{"facts": ["Имя: факт", "Имя: факт"]}} или {{"facts": []}} если фактов нет."""
 
     try:
-        response = await claude_service.mistral_client.chat.complete_async(
+        response = await ai_service.mistral_client.chat.complete_async(
             model=MISTRAL_MODEL,
             max_tokens=200,
             temperature=0.1,
@@ -246,76 +266,6 @@ async def extract_facts_from_conversation(
     except Exception as e:
         logger.error(f"Proactive fact extraction failed: {e}")
         return []
-
-
-# ── Redis cleanup / maintenance ──────────────────────────────────────
-
-async def cleanup_stale_redis_keys(max_age_days: int = 90) -> dict:
-    """Scan Redis for orphaned keys and delete those untouched for > max_age_days.
-
-    Returns a summary dict of what was cleaned up.
-    """
-    if not redis_client:
-        return {"error": "Redis not connected"}
-
-    stats = {"scanned": 0, "deleted": 0, "patterns": {}}
-    now = time.time()
-    cutoff = now - (max_age_days * 86400)
-
-    try:
-        cursor = 0
-        while True:
-            cursor, keys = await redis_client.scan(cursor, count=100)
-            for key in keys:
-                stats["scanned"] += 1
-                key_type = await redis_client.type(key)
-
-                should_delete = False
-
-                if key_type == "zset":
-                    # Sorted sets: check highest score (most recent timestamp)
-                    top = await redis_client.zrange(key, -1, -1, withscores=True)
-                    if not top:
-                        should_delete = True
-                    elif top[0][1] < cutoff:
-                        should_delete = True
-
-                elif key_type == "hash":
-                    last_seen = await redis_client.hget(key, "last_seen")
-                    if last_seen:
-                        # Profile hash — check last_seen
-                        try:
-                            from datetime import datetime
-                            dt = datetime.fromisoformat(last_seen)
-                            if dt.timestamp() < cutoff:
-                                should_delete = True
-                        except (ValueError, TypeError):
-                            pass
-                    else:
-                        # Style hash — no TTL check needed, counter-based
-                        pass
-
-                elif key_type == "list":
-                    # Recent message lists — check TTL or if empty
-                    length = await redis_client.llen(key)
-                    if length == 0:
-                        should_delete = True
-
-                if should_delete:
-                    await redis_client.delete(key)
-                    stats["deleted"] += 1
-                    # Track pattern
-                    pattern = ":".join(key.split(":")[:1] + ["*"] + key.split(":")[2:])
-                    stats["patterns"][pattern] = stats["patterns"].get(pattern, 0) + 1
-
-            if cursor == 0:
-                break
-    except Exception as e:
-        logger.error(f"Redis cleanup failed: {e}")
-        stats["error"] = str(e)
-
-    logger.info(f"Redis cleanup: scanned={stats['scanned']}, deleted={stats['deleted']}")
-    return stats
 
 
 # ── Quiet-mode per chat ──────────────────────────────────────────────
@@ -341,3 +291,39 @@ async def is_quiet_mode(chat_id: int) -> bool:
         return await redis_client.exists(f"chat:{chat_id}:quiet") > 0
     except Exception:
         return False
+
+
+# ── Debate mode per chat/thread ───────────────────────────────────────
+
+def _debate_key(chat_id: int, thread_id: int | None = None) -> str:
+    return f"chat:{chat_id}:{thread_id or 0}:debate"
+
+
+async def set_debate_mode(chat_id: int, topic: str, thread_id: int | None = None, ttl: int = 1800) -> None:
+    """Activate debate mode for a chat/thread for `ttl` seconds."""
+    if not redis_client:
+        return
+    try:
+        await redis_client.set(_debate_key(chat_id, thread_id), topic, ex=ttl)
+    except Exception as e:
+        logger.error(f"Failed to set debate mode: {e}")
+
+
+async def get_debate_topic(chat_id: int, thread_id: int | None = None) -> str | None:
+    """Return the active debate topic for a chat/thread, or None if inactive."""
+    if not redis_client:
+        return None
+    try:
+        return await redis_client.get(_debate_key(chat_id, thread_id))
+    except Exception:
+        return None
+
+
+async def clear_debate_mode(chat_id: int, thread_id: int | None = None) -> None:
+    """Deactivate debate mode for a chat/thread."""
+    if not redis_client:
+        return
+    try:
+        await redis_client.delete(_debate_key(chat_id, thread_id))
+    except Exception as e:
+        logger.error(f"Failed to clear debate mode: {e}")

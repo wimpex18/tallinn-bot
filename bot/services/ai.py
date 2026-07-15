@@ -1,15 +1,18 @@
-"""Mistral API client with streaming support."""
+"""Mistral API client: chat, streaming, summarization, and poll suggestions."""
 
+import datetime
+import json
+import logging
 import re
 import time
-import logging
 
 from mistralai.client import Mistral
 
 from config import (
-    MISTRAL_MODEL,
     MISTRAL_MAX_TOKENS,
+    MISTRAL_MODEL,
     MISTRAL_TEMPERATURE,
+    QUOTA_WARN_THRESHOLD,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,7 +77,17 @@ def _parse_base64_image(data_url: str) -> dict | None:
         return None
 
 
-async def query_claude(
+_DEBATE_SYSTEM_ADDENDUM = (
+    'РЕЖИМ ДЕБАТОВ активен, тема: "{topic}". '
+    'Твоя роль — вдумчивый оппонент, а не ассистент. Бери сторону, противоположную '
+    'преобладающему мнению в чате, и добросовестно её отстаивай: приводи контраргументы, '
+    'указывай на слабые места в рассуждениях собеседников, задавай острые уточняющие вопросы. '
+    'Не соглашайся просто чтобы быть вежливым. Оставайся уважительным и по делу — '
+    'это интеллектуальный спарринг, а не токсичность.'
+)
+
+
+async def query_ai(
     question: str,
     referenced_content: str = None,
     user_name: str = None,
@@ -86,7 +99,7 @@ async def query_claude(
     telegram_bot=None,
     telegram_chat_id: int = None,
     telegram_message_id: int = None,
-    thinking_budget: int = 0,
+    debate_topic: str = None,
 ) -> str:
     """Query Mistral with multi-turn context, memory, and optional streaming.
 
@@ -137,6 +150,8 @@ async def query_claude(
         dynamic_parts.append(f"Ты помнишь про эту группу: {', '.join(group_facts[:5])}")
     if user_style:
         dynamic_parts.append(user_style)
+    if debate_topic:
+        dynamic_parts.append(_DEBATE_SYSTEM_ADDENDUM.format(topic=debate_topic))
     system_text = "\n\n".join(dynamic_parts)
 
     # Auto-append Tallinn context for place/event queries
@@ -232,6 +247,7 @@ async def query_claude(
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         logger.info(f"Mistral responded in {elapsed_ms:.0f}ms ({len(answer)} chars)")
+        await record_call()
         return answer
 
     except Exception as exc:
@@ -321,3 +337,95 @@ def _clean_response(text: str) -> str:
     text = re.sub(r'\s+(\)+|\(+)', r'\1', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+
+# ── Usage observability (no hard cutoff — just visibility into free-tier use) ─
+
+async def record_call() -> None:
+    """Increment today's Mistral call counter in Redis and warn once if usage looks high."""
+    from bot.services import memory as memory_service
+    if not memory_service.redis_client:
+        return
+    try:
+        today = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+        key = f"mistral:calls:{today}"
+        count = await memory_service.redis_client.incr(key)
+        await memory_service.redis_client.expire(key, 2 * 86400)
+        if count == QUOTA_WARN_THRESHOLD:
+            logger.warning(
+                f"Mistral usage today has reached {count} calls — approaching a volume "
+                f"worth keeping an eye on via the Mistral console if you're on the free tier"
+            )
+    except Exception as exc:
+        logger.debug(f"Quota tracking skipped: {exc}")
+
+
+# ── Single-shot helpers (summarization, poll suggestions) ────────────
+
+async def summarize_conversation(messages: list[str], topic: str = None) -> str:
+    """Summarize a batch of recent chat messages (newest-first) into a short digest."""
+    if not messages:
+        return "Пока нечего суммировать — в чате было тихо."
+
+    _client = mistral_client
+    if _client is None:
+        return "Бот не готов, попробуй чуть позже("
+
+    conversation = "\n".join(reversed(messages))
+    focus = f" Сфокусируйся на теме: {topic}." if topic else ""
+    prompt = (
+        f"Кратко перескажи это обсуждение в групповом чате.{focus} "
+        "Формат: 3-6 пунктов, только ключевые темы и нерешённые вопросы. "
+        "Без вступления и заключения.\n\n"
+        f"{conversation}"
+    )
+    try:
+        response = await _client.chat.complete_async(
+            model=MISTRAL_MODEL, max_tokens=400, temperature=0.2,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        await record_call()
+        text = response.choices[0].message.content.strip() if response.choices else ""
+        return _clean_response(text) or "Не получилось собрать саммари("
+    except Exception as exc:
+        logger.error(f"Summarization failed: {exc}")
+        return "Не получилось собрать саммари("
+
+
+async def suggest_poll(context_text: str) -> dict | None:
+    """Ask the LLM to propose a poll from recent context.
+
+    Returns {"question": str, "options": [str, ...]} or None if nothing fits.
+    """
+    _client = mistral_client
+    if _client is None or not context_text:
+        return None
+
+    prompt = (
+        "На основе этого обсуждения в чате предложи короткий опрос (poll), "
+        "чтобы разрешить спор или узнать мнение группы.\n\n"
+        f"{context_text}\n\n"
+        'Отвечай ТОЛЬКО валидным JSON: {"question": "...", "options": ["...", "..."]} '
+        "Вопрос — до 250 символов, 2-6 вариантов ответа, каждый до 90 символов. "
+        'Если предложить нечего — {"question": null, "options": []}'
+    )
+    try:
+        response = await _client.chat.complete_async(
+            model=MISTRAL_MODEL, max_tokens=250, temperature=0.4,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        await record_call()
+        raw = response.choices[0].message.content.strip() if response.choices else ""
+        data = json.loads(raw)
+        question = data.get("question")
+        options = data.get("options", [])
+        if not question or not isinstance(options, list) or len(options) < 2:
+            return None
+        options = [str(o)[:90] for o in options[:6]]
+        return {"question": str(question)[:250], "options": options}
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        logger.warning("Poll suggestion: model did not return valid JSON")
+        return None
+    except Exception as exc:
+        logger.warning(f"Poll suggestion failed: {exc}")
+        return None

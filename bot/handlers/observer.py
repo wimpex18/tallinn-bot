@@ -1,4 +1,4 @@
-"""Silent observer + spontaneous replies.
+"""Silent observer + lightweight engagement.
 
 Registered in handler group 1 (separate from the main handlers in group 0).
 Runs on EVERY group message, even ones the bot doesn't respond to.
@@ -6,39 +6,45 @@ Runs on EVERY group message, even ones the bot doesn't respond to.
 Responsibilities:
 1. Store every message in the Redis recent-messages buffer
 2. Update per-user communication-style counters
-3. Occasionally (probability-based) generate a spontaneous reply
+3. Occasionally react with an emoji (default, cheap, non-spammy) or — if
+   explicitly opted into via SPONTANEOUS_REPLY_PROBABILITY > 0 — generate a
+   full spontaneous text reply (kept for backwards compatibility, default off)
 """
 
-import time
-import re
-import random
 import asyncio
 import logging
+import random
+import re
+import time
 import zoneinfo
 from datetime import datetime
 
-from telegram import Update, ReplyParameters
+from telegram import ReplyParameters, Update
 from telegram.ext import ContextTypes
 
-from config import (
-    BOT_USERNAME,
-    MISTRAL_MODEL,
-    SPONTANEOUS_REPLY_PROBABILITY,
-    SPONTANEOUS_REPLY_KEYWORD_BOOST,
-    SPONTANEOUS_REPLY_COOLDOWN,
-    SPONTANEOUS_REPLY_MIN_MESSAGES,
-    PROACTIVE_MAX_PER_HOUR,
-    INTERESTING_TOPICS,
-    QUIET_HOURS_START,
-    QUIET_HOURS_END,
-)
-from bot.utils.helpers import get_message_content, get_display_name
-from bot.utils.context import add_to_context, get_context_string
+from bot.services import memory as memory_service
 from bot.services.memory import (
-    store_recent_message, is_quiet_mode, save_group_fact, redis_client,
+    is_quiet_mode,
+    store_recent_message,
 )
 from bot.services.style import update_style_counters
-from bot.services import memory as memory_service
+from bot.utils.context import add_to_context, get_context_string
+from bot.utils.helpers import get_display_name, get_message_content
+from config import (
+    BOT_USERNAME,
+    INTERESTING_TOPICS,
+    MISTRAL_MODEL,
+    PROACTIVE_MAX_PER_HOUR,
+    QUIET_HOURS_END,
+    QUIET_HOURS_START,
+    REACTION_EMOJI,
+    REACTION_KEYWORD_BOOST,
+    REACTION_PROBABILITY,
+    SPONTANEOUS_REPLY_COOLDOWN,
+    SPONTANEOUS_REPLY_KEYWORD_BOOST,
+    SPONTANEOUS_REPLY_MIN_MESSAGES,
+    SPONTANEOUS_REPLY_PROBABILITY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,8 +150,9 @@ async def observe_and_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # Periodic cleanup of observer tracking dicts
     evict_stale_observer_data()
 
-    # 3. Maybe send a spontaneous reply
-    #    Skip if: message is from the bot itself, quiet hours, quiet mode
+    # 3. Maybe engage: emoji reaction (default, cheap) or full text reply
+    #    (opt-in via SPONTANEOUS_REPLY_PROBABILITY, default off).
+    #    Skip if: message is from the bot itself, quiet hours, hourly/cooldown caps.
     if user.username == BOT_USERNAME:
         return
     if _is_quiet_hours():
@@ -153,38 +160,53 @@ async def observe_and_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not _check_rate_ok(chat_id):
         return
 
-    # Probability check
-    probability = SPONTANEOUS_REPLY_PROBABILITY
     text_lower = text.lower()
-    if any(kw in text_lower for kw in INTERESTING_TOPICS):
-        probability += SPONTANEOUS_REPLY_KEYWORD_BOOST
+    has_keyword = any(kw in text_lower for kw in INTERESTING_TOPICS)
 
-    if random.random() > probability:
+    # Full spontaneous text reply — kept for backwards compatibility, disabled by
+    # default (SPONTANEOUS_REPLY_PROBABILITY = 0.0) since it was too noisy for the group.
+    text_probability = SPONTANEOUS_REPLY_PROBABILITY
+    if has_keyword:
+        text_probability += SPONTANEOUS_REPLY_KEYWORD_BOOST
+
+    if text_probability > 0 and random.random() < text_probability:
+        if await is_quiet_mode(chat_id):
+            return
+        thread_id = message.message_thread_id
+        conv_context = get_context_string(chat_id, thread_id)
+        comment = await _generate_spontaneous_comment(conv_context, text, user_name)
+        if comment:
+            _record_engagement(chat_id)
+            add_to_context(chat_id, "assistant", "bot", comment, thread_id=thread_id)
+            await message.reply_text(comment, reply_parameters=ReplyParameters(message_id=message.message_id))
+            logger.info(f"[spontaneous] Replied in chat {chat_id}: {comment[:60]}...")
         return
 
-    # Check quiet mode (async, so checked last to avoid Redis call on every msg)
-    if await is_quiet_mode(chat_id):
-        return
+    # Lightweight emoji reaction — the default, much less spammy engagement.
+    reaction_probability = REACTION_PROBABILITY
+    if has_keyword:
+        reaction_probability += REACTION_KEYWORD_BOOST
 
-    # Generate and send
-    thread_id = message.message_thread_id
-    conv_context = get_context_string(chat_id, thread_id)
-    comment = await _generate_spontaneous_comment(conv_context, text, user_name)
+    if random.random() < reaction_probability:
+        if await is_quiet_mode(chat_id):
+            return
+        emoji = random.choice(REACTION_EMOJI)
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=chat_id, message_id=message.message_id, reaction=emoji,
+            )
+            _record_engagement(chat_id)
+            logger.info(f"[reaction] Reacted with {emoji} in chat {chat_id}")
+        except Exception as e:
+            logger.debug(f"Reaction failed in chat {chat_id}: {e}")
 
-    if comment:
-        now = time.time()
-        _last_spontaneous[chat_id] = now
-        _messages_since_reply[chat_id] = 0
-        if chat_id not in _hourly_sends:
-            _hourly_sends[chat_id] = []
-        _hourly_sends[chat_id].append(now)
 
-        # Track the spontaneous reply in conversation context so
-        # follow-up questions can reference what the bot just said.
-        add_to_context(chat_id, "assistant", "bot", comment, thread_id=thread_id)
-
-        await message.reply_text(comment, reply_parameters=ReplyParameters(message_id=message.message_id))
-        logger.info(f"[spontaneous] Replied in chat {chat_id}: {comment[:60]}...")
+def _record_engagement(chat_id: int) -> None:
+    """Update cooldown/hourly-cap bookkeeping after any spontaneous engagement."""
+    now = time.time()
+    _last_spontaneous[chat_id] = now
+    _messages_since_reply[chat_id] = 0
+    _hourly_sends.setdefault(chat_id, []).append(now)
 
 
 async def _store_and_profile(
@@ -206,8 +228,8 @@ async def _generate_spontaneous_comment(
 
     Returns None if the LLM decides to stay silent.
     """
-    from bot.services import claude as claude_service
-    if not claude_service.mistral_client:
+    from bot.services import ai as ai_service
+    if not ai_service.mistral_client:
         return None
 
     prompt = (
@@ -220,7 +242,7 @@ async def _generate_spontaneous_comment(
     )
 
     try:
-        response = await claude_service.mistral_client.chat.complete_async(
+        response = await ai_service.mistral_client.chat.complete_async(
             model=MISTRAL_MODEL,
             max_tokens=80,
             temperature=0.7,

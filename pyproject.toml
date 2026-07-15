@@ -1,0 +1,23 @@
+[project]
+name = "tallinn-bot"
+version = "0.1.0"
+description = "Telegram helper bot for a private Tallinn friends' group"
+requires-python = ">=3.13"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 110
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # line length handled loosely — long Russian prompt strings are common here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]

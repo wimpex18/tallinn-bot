@@ -1,8 +1,8 @@
 """HTML metadata extraction and content parsing."""
 
-import re
 import json
 import logging
+import re
 
 import trafilatura
 

@@ -1,7 +1,7 @@
 """Configuration: environment variables and constants."""
 
-import os
 import logging
+import os
 
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -16,6 +16,9 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REDIS_URL = os.getenv("REDIS_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+# Random path segment for the webhook URL — intentionally independent of
+# TELEGRAM_TOKEN so the bot token never appears in Render's request logs.
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "")
 
 # ── Rate limiting ────────────────────────────────────────────────────
 RATE_LIMIT_SECONDS = 5
@@ -37,10 +40,45 @@ URL_HEAD_CHARS = 3000        # characters kept from the start (title, lead, date
 URL_TAIL_CHARS = 2000        # characters kept from the end (conclusions, contacts)
 
 # ── Mistral API ───────────────────────────────────────────────────────
-MISTRAL_MODEL = "mistral-small-latest"
+MISTRAL_MODEL = "mistral-small-latest"     # currently resolves to Mistral Small 4 (vision-capable)
 MISTRAL_TIMEOUT = 60.0
 MISTRAL_MAX_TOKENS = 1024
 MISTRAL_TEMPERATURE = 0.3
+VOXTRAL_MODEL = "voxtral-mini-latest"      # speech-to-text for voice messages
+
+# Usage observability: log a one-time warning once today's call count hits this
+# (no hard cutoff — just visibility so free-tier usage doesn't silently degrade)
+QUOTA_WARN_THRESHOLD = 300
+
+# ── Web search (Mistral Conversations API + web_search tool) ─────────
+# Explicit natural-language triggers that route a question through a live
+# web search before answering (in addition to /factcheck and /debate).
+SEARCH_TRIGGER_KEYWORDS = [
+    "найди", "найти", "поищи", "поискать", "загугли", "нагугли",
+    "search for", "search the web", "погугли",
+]
+
+# ── Debate mode ───────────────────────────────────────────────────────
+DEBATE_MODE_TTL = 1800   # 30 min — how long /debate keeps the adversarial persona active
+
+# ── Lighter engagement: emoji reactions instead of spontaneous text ──
+# Restricted to Telegram's standard (non-Premium) reaction emoji set.
+REACTION_EMOJI = ["👍", "😁", "🔥", "🤔", "😂", "👏"]
+REACTION_PROBABILITY = 0.05      # small chance per message, default ON (unlike text replies)
+REACTION_KEYWORD_BOOST = 0.10    # extra chance when INTERESTING_TOPICS keywords are present
+
+# Daily fun/icebreaker prompt (JobQueue), skipped for quiet-mode chats
+DAILY_PROMPT_HOUR = 18  # 18:00 Tallinn time — evening, likely active chat
+DAILY_PROMPTS = [
+    "Какое место в Таллинне вы бы показали другу, который приехал на один день?",
+    "Лучший бар/кафе, который вы открыли для себя за последний месяц?",
+    "Если бы пришлось переехать из Таллинна — куда и почему?",
+    "Какая эстонская привычка/традиция вас удивила больше всего?",
+    "Недооценённое место в городе, куда никто не ходит зря?",
+    "Какое блюдо эстонской кухни вы бы порекомендовали, а какое — нет?",
+    "Что бы вы изменили в Таллинне, будь у вас такая власть?",
+    "Лучшее событие/концерт, на котором вы были в этом году?",
+]
 
 # ── Telegram connection pool (critical for performance) ──────────────
 # PTB v21.9 defaults to pool_size=1 which causes severe bottlenecks.

@@ -1,19 +1,21 @@
-"""Telegram command handlers: /start, /help, /remember, /forget, /memory."""
+"""Telegram command handlers: /start, /help, /remember, /forget, /memory, and more."""
 
 import logging
 
-from telegram import Update
+from telegram import ReplyParameters, Update
 from telegram.ext import ContextTypes
 
-from config import USERNAME_TO_NAME
+from bot.services.memory import (
+    get_group_facts,
+    get_user_facts,
+    save_group_fact,
+    save_user_fact,
+)
+from bot.utils.context import clear_context, get_context_string
+from bot.utils.helpers import get_message_content, send_typing
+from config import DEBATE_MODE_TTL, USERNAME_TO_NAME
 
 logger = logging.getLogger(__name__)
-from bot.services.memory import (
-    save_user_fact, get_user_facts,
-    save_group_fact, get_group_facts,
-    redis_client,
-)
-from bot.utils.context import clear_context
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -41,11 +43,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "1. Сделай reply на любое сообщение\n"
         "2. Тэгни меня и спроси\n"
         "3. Я прочитаю сообщение + контекст разговора\n\n"
+        "Поиск в интернете: просто спроси \"найди...\", \"погугли...\" и т.д.\n\n"
         "Примеры:\n"
         "- 'это правда?'\n"
         "- 'подробнее про это'\n"
         "- 'какой вариант лучше?'\n"
         "- 'что посоветуешь из меню?'\n\n"
+        "Групповые фишки:\n"
+        "/summary или /tldr - краткое саммари последнего обсуждения\n"
+        "/debate <тема> - включить режим дебатов на 30 мин\n"
+        "/factcheck - проверить факт (reply на сообщение или /factcheck <утверждение>)\n"
+        "/poll Вопрос | Вариант 1 | Вариант 2 - создать опрос\n"
+        "/poll suggest - предложить опрос по недавнему обсуждению\n\n"
         "Память:\n"
         "/memory - посмотреть что помню\n"
         "/remember <факт> - запомнить\n"
@@ -141,32 +150,13 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(response.strip())
 
 
-async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /cleanup — remove stale Redis keys (admin only)."""
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-
-    # Only allow in private chat or by group admin
-    if update.effective_chat.type != "private":
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        if member.status not in ["creator", "administrator"]:
-            await update.message.reply_text("Только админ может это делать)")
-            return
-
-    from bot.services.memory import cleanup_stale_redis_keys
-    await update.message.reply_text("Чищу старые данные...")
-    stats = await cleanup_stale_redis_keys(max_age_days=90)
-    await update.message.reply_text(
-        f"Готово! Просканировано: {stats.get('scanned', 0)}, "
-        f"удалено: {stats.get('deleted', 0)}"
-    )
-
-
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /clear — wipe in-memory conversation context for this chat."""
+    """Handle /clear — wipe in-memory conversation context (and debate mode) for this chat."""
     chat_id = update.effective_chat.id
     thread_id = update.message.message_thread_id
     clear_context(chat_id, thread_id)
+    from bot.services.memory import clear_debate_mode
+    await clear_debate_mode(chat_id, thread_id)
     await update.message.reply_text("Контекст разговора очищен. Начинаем с чистого листа)")
 
 
@@ -192,3 +182,131 @@ async def quiet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Включил спонтанные сообщения)")
     else:
         await update.message.reply_text("Выключил спонтанные сообщения. /quiet чтобы вернуть)")
+
+
+async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /summary and /tldr — summarize recent buffered chat messages."""
+    chat_id = update.effective_chat.id
+    thread_id = update.message.message_thread_id
+
+    count = 30
+    if context.args:
+        try:
+            count = max(5, min(int(context.args[0]), 100))
+        except ValueError:
+            pass
+
+    from bot.services.ai import summarize_conversation
+    from bot.services.memory import get_recent_chat_messages
+
+    messages = await get_recent_chat_messages(chat_id, count, thread_id=thread_id)
+    if not messages:
+        await update.message.reply_text("Пока нечего суммировать — в чате было тихо.")
+        return
+
+    await send_typing(context.bot, chat_id)
+    summary = await summarize_conversation(messages)
+    await update.message.reply_text(summary)
+
+
+async def debate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /debate <topic> — bot takes an adversarial stance for a limited time."""
+    chat_id = update.effective_chat.id
+    thread_id = update.message.message_thread_id
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /debate <тема>\nНапример: /debate удалёнка лучше офиса"
+        )
+        return
+
+    topic = " ".join(context.args)[:300]
+    from bot.services.memory import set_debate_mode
+    await set_debate_mode(chat_id, topic, thread_id=thread_id, ttl=DEBATE_MODE_TTL)
+
+    minutes = DEBATE_MODE_TTL // 60
+    await update.message.reply_text(
+        f"Режим дебатов включён на {minutes} мин. Тема: «{topic}». "
+        f"Обращайся ко мне — буду топить за другую сторону) /clear чтобы выключить раньше."
+    )
+
+
+async def factcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /factcheck — verify a claim via live web search (reply or inline text)."""
+    message = update.message
+    reply_msg = message.reply_to_message
+
+    claim = " ".join(context.args) if context.args else None
+    if not claim and reply_msg:
+        claim = get_message_content(reply_msg)
+
+    if not claim:
+        await message.reply_text(
+            "Использование: ответь на сообщение командой /factcheck, "
+            "или напиши /factcheck <утверждение>"
+        )
+        return
+
+    await send_typing(context.bot, update.effective_chat.id)
+
+    from bot.services.ai import query_ai
+    from bot.services.search import search_web
+
+    search_result = await search_web(f"Проверь факт: {claim}")
+    if not search_result:
+        await message.reply_text("Не получилось проверить — попробуй позже(")
+        return
+
+    answer = await query_ai(
+        question=f"Проверь это утверждение на достоверность и дай короткий вердикт: {claim}",
+        referenced_content=search_result,
+    )
+    await message.reply_text(answer, reply_parameters=ReplyParameters(message_id=message.message_id))
+
+
+async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /poll — manual poll, or /poll suggest for an LLM-proposed one."""
+    message = update.message
+    chat_id = update.effective_chat.id
+    thread_id = message.message_thread_id
+    raw = " ".join(context.args) if context.args else ""
+
+    if raw.strip().lower() == "suggest":
+        from bot.services.ai import suggest_poll
+
+        conv_context = get_context_string(chat_id, thread_id)
+        if not conv_context:
+            await message.reply_text("Пока не с чем работать — обсудите что-нибудь, и я предложу опрос)")
+            return
+
+        await send_typing(context.bot, chat_id)
+        suggestion = await suggest_poll(conv_context)
+        if not suggestion:
+            await message.reply_text("Не придумал опрос из последнего обсуждения(")
+            return
+
+        await context.bot.send_poll(
+            chat_id=chat_id,
+            question=suggestion["question"],
+            options=suggestion["options"],
+            is_anonymous=False,
+            message_thread_id=thread_id,
+        )
+        return
+
+    parts = [p.strip() for p in raw.split("|") if p.strip()]
+    if len(parts) < 3:
+        await message.reply_text(
+            "Использование: /poll Вопрос | Вариант 1 | Вариант 2 [| Вариант 3 ...]\n"
+            "Или: /poll suggest — предложу опрос по недавнему обсуждению"
+        )
+        return
+
+    question, options = parts[0][:300], [o[:100] for o in parts[1:10]]
+    await context.bot.send_poll(
+        chat_id=chat_id,
+        question=question,
+        options=options,
+        is_anonymous=False,
+        message_thread_id=thread_id,
+    )

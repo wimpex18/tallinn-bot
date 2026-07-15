@@ -11,8 +11,8 @@ Usage inside handlers:
     timer.done()                        # logs total wall-clock time
 """
 
-import time
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 

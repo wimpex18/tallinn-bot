@@ -1,7 +1,7 @@
 """Real-time weather via wttr.in (no API key required)."""
 
-import re
 import logging
+import re
 
 import httpx
 
@@ -112,14 +112,6 @@ def extract_weather_city(text: str) -> str | None:
     return m.group(1) if m else None
 
 
-# Conditions that are always worth mentioning regardless of brevity
-_NOTABLE_CONDITIONS = {
-    "Blizzard", "Heavy snow", "Blowing snow",
-    "Heavy rain", "Moderate or heavy rain shower",
-    "Thunderstorm", "Thundery outbreaks possible",
-    "Freezing drizzle", "Freezing fog", "Ice pellets",
-}
-
 _STRONG_WIND_KMH = 30  # above this, always mention wind
 
 
@@ -148,8 +140,7 @@ async def fetch_weather(city: str = "Tallinn") -> str | None:
         temp_str = f"+{temp_c}°C" if temp_c >= 0 else f"{temp_c}°C"
         parts = [f"{temp_str}, {desc_ru}"]
 
-        # Always mention strong wind or notable conditions
-        notable = desc_en in _NOTABLE_CONDITIONS
+        # Always mention strong wind
         if wind_kmph > _STRONG_WIND_KMH:
             parts.append(f"ветер {wind_kmph} км/ч")
 
