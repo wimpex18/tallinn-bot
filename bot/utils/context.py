@@ -4,13 +4,17 @@ Context is keyed by (chat_id, thread_id) so Telegram forum topics each get
 their own isolated history.  thread_id=0 is used for non-topic chats.
 """
 
-import time
 import logging
+import time
 from collections import defaultdict
 
 from config import (
-    CONTEXT_SIZE, CONTEXT_MAX_AGE, RATE_LIMIT_MAX_AGE, EVICTION_INTERVAL,
-    CONTEXT_COMPACT_THRESHOLD, CONTEXT_COMPACT_KEEP,
+    CONTEXT_COMPACT_KEEP,
+    CONTEXT_COMPACT_THRESHOLD,
+    CONTEXT_MAX_AGE,
+    CONTEXT_SIZE,
+    EVICTION_INTERVAL,
+    RATE_LIMIT_MAX_AGE,
 )
 
 logger = logging.getLogger(__name__)

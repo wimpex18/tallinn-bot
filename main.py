@@ -5,47 +5,69 @@ Performance-critical settings applied here:
 - concurrent_updates=True  (process updates from different chats in parallel)
 - drop_pending_updates=True on webhook (clear stale backlog on restart)
 - Increased read/write/connect timeouts
-- webhook secret_token for security
+- webhook secret_token for security, random WEBHOOK_PATH (not the bot token)
 - JobQueue for proactive memory + scheduled tasks
-- Silent observer handler (group 1) for style profiling + spontaneous replies
+- Silent observer handler (group 1) for style profiling + emoji-reaction engagement
 """
 
-import os
 import datetime
+import os
+import random
+import uuid
 import zoneinfo
-import logging
 
-from mistralai.client import Mistral
 import redis.asyncio as aioredis
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from mistralai.client import Mistral
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-from config import (
-    TELEGRAM_TOKEN, MISTRAL_API_KEY, BOT_USERNAME, REDIS_URL, WEBHOOK_SECRET,
-    TELEGRAM_POOL_SIZE, TELEGRAM_POOL_TIMEOUT,
-    TELEGRAM_READ_TIMEOUT, TELEGRAM_WRITE_TIMEOUT, TELEGRAM_CONNECT_TIMEOUT,
-    PROACTIVE_MEMORY_INTERVAL,
-    QUIET_HOURS_START, QUIET_HOURS_END,
-    logger,
-)
 from bot.handlers.commands import (
-    start_command, help_command, remember_command, forget_command, memory_command,
-    cleanup_command, quiet_command, clear_command,
+    clear_command,
+    debate_command,
+    factcheck_command,
+    forget_command,
+    help_command,
+    memory_command,
+    poll_command,
+    quiet_command,
+    remember_command,
+    start_command,
+    summary_command,
 )
+from bot.handlers.errors import error_handler
 from bot.handlers.messages import handle_message
 from bot.handlers.observer import observe_and_learn
-from bot.handlers.errors import error_handler
+from bot.handlers.voice import handle_voice_message
+from bot.services import ai as ai_service
 from bot.services import memory as memory_service
-from bot.services import claude as claude_service
 from bot.services import url_fetcher as url_fetcher_service
 from bot.services.style import generate_style_summary_llm
+from config import (
+    BOT_USERNAME,
+    DAILY_PROMPT_HOUR,
+    DAILY_PROMPTS,
+    MISTRAL_API_KEY,
+    PROACTIVE_MEMORY_INTERVAL,
+    QUIET_HOURS_END,
+    QUIET_HOURS_START,
+    REDIS_URL,
+    TELEGRAM_CONNECT_TIMEOUT,
+    TELEGRAM_POOL_SIZE,
+    TELEGRAM_POOL_TIMEOUT,
+    TELEGRAM_READ_TIMEOUT,
+    TELEGRAM_TOKEN,
+    TELEGRAM_WRITE_TIMEOUT,
+    WEBHOOK_PATH,
+    WEBHOOK_SECRET,
+    logger,
+)
 
 TALLINN_TZ = zoneinfo.ZoneInfo("Europe/Tallinn")
 
@@ -156,12 +178,53 @@ async def refresh_style_profiles_job(context: ContextTypes.DEFAULT_TYPE) -> None
         logger.error(f"[job] Style profile refresh failed: {e}")
 
 
+async def daily_prompt_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Post a random icebreaker/trivia prompt once a day to recently-active chats."""
+    if not memory_service.redis_client:
+        return
+
+    logger.info("[job] Daily fun prompt starting")
+    prompt = random.choice(DAILY_PROMPTS)
+
+    try:
+        cursor = 0
+        sent = 0
+        while True:
+            cursor, keys = await memory_service.redis_client.scan(
+                cursor, match="chat:*:*:recent_msgs", count=50,
+            )
+            for key in keys:
+                parts = key.split(":")
+                if len(parts) != 4:
+                    continue
+                try:
+                    chat_id = int(parts[1])
+                except ValueError:
+                    continue
+
+                if await memory_service.is_quiet_mode(chat_id):
+                    continue
+
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=prompt)
+                    sent += 1
+                except Exception as e:
+                    logger.warning(f"[job] Daily prompt failed for chat {chat_id}: {e}")
+
+            if cursor == 0:
+                break
+        if sent:
+            logger.info(f"[job] Daily prompt sent to {sent} chat(s)")
+    except Exception as e:
+        logger.error(f"[job] Daily prompt job failed: {e}")
+
+
 # ── Client lifecycle ─────────────────────────────────────────────────
 
 async def init_clients(application) -> None:
     """Initialize global HTTP clients, async Redis, and schedule jobs."""
     # Mistral client
-    claude_service.mistral_client = Mistral(api_key=MISTRAL_API_KEY)
+    ai_service.mistral_client = Mistral(api_key=MISTRAL_API_KEY)
     logger.info("Mistral client initialized")
 
     # curl_cffi for URL fetching (browser TLS impersonation)
@@ -203,15 +266,21 @@ async def init_clients(application) -> None:
             time=datetime.time(14, 0, tzinfo=TALLINN_TZ),
             name="refresh_styles",
         )
-        logger.info("JobQueue: proactive_memory + refresh_styles scheduled")
+        # Daily fun/icebreaker prompt
+        jq.run_daily(
+            daily_prompt_job,
+            time=datetime.time(DAILY_PROMPT_HOUR, 0, tzinfo=TALLINN_TZ),
+            name="daily_prompt",
+        )
+        logger.info("JobQueue: proactive_memory + refresh_styles + daily_prompt scheduled")
     else:
         logger.warning("JobQueue not available — install python-telegram-bot[job-queue]")
 
 
 async def cleanup_clients(application) -> None:
     """Cleanup global HTTP clients and Redis on shutdown."""
-    if claude_service.mistral_client:
-        claude_service.mistral_client = None
+    if ai_service.mistral_client:
+        ai_service.mistral_client = None
     if url_fetcher_service.curl_session:
         await url_fetcher_service.curl_session.close()
     if memory_service.redis_client:
@@ -260,9 +329,13 @@ def main() -> None:
     application.add_handler(CommandHandler("remember", remember_command))
     application.add_handler(CommandHandler("forget", forget_command))
     application.add_handler(CommandHandler("memory", memory_command))
-    application.add_handler(CommandHandler("cleanup", cleanup_command))
     application.add_handler(CommandHandler("quiet", quiet_command))
     application.add_handler(CommandHandler("clear", clear_command))
+    application.add_handler(CommandHandler(["summary", "tldr"], summary_command))
+    application.add_handler(CommandHandler("debate", debate_command))
+    application.add_handler(CommandHandler("factcheck", factcheck_command))
+    application.add_handler(CommandHandler("poll", poll_command))
+    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_message))
     application.add_handler(MessageHandler(
         (filters.TEXT | filters.FORWARDED | filters.PHOTO) & ~filters.COMMAND,
         handle_message,
@@ -284,11 +357,27 @@ def main() -> None:
         port = int(os.getenv("PORT", 10000))
         webhook_url = os.getenv("WEBHOOK_URL")
 
+        # The webhook path is intentionally independent of TELEGRAM_TOKEN so the
+        # bot token never appears in Render's request logs or any proxy in front
+        # of it. Falls back to a freshly generated UUID (won't survive a restart,
+        # but WEBHOOK_SECRET below is the real access control) if unset.
+        webhook_path = WEBHOOK_PATH or uuid.uuid4().hex
+        if not WEBHOOK_PATH:
+            logger.warning(
+                "WEBHOOK_PATH not set — generated a random one for this process. "
+                "Set WEBHOOK_PATH to a fixed random value so it's stable across restarts."
+            )
+        if not WEBHOOK_SECRET:
+            logger.warning(
+                "WEBHOOK_SECRET is not set — the webhook endpoint will accept unauthenticated "
+                "requests from anyone who discovers the URL. Set WEBHOOK_SECRET before going live."
+            )
+
         webhook_kwargs = {
             "listen": "0.0.0.0",
             "port": port,
-            "url_path": TELEGRAM_TOKEN,
-            "webhook_url": f"{webhook_url}/{TELEGRAM_TOKEN}",
+            "url_path": webhook_path,
+            "webhook_url": f"{webhook_url}/{webhook_path}",
             "drop_pending_updates": True,
         }
         if WEBHOOK_SECRET:

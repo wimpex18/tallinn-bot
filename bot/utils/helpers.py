@@ -1,13 +1,13 @@
 """URL extraction, rate limiting, and misc helpers."""
 
-import re
-import time
 import base64
 import logging
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import re
+import time
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-from config import RATE_LIMIT_SECONDS, USERNAME_TO_NAME
 from bot.utils.context import user_last_query
+from config import RATE_LIMIT_SECONDS, USERNAME_TO_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +149,35 @@ def is_forwarded_message(message) -> bool:
     if not message:
         return False
     return message.forward_origin is not None
+
+
+def get_forward_origin_info(message) -> str | None:
+    """Describe where a forwarded message originally came from, if known.
+
+    Returns e.g. "[Forwarded from channel: Meduza (@meduzalive)]" or
+    "[Forwarded from Иван]" — None if the message isn't forwarded or Telegram
+    didn't expose origin info (e.g. the original sender hid their identity).
+    """
+    if not message or not message.forward_origin:
+        return None
+    origin = message.forward_origin
+    origin_type = getattr(origin, "type", None)
+
+    if origin_type == "channel":
+        chat = origin.chat
+        handle = f" (@{chat.username})" if chat.username else ""
+        return f"[Forwarded from channel: {chat.title}{handle}]"
+    if origin_type == "chat":
+        chat = origin.sender_chat
+        handle = f" (@{chat.username})" if chat.username else ""
+        return f"[Forwarded from: {chat.title}{handle}]"
+    if origin_type == "user":
+        user = origin.sender_user
+        name = get_display_name(user) or user.first_name or "unknown"
+        return f"[Forwarded from {name}]"
+    if origin_type == "hidden_user":
+        return f"[Forwarded from {origin.sender_user_name}]"
+    return None
 
 
 def has_photo(message) -> bool:
