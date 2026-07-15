@@ -16,6 +16,17 @@ _BOT_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A phrase inside quotes is being mentioned/quoted, not issued as a command —
+# e.g. an announcement listing example phrases like «сделай саммари» shouldn't
+# itself trigger a summary, and a message quoting "найди" as an example
+# shouldn't fire a real web search. Blank quoted spans out before keyword
+# matching (same length, so index math elsewhere stays valid).
+_QUOTE_SPAN_RE = re.compile(r'«[^»]+»|"[^"]+"|“[^”]+”|„[^“]+“')
+
+
+def mask_quoted_spans(text: str) -> str:
+    return _QUOTE_SPAN_RE.sub(lambda m: " " * len(m.group(0)), text)
+
 
 # ── Rate limiting ────────────────────────────────────────────────────
 

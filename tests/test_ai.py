@@ -77,6 +77,32 @@ async def test_query_ai_no_client_returns_friendly_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_query_ai_system_prompt_includes_current_date(monkeypatch):
+    fake_client = _make_fake_client()
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    await ai.query_ai(question="какой сегодня день?")
+
+    system_text = fake_client.chat.complete_async.call_args.kwargs["messages"][0]["content"]
+    import datetime
+    now = datetime.datetime.now(ai._TALLINN_TZ)
+    assert now.strftime("%d.%m.%Y") in system_text
+    assert ai._RU_WEEKDAYS[now.weekday()] in system_text
+
+
+@pytest.mark.asyncio
+async def test_query_ai_system_prompt_allows_sharing_sources(monkeypatch):
+    fake_client = _make_fake_client()
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    await ai.query_ai(question="проверь факт про Х")
+
+    system_text = fake_client.chat.complete_async.call_args.kwargs["messages"][0]["content"]
+    assert "ИСТОЧНИКИ" in system_text
+    assert "Sources:" in system_text
+
+
+@pytest.mark.asyncio
 async def test_query_ai_system_prompt_defines_witty_not_thuggish_persona(monkeypatch):
     fake_client = _make_fake_client()
     monkeypatch.setattr(ai, "mistral_client", fake_client)

@@ -12,6 +12,7 @@ from bot.utils.helpers import (
     get_forward_origin_info,
     get_message_content,
     is_forwarded_message,
+    mask_quoted_spans,
     mentions_bot_by_name,
     set_rate_limit,
 )
@@ -157,3 +158,26 @@ def test_mentions_bot_by_name_no_match_unrelated_text():
 def test_mentions_bot_by_name_empty_text():
     assert mentions_bot_by_name("") is False
     assert mentions_bot_by_name(None) is False
+
+
+def test_mask_quoted_spans_blanks_guillemets():
+    masked = mask_quoted_spans("можно попросить «сделай саммари» или «сделай опрос»")
+    assert "саммари" not in masked
+    assert "сделай опрос" not in masked
+    assert "можно попросить" in masked
+
+
+def test_mask_quoted_spans_blanks_straight_double_quotes():
+    masked = mask_quoted_spans('команда "найди бар" сработает')
+    assert "найди" not in masked
+
+
+def test_mask_quoted_spans_preserves_length_for_index_math():
+    text = 'что-то «сделай саммари» ещё текст'
+    masked = mask_quoted_spans(text)
+    assert len(masked) == len(text)
+
+
+def test_mask_quoted_spans_leaves_unquoted_text_untouched():
+    text = "давай поспорим про удалёнку"
+    assert mask_quoted_spans(text) == text

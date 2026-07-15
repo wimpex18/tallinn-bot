@@ -165,14 +165,20 @@ client — nothing hits a live Telegram or Mistral connection.
 
 - `config.py` — every tunable constant lives here (rate limits, TTLs, prompts, keyword lists).
 - `bot/services/ai.py` — the Mistral client, main `query_ai()` entry point (streaming + blocking),
-  plus `summarize_conversation()`, `suggest_poll()`, and `classify_intent()`.
+  plus `summarize_conversation()`, `suggest_poll()`, and `classify_intent()`. Every call injects the
+  current date/day-of-week (Europe/Tallinn) into the system prompt, so date-relative reasoning
+  ("сегодня"/"завтра", how recent something actually is) is grounded instead of guessed.
 - `bot/services/intent.py` — decides whether a plain-language message means "run /summary" (etc.)
   in three tiers: (1) a specific phrase match ("о чём говорили", "сделай опрос") resolves for free,
   no LLM call; (2) no phrase match and no loose signal word either — the common case, plain chat —
   returns `None` for free, same cost as today; (3) a loose signal word is present but no clean
   phrase match (e.g. "дебат" appears but not in a recognized trigger) — spends one extra Mistral
   call (`ai.classify_intent`) to disambiguate and to fill in a topic/claim a phrase match found the
-  trigger for but not the parameter (e.g. "давай поспорим" with no topic in the sentence).
+  trigger for but not the parameter (e.g. "давай поспорим" with no topic in the sentence). Phrase
+  matching first runs `bot/utils/helpers.py::mask_quoted_spans()` — a phrase in quotes is being
+  mentioned, not issued as a command (e.g. an announcement listing usage examples like «сделай
+  саммари» shouldn't itself trigger one) — and matches require a leading word boundary so a keyword
+  can't false-fire as a substring buried inside an unrelated word.
 - `bot/handlers/actions.py` — `do_summary()`/`do_debate()`/`do_factcheck()`/`do_poll_suggest()`, the
   actual work behind those four commands, called both by `bot/handlers/commands.py`'s slash-command
   handlers (parsing `context.args`) and by `messages.py`'s natural-language routing (parsing
@@ -181,6 +187,8 @@ client — nothing hits a live Telegram or Mistral connection.
   (`beta.conversations.start_async` with a `WebSearchTool`), *not* Chat Completions — Mistral's
   `web_search` connector is only available there, which is why it's a separate call whose result
   gets fed back into `query_ai()` as `referenced_content`, the same pattern used for weather data.
+  `is_search_trigger()` uses the same `mask_quoted_spans()` + word-boundary matching as
+  `intent.py`, for the same reason — a quoted example shouldn't fire a real (costly) search.
 - `bot/services/url_fetcher.py` — fetches shared links in three tiers: (1) `curl_cffi` with browser
   TLS/JA3 impersonation (`IMPERSONATE_PROFILES` in `config.py`, tried in parallel, generic
   `"chrome"`/`"safari"` aliases so they always track the latest supported browser fingerprint); (2) if
