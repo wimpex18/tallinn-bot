@@ -122,6 +122,32 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"  # WEBHOOK_SECRET
 Both are optional (the bot falls back to a per-process random path and logs a warning), but should
 be set for any real deployment.
 
+### Free-tier spin-down (messages silently lost)
+
+Render's free web-service plan stops the process after ~15 minutes with no incoming HTTP traffic,
+and cold-starting it back up takes 20-30+ seconds. Because the bot runs in **webhook** mode on
+Render, a message that arrives while it's asleep (or during that boot window) can fail to be
+delivered at all — `run_webhook(..., drop_pending_updates=True)` means anything that piles up while
+the process is down gets discarded on restart rather than replayed, and Telegram's own webhook
+retry window is short. From the outside this looks exactly like "the bot stopped responding":
+Telegram still marks your message delivered (it reached the webhook endpoint or was queued for
+retry), but nothing ever processes it.
+
+Fix (free, a few minutes of setup):
+1. Set a **fixed** `WEBHOOK_PATH` and `WEBHOOK_SECRET` as real Render env vars (see above) — without
+   a fixed path, it's a fresh random value every restart, so nothing external can reliably target it.
+2. Point a free uptime monitor (e.g. [UptimeRobot](https://uptimerobot.com/),
+   [cron-job.org](https://cron-job.org/)) at `https://<your-app>.onrender.com/<WEBHOOK_PATH>` on a
+   ~10 minute interval, configured to treat **any** response as "up" (not just 200). Telegram
+   webhooks only accept `POST`, so a monitor's `GET`/`HEAD` check will get back a `405` — that's
+   expected and fine, it's still real HTTP traffic reaching the port, which is all Render checks for
+   to keep a free service warm. (There's no supported way to bolt a separate `/health` route onto
+   python-telegram-bot's webhook server — it's a fixed single-route Tornado app internally — so
+   pinging the existing webhook path is the simplest option that doesn't touch PTB internals.)
+
+If losing an occasional message is unacceptable, the only complete fix is a paid Render plan
+(e.g. Starter) — those don't spin down.
+
 ## Deployment
 
 Render is the only deployment tool this project uses — there's no separate CD pipeline. `render.yaml`
