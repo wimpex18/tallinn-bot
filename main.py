@@ -19,7 +19,7 @@ import zoneinfo
 import redis.asyncio as aioredis
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from mistralai.client import Mistral
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -74,6 +74,24 @@ from config import (
 )
 
 TALLINN_TZ = zoneinfo.ZoneInfo("Europe/Tallinn")
+
+BOT_COMMANDS = [
+    BotCommand("start", "Начать"),
+    BotCommand("help", "Помощь и список команд"),
+    BotCommand("summary", "Краткое саммари обсуждения"),
+    BotCommand("tldr", "То же, что /summary"),
+    BotCommand("debate", "Включить режим дебатов"),
+    BotCommand("factcheck", "Проверить факт"),
+    BotCommand("poll", "Создать опрос"),
+    BotCommand("quiz", "Викторина с вариантами ответов"),
+    BotCommand("quote", "Сохранить цитату (в ответ на сообщение)"),
+    BotCommand("quotes", "Показать случайную цитату"),
+    BotCommand("remember", "Запомнить факт"),
+    BotCommand("forget", "Забыть всё"),
+    BotCommand("memory", "Что я помню"),
+    BotCommand("clear", "Очистить контекст"),
+    BotCommand("quiet", "Вкл/выкл спонтанные реакции"),
+]
 
 
 # ── Scheduled jobs ───────────────────────────────────────────────────
@@ -230,6 +248,14 @@ async def init_clients(application) -> None:
     # Mistral client
     ai_service.mistral_client = Mistral(api_key=MISTRAL_API_KEY)
     logger.info("Mistral client initialized")
+
+    # Sync the Telegram command menu (BotFather list) with our handlers,
+    # so newly added commands show up without manual BotFather edits.
+    try:
+        await application.bot.set_my_commands(BOT_COMMANDS)
+        logger.info("Command menu synced with Telegram (set_my_commands)")
+    except Exception as e:
+        logger.warning(f"Failed to sync command menu: {e}")
 
     # curl_cffi for URL fetching (browser TLS impersonation)
     url_fetcher_service.curl_session = CurlAsyncSession(
