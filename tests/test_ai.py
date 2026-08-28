@@ -259,6 +259,39 @@ async def test_query_ai_debate_topic_adds_system_addendum(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_query_ai_defaults_to_low_reasoning_effort(monkeypatch):
+    fake_client = _make_fake_client()
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    await ai.query_ai(question="как дела?")
+
+    kwargs = fake_client.chat.complete_async.call_args.kwargs
+    assert kwargs["reasoning_effort"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_query_ai_debate_mode_bumps_reasoning_effort(monkeypatch):
+    fake_client = _make_fake_client()
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    await ai.query_ai(question="что думаешь?", debate_topic="удалёнка лучше офиса")
+
+    kwargs = fake_client.chat.complete_async.call_args.kwargs
+    assert kwargs["reasoning_effort"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_query_ai_respects_explicit_reasoning_effort(monkeypatch):
+    fake_client = _make_fake_client()
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    await ai.query_ai(question="проверь факт", reasoning_effort="medium")
+
+    kwargs = fake_client.chat.complete_async.call_args.kwargs
+    assert kwargs["reasoning_effort"] == "medium"
+
+
+@pytest.mark.asyncio
 async def test_summarize_conversation_empty_messages():
     result = await ai.summarize_conversation([])
     assert "нечего" in result.lower()
@@ -301,6 +334,60 @@ async def test_suggest_poll_returns_none_when_no_topic_found(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_suggest_quiz_parses_valid_json(monkeypatch):
+    client = _make_fake_client(
+        '{"question": "Столица Эстонии?", "options": ["Таллинн", "Тарту", "Нарва", "Пярну"], '
+        '"correct_option_id": 0}',
+    )
+    monkeypatch.setattr(ai, "mistral_client", client)
+
+    result = await ai.suggest_quiz("Эстония")
+
+    assert result == {
+        "question": "Столица Эстонии?",
+        "options": ["Таллинн", "Тарту", "Нарва", "Пярну"],
+        "correct_option_id": 0,
+    }
+    kwargs = client.chat.complete_async.call_args.kwargs
+    assert kwargs["response_format"] == {"type": "json_object"}
+    assert "Эстония" in kwargs["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_suggest_quiz_no_topic_uses_general_prompt(monkeypatch):
+    client = _make_fake_client('{"question": "Q?", "options": ["A", "B"], "correct_option_id": 1}')
+    monkeypatch.setattr(ai, "mistral_client", client)
+
+    result = await ai.suggest_quiz()
+
+    assert result["correct_option_id"] == 1
+    kwargs = client.chat.complete_async.call_args.kwargs
+    assert "Таллинн" in kwargs["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_suggest_quiz_rejects_out_of_range_correct_id(monkeypatch):
+    client = _make_fake_client('{"question": "Q?", "options": ["A", "B"], "correct_option_id": 5}')
+    monkeypatch.setattr(ai, "mistral_client", client)
+
+    assert await ai.suggest_quiz() is None
+
+
+@pytest.mark.asyncio
+async def test_suggest_quiz_returns_none_on_invalid_json(monkeypatch):
+    client = _make_fake_client("not json")
+    monkeypatch.setattr(ai, "mistral_client", client)
+
+    assert await ai.suggest_quiz() is None
+
+
+@pytest.mark.asyncio
+async def test_suggest_quiz_no_client_returns_none(monkeypatch):
+    monkeypatch.setattr(ai, "mistral_client", None)
+    assert await ai.suggest_quiz() is None
+
+
+@pytest.mark.asyncio
 async def test_classify_intent_parses_debate_action(monkeypatch):
     client = _make_fake_client('{"action": "debate", "topic": "IPA vs lager", "claim": null}')
     monkeypatch.setattr(ai, "mistral_client", client)
@@ -309,6 +396,15 @@ async def test_classify_intent_parses_debate_action(monkeypatch):
     assert result == {"action": "debate", "topic": "IPA vs lager", "claim": None}
     kwargs = client.chat.complete_async.call_args.kwargs
     assert kwargs["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_classify_intent_parses_quiz_action(monkeypatch):
+    client = _make_fake_client('{"action": "quiz", "topic": "Эстония", "claim": null}')
+    monkeypatch.setattr(ai, "mistral_client", client)
+
+    result = await ai.classify_intent("устроим что-то типа викторинки?")
+    assert result == {"action": "quiz", "topic": "Эстония", "claim": None}
 
 
 @pytest.mark.asyncio

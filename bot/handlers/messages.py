@@ -229,6 +229,9 @@ async def _process_message(
         if intent.action == "poll":
             await action_handlers.do_poll_suggest(update, context)
             return
+        if intent.action == "quiz":
+            await action_handlers.do_quiz(update, context, intent.topic)
+            return
         # Resolved to debate/factcheck but couldn't pin down a topic/claim —
         # fall through to a normal conversational reply rather than a
         # command-usage hint; a natural sentence that doesn't fully qualify

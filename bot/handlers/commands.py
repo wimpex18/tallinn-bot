@@ -6,13 +6,16 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from bot.services.memory import (
+    get_all_quotes,
     get_group_facts,
+    get_random_quote,
     get_user_facts,
     save_group_fact,
+    save_quote,
     save_user_fact,
 )
 from bot.utils.context import clear_context
-from bot.utils.helpers import get_message_content
+from bot.utils.helpers import get_display_name, get_message_content
 from config import USERNAME_TO_NAME
 
 logger = logging.getLogger(__name__)
@@ -54,7 +57,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/debate <тема> - режим дебатов на 30 мин (\"давай поспорим про удалёнку\")\n"
         "/factcheck - проверить факт (\"проверь, правда ли что...\")\n"
         "/poll Вопрос | Вариант 1 | Вариант 2 - создать опрос вручную\n"
-        "/poll suggest - предложить опрос по обсуждению (\"сделай опрос\")\n\n"
+        "/poll suggest - предложить опрос по обсуждению (\"сделай опрос\")\n"
+        "/quiz [тема] - викторина с вариантами ответа (\"устрой викторину про Таллинн\")\n\n"
+        "Ответь голосом: скажи \"ответь голосом\" — если настроено (см. README), пришлю ещё и голосовое.\n\n"
+        "Книга цитат:\n"
+        "/quote - ответь этой командой на смешное сообщение, чтобы сохранить его\n"
+        "/quotes - показать случайную сохранённую цитату\n"
+        "/quotes list - показать последние сохранённые цитаты\n\n"
         "Память:\n"
         "/memory - посмотреть что помню\n"
         "/remember <факт> - запомнить\n"
@@ -277,3 +286,58 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         allows_revoting=True,
         message_thread_id=thread_id,
     )
+
+
+async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /quiz [topic] — generate and send a native Telegram quiz question."""
+    topic = " ".join(context.args) if context.args else None
+    from bot.handlers.actions import do_quiz
+    await do_quiz(update, context, topic)
+
+
+async def quote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /quote — reply to a message to save it in the group's quote book."""
+    message = update.message
+    reply_msg = message.reply_to_message
+
+    if update.effective_chat.type == "private":
+        await message.reply_text("Книга цитат — это для группового чата)")
+        return
+
+    if not reply_msg:
+        await message.reply_text("Ответь этой командой на сообщение, которое хочешь сохранить как цитату)")
+        return
+
+    content = get_message_content(reply_msg)
+    if not content:
+        await message.reply_text("Не получилось сохранить — в сообщении нет текста(")
+        return
+
+    author = get_display_name(reply_msg.from_user) if reply_msg.from_user else None
+    quote = f"{author}: {content}" if author else content
+
+    await save_quote(update.effective_chat.id, quote[:500])
+    await message.reply_text("Сохранил в книгу цитат)")
+
+
+async def quotes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /quotes — show a random saved quote, or /quotes list for the recent ones."""
+    message = update.message
+    chat_id = update.effective_chat.id
+
+    if context.args and context.args[0].lower() == "list":
+        quotes = await get_all_quotes(chat_id, limit=10)
+        if not quotes:
+            await message.reply_text("Пока ни одной цитаты не сохранено)")
+            return
+        text = "\n\n".join(f"— {q}" for q in quotes)
+        await message.reply_text(f"Последние цитаты:\n\n{text}")
+        return
+
+    quote = await get_random_quote(chat_id)
+    if not quote:
+        await message.reply_text(
+            "Пока ни одной цитаты не сохранено. Ответь на смешное сообщение командой /quote)"
+        )
+        return
+    await message.reply_text(f"— {quote}")

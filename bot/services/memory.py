@@ -7,6 +7,7 @@ untouched keys on its own, so there is no separate cleanup job to run.
 
 import json
 import logging
+import random
 import re
 import time
 from datetime import UTC
@@ -74,6 +75,56 @@ async def get_group_facts(chat_id: int) -> list[str]:
         return await redis_client.zrange(f"group:{chat_id}:facts", 0, -1)
     except Exception as e:
         logger.error(f"Failed to get group facts: {e}")
+        return []
+
+
+# ── Saved quotes (per group, on-demand only — never posted unprompted) ──
+
+_MAX_QUOTES_KEPT = 100
+
+
+async def save_quote(chat_id: int, quote: str) -> None:
+    """Save a memorable quote for the group (sorted set, newest kept, max 100)."""
+    if not redis_client or not quote:
+        return
+    try:
+        key = f"group:{chat_id}:quotes"
+        pipe = redis_client.pipeline()
+        pipe.zadd(key, {quote: time.time()})
+        pipe.expire(key, _KEY_TTL_SECONDS)
+        await pipe.execute()
+        count = await redis_client.zcard(key)
+        if count > _MAX_QUOTES_KEPT:
+            await redis_client.zremrangebyrank(key, 0, -(_MAX_QUOTES_KEPT + 1))
+    except Exception as e:
+        logger.error(f"Failed to save quote: {e}")
+
+
+async def get_random_quote(chat_id: int) -> str | None:
+    """Get one random saved quote for the group, or None if none are saved."""
+    if not redis_client:
+        return None
+    try:
+        key = f"group:{chat_id}:quotes"
+        count = await redis_client.zcard(key)
+        if not count:
+            return None
+        idx = random.randint(0, count - 1)
+        result = await redis_client.zrange(key, idx, idx)
+        return result[0] if result else None
+    except Exception as e:
+        logger.error(f"Failed to get random quote: {e}")
+        return None
+
+
+async def get_all_quotes(chat_id: int, limit: int = 10) -> list[str]:
+    """Get saved quotes for the group, newest first, capped at `limit`."""
+    if not redis_client:
+        return []
+    try:
+        return await redis_client.zrevrange(f"group:{chat_id}:quotes", 0, limit - 1)
+    except Exception as e:
+        logger.error(f"Failed to get quotes: {e}")
         return []
 
 

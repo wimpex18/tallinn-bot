@@ -54,7 +54,7 @@ VOXTRAL_MODEL = "voxtral-mini-latest"      # speech-to-text for voice messages
 # see bot/services/speech.py). Off unless VOXTRAL_TTS_VOICE_ID is set to a
 # voice id from your Mistral account (console.mistral.ai → Voices, preset or
 # custom) — there's no default, since the API requires a real voice id.
-VOXTRAL_TTS_MODEL = "voxtral-mini-tts-2603"
+VOXTRAL_TTS_MODEL = "voxtral-mini-tts-latest"
 VOXTRAL_TTS_VOICE_ID = os.getenv("VOXTRAL_TTS_VOICE_ID", "")
 VOICE_REPLY_TRIGGER_KEYWORDS = ["ответь голосом", "скажи голосом", "запиши голосовое", "voice reply"]
 
@@ -98,6 +98,9 @@ INTENT_STRONG_POLL = [
     "давайте проголосуем", "сделай голосование", "заведи опрос",
 ]
 INTENT_WEAK_POLL = ["опрос", "голосование", "проголосу"]
+
+INTENT_STRONG_QUIZ = ["устрой викторину", "сделай викторину", "давай викторину", "хочу викторину"]
+INTENT_WEAK_QUIZ = ["викторин", "quiz"]
 
 # ── Debate mode ───────────────────────────────────────────────────────
 DEBATE_MODE_TTL = 1800   # 30 min — how long /debate keeps the adversarial persona active

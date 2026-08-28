@@ -29,6 +29,40 @@ async def test_strong_poll_trigger_no_llm_call(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_strong_quiz_trigger_no_topic_no_llm_call(monkeypatch):
+    classify_mock = AsyncMock()
+    monkeypatch.setattr(ai_module, "classify_intent", classify_mock)
+
+    result = await detect_action_intent("давай викторину", None)
+
+    assert result == Intent("quiz")
+    classify_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_strong_quiz_trigger_with_topic_no_llm_call(monkeypatch):
+    classify_mock = AsyncMock()
+    monkeypatch.setattr(ai_module, "classify_intent", classify_mock)
+
+    result = await detect_action_intent("устрой викторину про Таллинн", None)
+
+    assert result.action == "quiz"
+    assert result.topic == "Таллинн"
+    classify_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_weak_quiz_signal_falls_through_to_llm(monkeypatch):
+    classify_mock = AsyncMock(return_value={"action": "quiz", "topic": None, "claim": None})
+    monkeypatch.setattr(ai_module, "classify_intent", classify_mock)
+
+    result = await detect_action_intent("может замутим викторинку какую-нибудь?", None)
+
+    classify_mock.assert_called_once()
+    assert result.action == "quiz"
+
+
+@pytest.mark.asyncio
 async def test_strong_debate_trigger_with_topic_no_llm_call(monkeypatch):
     classify_mock = AsyncMock()
     monkeypatch.setattr(ai_module, "classify_intent", classify_mock)

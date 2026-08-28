@@ -1,4 +1,4 @@
-"""Shared action execution for /summary, /debate, /factcheck, and /poll suggest.
+"""Shared action execution for /summary, /debate, /factcheck, /poll suggest, and /quiz.
 
 Used both by the literal slash commands (bot/handlers/commands.py, which parse
 context.args/reply_to_message and delegate here) and by natural-language
@@ -68,6 +68,7 @@ async def do_factcheck(update: Update, context: ContextTypes.DEFAULT_TYPE, claim
     answer = await query_ai(
         question=f"Проверь это утверждение на достоверность и дай короткий вердикт: {claim}",
         referenced_content=search_result,
+        reasoning_effort="medium",
     )
     await message.reply_text(answer, reply_parameters=ReplyParameters(message_id=message.message_id))
 
@@ -97,5 +98,30 @@ async def do_poll_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         options=suggestion["options"],
         is_anonymous=False,
         allows_revoting=True,
+        message_thread_id=thread_id,
+    )
+
+
+async def do_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE, topic: str = None) -> None:
+    """Generate and send a native Telegram quiz question, optionally on `topic`."""
+    message = update.message
+    chat_id = update.effective_chat.id
+    thread_id = message.message_thread_id
+
+    from bot.services.ai import suggest_quiz
+
+    await send_typing(context.bot, chat_id)
+    quiz = await suggest_quiz(topic)
+    if not quiz:
+        await message.reply_text("Не придумал вопрос для викторины, попробуй ещё раз)")
+        return
+
+    await context.bot.send_poll(
+        chat_id=chat_id,
+        question=quiz["question"],
+        options=quiz["options"],
+        type="quiz",
+        correct_option_id=quiz["correct_option_id"],
+        is_anonymous=False,
         message_thread_id=thread_id,
     )
