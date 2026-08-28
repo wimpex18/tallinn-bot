@@ -188,9 +188,11 @@ client — nothing hits a live Telegram or Mistral connection.
   `classify_intent()`. Injects the current date/day-of-week (Europe/Tallinn) into the system prompt
   on every call. All JSON-returning calls pass `response_format={"type": "json_object"}` (Mistral's
   structured-output mode) rather than only asking for JSON in the prompt text. Takes a
-  `reasoning_effort` param ("none" through "xhigh" — Mistral Small 4 unifies fast chat and deep
-  reasoning via this one parameter); defaults to `"low"` for quick casual replies, `"medium"` for
-  debate mode and fact-checking.
+  `reasoning_effort` param — Mistral Small 4 unifies fast chat and deep reasoning via this one
+  parameter. The SDK's type hints suggest a 5-level scale, but the live model currently only accepts
+  `"none"` or `"high"` (confirmed via a real 400 in production when `"low"` was tried — don't reuse
+  the wider scale without checking against a live key first). Defaults to `"none"` for quick casual
+  replies, `"high"` for debate mode and fact-checking.
 - `bot/services/intent.py` — natural-language routing for summary/debate/factcheck/poll/quiz, in
   three tiers: (1) a specific phrase match resolves for free, no LLM call; (2) no phrase match and no
   loose signal word — the common case, plain chat — returns `None` for free; (3) a loose signal word

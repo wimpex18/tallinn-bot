@@ -141,7 +141,7 @@ async def query_ai(
     telegram_message_id: int = None,
     debate_topic: str = None,
     last_reply_different_user: str = None,
-    reasoning_effort: str = "low",
+    reasoning_effort: str = "none",
 ) -> str:
     """Query Mistral with multi-turn context, memory, and optional streaming.
 
@@ -150,16 +150,18 @@ async def query_ai(
     The final cleaned text is always returned so callers can store it in context.
 
     reasoning_effort: Mistral Small 4 unifies fast chat and deep reasoning in
-    one model via this parameter ("none"/"low"/"medium"/"high"/"xhigh").
-    Defaults to "low" to keep casual chat quick and match this bot's terse
-    persona; callers doing something that actually benefits from more
-    careful reasoning (fact-checking, debate) pass a higher value. Debate
-    mode bumps itself to "medium" below regardless of what's passed in,
-    since arguing a position well needs more than a quick reflex answer.
+    one model via this parameter. The SDK's type hints suggest a 5-level scale
+    ("none"/"low"/"medium"/"high"/"xhigh"), but the live model currently only
+    accepts "none" or "high" — confirmed via a real 400 from the API ("Must
+    be one of (none, high)") when "low" was tried in production. Defaults to
+    "none" to keep casual chat quick and match this bot's terse persona;
+    debate mode bumps itself to "high" below, and do_factcheck() passes
+    "high" explicitly, since both benefit from more than a quick reflex
+    answer.
     """
     t0 = time.monotonic()
-    if debate_topic and reasoning_effort == "low":
-        reasoning_effort = "medium"
+    if debate_topic and reasoning_effort == "none":
+        reasoning_effort = "high"
 
     # ── System prompt ─────────────────────────────────────────────
     _STATIC_SYSTEM = (
@@ -394,7 +396,7 @@ async def query_ai(
         return err
 
 
-async def _blocking_response(client: Mistral, messages: list[dict], reasoning_effort: str = "low") -> str:
+async def _blocking_response(client: Mistral, messages: list[dict], reasoning_effort: str = "none") -> str:
     """Non-streaming Mistral call — returns the full response text."""
     response = await client.chat.complete_async(
         model=MISTRAL_MODEL,
@@ -413,7 +415,7 @@ async def _stream_response(
     telegram_bot,
     chat_id: int,
     message_id: int,
-    reasoning_effort: str = "low",
+    reasoning_effort: str = "none",
 ) -> str:
     """Stream Mistral response and pipe chunks into Telegram via editMessageText."""
     accumulated = ""

@@ -81,7 +81,7 @@ async def test_do_factcheck_replies_with_verdict(monkeypatch):
 
     update.message.reply_text.assert_called_once()
     assert update.message.reply_text.call_args.args[0] == "Похоже на правду"
-    assert ai_module.query_ai.call_args.kwargs["reasoning_effort"] == "medium"
+    assert ai_module.query_ai.call_args.kwargs["reasoning_effort"] == "high"
 
 
 @pytest.mark.asyncio

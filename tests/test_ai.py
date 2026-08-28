@@ -259,14 +259,14 @@ async def test_query_ai_debate_topic_adds_system_addendum(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_query_ai_defaults_to_low_reasoning_effort(monkeypatch):
+async def test_query_ai_defaults_to_none_reasoning_effort(monkeypatch):
     fake_client = _make_fake_client()
     monkeypatch.setattr(ai, "mistral_client", fake_client)
 
     await ai.query_ai(question="как дела?")
 
     kwargs = fake_client.chat.complete_async.call_args.kwargs
-    assert kwargs["reasoning_effort"] == "low"
+    assert kwargs["reasoning_effort"] == "none"
 
 
 @pytest.mark.asyncio
@@ -277,7 +277,7 @@ async def test_query_ai_debate_mode_bumps_reasoning_effort(monkeypatch):
     await ai.query_ai(question="что думаешь?", debate_topic="удалёнка лучше офиса")
 
     kwargs = fake_client.chat.complete_async.call_args.kwargs
-    assert kwargs["reasoning_effort"] == "medium"
+    assert kwargs["reasoning_effort"] == "high"
 
 
 @pytest.mark.asyncio
@@ -285,10 +285,10 @@ async def test_query_ai_respects_explicit_reasoning_effort(monkeypatch):
     fake_client = _make_fake_client()
     monkeypatch.setattr(ai, "mistral_client", fake_client)
 
-    await ai.query_ai(question="проверь факт", reasoning_effort="medium")
+    await ai.query_ai(question="проверь факт", reasoning_effort="high")
 
     kwargs = fake_client.chat.complete_async.call_args.kwargs
-    assert kwargs["reasoning_effort"] == "medium"
+    assert kwargs["reasoning_effort"] == "high"
 
 
 @pytest.mark.asyncio
