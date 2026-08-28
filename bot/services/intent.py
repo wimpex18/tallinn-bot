@@ -1,4 +1,4 @@
-"""Hybrid natural-language intent routing for /summary, /debate, /factcheck, /poll.
+"""Hybrid natural-language intent routing for /summary, /debate, /factcheck, /poll, /quiz.
 
 Three tiers, in order — see README's "Architecture notes" for the rationale:
 
@@ -20,10 +20,12 @@ from config import (
     INTENT_STRONG_DEBATE,
     INTENT_STRONG_FACTCHECK,
     INTENT_STRONG_POLL,
+    INTENT_STRONG_QUIZ,
     INTENT_STRONG_SUMMARY,
     INTENT_WEAK_DEBATE,
     INTENT_WEAK_FACTCHECK,
     INTENT_WEAK_POLL,
+    INTENT_WEAK_QUIZ,
     INTENT_WEAK_SUMMARY,
 )
 
@@ -93,6 +95,11 @@ async def detect_action_intent(question: str, conv_context: str = None) -> Inten
     if _matches_any(text_lower, INTENT_STRONG_POLL):
         return Intent("poll")
 
+    quiz_trigger = _first_match(text_lower, INTENT_STRONG_QUIZ)
+    if quiz_trigger:
+        topic = _extract_remainder(text_lower, question, quiz_trigger)
+        return Intent("quiz", topic=topic or None)
+
     debate_trigger = _first_match(text_lower, INTENT_STRONG_DEBATE)
     if debate_trigger:
         topic = _extract_remainder(text_lower, question, debate_trigger)
@@ -117,6 +124,7 @@ async def detect_action_intent(question: str, conv_context: str = None) -> Inten
         or _matches_any(text_lower, INTENT_WEAK_DEBATE)
         or _matches_any(text_lower, INTENT_WEAK_FACTCHECK)
         or _matches_any(text_lower, INTENT_WEAK_POLL)
+        or _matches_any(text_lower, INTENT_WEAK_QUIZ)
         or debate_trigger is not None
         or factcheck_trigger is not None
     )

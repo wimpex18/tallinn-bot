@@ -5,60 +5,63 @@ analysis, weather, debate facilitation, and persistent memory of the group's run
 
 ## How it works
 
-**Framework:** [python-telegram-bot](https://docs.python-telegram-bot.org/) 22.8 (async), running on
-Python 3.14, deployed on [Render](https://render.com/) (webhook in production, long polling locally).
+**Stack:** [python-telegram-bot](https://docs.python-telegram-bot.org/) 22.8 (async, Bot API 10.0),
+Python 3.14, [Mistral AI](https://mistral.ai/) (`mistral-small-latest`, currently Mistral Small 4 —
+vision-capable, 256k context), Redis for persistent memory, deployed on [Render](https://render.com/)
+(webhook in production, long polling locally).
 
-**AI:** [Mistral AI](https://mistral.ai/) (`mistral-small-latest`, currently Mistral Small 4 —
-vision-capable). The bot uses Mistral for everything: answering questions, extracting facts,
-summarizing, debate mode, poll suggestions, fact-checking, and speech-to-text (Voxtral).
+### Persona & tone
 
-**Memory:** Redis holds long-lived state (facts about people/groups, per-user communication style,
-a rolling buffer of recent messages, quiet-mode/debate-mode flags). Every write refreshes a 90-day
-TTL on its own key, so Redis expires stale data on its own — there's no separate cleanup job.
-An in-memory, per-process cache holds the active conversation window for low-latency replies; Redis
-is the fallback that survives restarts.
+The system prompt (`bot/services/ai.py::_STATIC_SYSTEM`) defines a specific character, not a generic
+assistant: short, informal replies in Russian, witty and warm rather than encyclopedic — a sharp
+friend in the chat, not a customer-service bot. Two rules sit above everything else and can't be
+overridden by per-user style adaptation:
+- **No hostility** — no anger, contempt, or insults toward anyone in the chat.
+- **No bravado** — no tough-guy posturing, no mock-threats (physical or sexual) even as jokes.
+
+Per-user tone adaptation (`bot/services/style.py`) tracks each person's own casual register — slang,
+mild profanity, message length — and nudges the bot to match it, but explicitly scoped to *manner of
+speech*, never as license for the two rules above. As a second layer, every finished reply also gets
+checked by Mistral's Moderation API (`mistral-moderation-2603`) before being sent, scoped to the
+categories behind those two rules (`hate_and_discrimination`, `violence_and_threats`, `sexual`,
+`self_harm`) — not a blanket filter, so normal group-chat banter isn't flagged. A flagged reply gets
+replaced with a short, honest fallback instead. The check fails open: a moderation-API error lets the
+original reply through rather than going silent.
+
+### Memory
+
+Redis holds long-lived state: per-user facts (global to the person, not scoped to a chat — the same
+`user:{id}:facts` bucket whether they're in a DM or any group), per-group facts, per-user style
+profiles, a saved-quotes book per group (`/quote`/`/quotes`), and quiet-mode/debate-mode flags. Every
+write refreshes a 90-day TTL on its own key, so Redis expires stale data on its own — no cleanup job.
+An in-memory, per-process cache holds the active conversation window for low-latency replies; Redis is
+the fallback that survives restarts.
 
 ### Handler groups
 
-- **Group 0** (default): commands (`/start`, `/summary`, `/debate`, ...) and the main message handler,
-  which only reacts to messages that are @-mentions, replies to the bot, plain-text mentions of the
-  bot's name (`BOT_DISPLAY_NAMES` in `config.py` — "Sam"/"Сэм" by default, whole-word/case-insensitive
-  via `mentions_bot_by_name()` in `bot/utils/helpers.py`), or private-chat messages.
-- **Group 1** (silent observer): runs on *every* group message regardless of whether the bot was
-  addressed. It stores the message into Redis, updates the sender's style profile, and — at a small
-  default probability — reacts with an emoji to keep the bot feeling present without being spammy.
-  A full spontaneous text-reply path also exists but is disabled by default (`SPONTANEOUS_REPLY_PROBABILITY = 0`
-  in `config.py`) since the group found it too noisy.
+- **Group 0** (default): commands and the main message handler, which only reacts to @-mentions,
+  replies to the bot, plain-text mentions of the bot's name (`BOT_DISPLAY_NAMES` in `config.py` —
+  "Sam"/"Сэм" by default), or private-chat messages.
+- **Group 1** (silent observer): runs on every group message regardless of whether the bot was
+  addressed — stores it into Redis, updates the sender's style profile, and at a small default
+  probability reacts with an emoji. A spontaneous-text-reply path exists but is disabled by default
+  (too noisy for this group).
 
-### Scheduled jobs (JobQueue)
+### Scheduled jobs
 
-- **Proactive memory** (~every 8h): reviews each chat's recent-message buffer and extracts facts the
-  per-message pipeline missed.
-- **Style refresh** (daily, 14:00 Tallinn time): regenerates natural-language style summaries for
-  active users so the bot's tone stays adapted to how each person actually talks.
-- **Daily prompt** (daily, 18:00 Tallinn time): posts a random icebreaker/trivia question to
-  recently-active, non-quiet chats. **Disabled by default** (`DAILY_PROMPT_ENABLED = False` in
-  `config.py`) — the bot should only speak when spoken to (or, occasionally, react with an emoji).
+- **Proactive memory** (~every 8h) and **style refresh** (daily) run quietly in the background.
+- **Daily icebreaker prompt** exists but is **disabled by default** — this bot only speaks when
+  spoken to (or reacts with an emoji).
 
-### Group chat robustness
+### Group chat reliability
 
-A handful of behaviors worth knowing about for a busy multi-person chat:
-
-- **Editing a message doesn't re-trigger the bot.** Telegram routes edited messages through the
-  same handlers as new ones by default; `main.py`'s handlers explicitly exclude
-  `filters.UpdateType.EDITED` so fixing a typo in your question doesn't produce a second reply
-  (or double-count style/reaction stats in the silent observer).
-- **Follow-up questions are scoped to the person who asked them.** The in-memory conversation
-  window (`bot/utils/context.py`) is shared per `(chat_id, thread_id)` across everyone in the
-  chat, but the "answer an unqualified follow-up as a continuation of the bot's last reply" prompt
-  rule only applies when the current asker is the same person the bot's last reply (in that
-  chat/thread) was addressed to — tracked via `set_last_bot_reply_target()`/
-  `get_last_bot_reply_target()`. Without this, two people asking the bot unrelated things back to
-  back could get a reply that's accidentally about the other person's topic.
-- **External content is framed as untrusted data, not instructions.** Fetched web pages, search
-  results, and forwarded posts get fed to the model as reference material — the system prompt
-  explicitly tells it not to follow anything that reads like a command inside that content (a
-  defense against a forwarded link or page containing a prompt-injection attempt).
+- Edited messages don't re-trigger a reply (Telegram routes edits through the same handlers as new
+  messages by default; explicitly filtered out).
+- An unqualified follow-up ("а это точно так?") only continues the bot's *previous* reply if it's
+  from the same person that reply was addressed to — the conversation window is shared across
+  everyone in a chat, so this prevents cross-talk in a busy group.
+- Content from web pages, search results, and forwarded posts is explicitly framed as untrusted
+  reference material, not instructions — a defense against prompt injection via a forwarded link.
 
 ## Commands
 
@@ -68,23 +71,24 @@ A handful of behaviors worth knowing about for a busy multi-person chat:
 | `/summary`, `/tldr [N]` | Summarize the last N (default 30) buffered messages | "о чём тут говорили?" |
 | `/debate <topic>` | Bot takes an adversarial stance on `<topic>` for 30 minutes | "давай поспорим про X" |
 | `/factcheck` | Verify a claim (reply to a message, or `/factcheck <claim>`) via live web search | "проверь факт: X" |
-| `/poll Q \| A \| B \| C` | Send a native Telegram poll (manual only, no natural-language equivalent) | — |
-| `/poll suggest` | Ask the bot to propose a poll from the recent discussion | "сделай опрос" |
+| `/poll Q \| A \| B \| C` | Send a native, revotable Telegram poll (manual only) | — |
+| `/poll suggest` | Propose a poll from the recent discussion | "сделай опрос" |
+| `/quiz [topic]` | Native Telegram quiz question with a marked correct answer | "устрой викторину про Таллинн" |
+| `/quote` | Reply to a message with this to save it in the group's quote book | — |
+| `/quotes` | Show a random saved quote (`/quotes list` for the recent ones) | — |
 | `/remember <fact>` | Save a fact (per-user in DM, per-group in groups) | — |
-| `/forget` | Wipe saved facts. In a DM, wipes your own. In a group, wipes the *shared group* facts — admin-only | — |
-| `/forget me` | Wipe only your own remembered facts — works for anyone, in DMs or groups, no admin needed | — |
+| `/forget` | Wipe saved facts — own in a DM, *shared group* facts in a group (admin-only) | — |
+| `/forget me` | Wipe only your own remembered facts, anywhere, no admin needed | — |
 | `/memory` | Show what the bot remembers | — |
 | `/clear` | Reset conversation context (and end debate mode) for this chat/thread | — |
 | `/quiet` | Toggle emoji-reaction engagement for this chat (admin-only) | — |
 
-The four natural-language triggers above are handled by `bot/services/intent.py` — see
-"Architecture notes" below for how it decides when a plain sentence means one of these. The bot can
-also describe its own features conversationally (e.g. "что ты умеешь?") since `bot/services/ai.py`'s
-system prompt includes a short capabilities summary.
-
-The bot also responds to forwarded posts/photos (including forwards from channels — it captures and
-cites the original source), shared links, images (menus, flyers, screenshots — anything), voice
-messages (in DMs or when replied to), and natural-language search triggers ("найди...", "search for...").
+The five natural-language triggers above are handled by `bot/services/intent.py` (see Architecture
+notes). The bot also: describes its own features conversationally ("что ты умеешь?"); reads forwarded
+posts/photos (including from channels, citing the source), shared links, and images; transcribes
+voice messages (in DMs or when replied to); answers natural-language search triggers ("найди...");
+and can reply with a synthesized voice message on request ("ответь голосом") — see "Voice replies" in
+Setup, off by default.
 
 ## Setup
 
@@ -100,80 +104,69 @@ messages (in DMs or when replied to), and natural-language search triggers ("н�
 3. `python main.py` — runs with long polling locally; set `RENDER=true` + `WEBHOOK_URL` +
    `WEBHOOK_PATH` + `WEBHOOK_SECRET` for webhook mode (see `render.yaml`).
 
+### Voice replies (experimental, paid, off by default)
+
+This is the only feature in the codebase that costs money and isn't already in use — it's off unless
+you explicitly opt in. Voxtral TTS is **not** on Mistral's free tier: $0.016 per 1,000 characters
+(a typical short reply costs a fraction of a cent, but it needs billing enabled on your Mistral
+account). To turn it on, set `VOXTRAL_TTS_VOICE_ID` to a voice id from your Mistral account
+(console.mistral.ai → Voices — a preset voice works, no cloning required); the bot then sends a
+synthesized voice message alongside the text reply whenever someone asks "ответь голосом". Unlike the
+rest of this codebase, `bot/services/speech.py` hasn't been verified against a live API key (no
+network access to Mistral from the environment this was built in) — it fails safely to text-only on
+any error, but treat the first real use as the actual test.
+
 ### Redis hosting
 
-Any Redis 7.4+ instance works (the code uses whole-key `EXPIRE` refreshes, compatible everywhere;
-7.4+ is only needed if you extend it with per-field hash TTLs). Two free options that fit this
-bot's tiny footprint (no images are ever stored in Redis, only short text):
+Any Redis 7.4+ instance works (whole-key `EXPIRE` refreshes, no advanced features needed). Two free
+options that fit this bot's tiny footprint (no images stored, only short text):
 
 - **[Render Key Value](https://render.com/docs/key-value)** — same platform as the bot, 25MB free.
 - **[Upstash](https://upstash.com/)** — 256MB / 500K commands per month free, works from anywhere.
 
 ### Webhook security
 
-The webhook path is a random value (`WEBHOOK_PATH`) independent of `TELEGRAM_TOKEN`, so the bot
-token never ends up in Render's request logs. Generate one with:
+`WEBHOOK_PATH` is a random value independent of `TELEGRAM_TOKEN`, so the token never ends up in
+Render's request logs. Generate both:
 
 ```bash
-python -c "import uuid; print(uuid.uuid4())"       # WEBHOOK_PATH
+python -c "import uuid; print(uuid.uuid4())"                  # WEBHOOK_PATH
 python -c "import secrets; print(secrets.token_urlsafe(32))"  # WEBHOOK_SECRET
 ```
 
-Both are optional (the bot falls back to a per-process random path and logs a warning), but should
-be set for any real deployment.
+Both are optional (falls back to a per-process random path with a warning), but should be set for
+any real deployment — a fixed `WEBHOOK_PATH` is also required for the spin-down fix below.
 
 ### Free-tier spin-down (messages silently lost)
 
-Render's free web-service plan stops the process after ~15 minutes with no incoming HTTP traffic,
-and cold-starting it back up takes 20-30+ seconds. Because the bot runs in **webhook** mode on
-Render, a message that arrives while it's asleep (or during that boot window) can fail to be
-delivered at all — `run_webhook(..., drop_pending_updates=True)` means anything that piles up while
-the process is down gets discarded on restart rather than replayed, and Telegram's own webhook
-retry window is short. From the outside this looks exactly like "the bot stopped responding":
-Telegram still marks your message delivered (it reached the webhook endpoint or was queued for
-retry), but nothing ever processes it.
+Render's free plan stops the process after ~15 minutes idle; waking it back up takes 20-30+ seconds.
+Because the bot runs in **webhook** mode with `drop_pending_updates=True`, a message that arrives
+while it's asleep (or mid-restart) can be lost outright rather than delayed — from the outside this
+looks exactly like "the bot stopped responding." Fix, free:
+1. Set a **fixed** `WEBHOOK_PATH`/`WEBHOOK_SECRET` (above) — without a fixed path there's nothing
+   stable to target.
+2. Point a free uptime monitor ([UptimeRobot](https://uptimerobot.com/),
+   [cron-job.org](https://cron-job.org/)) at `https://<your-app>.onrender.com/<WEBHOOK_PATH>` every
+   ~10 minutes, accepting any response code — Telegram webhooks only accept `POST`, so a `GET` check
+   gets a harmless `405`, which is still enough traffic to keep Render from spinning the service down.
 
-Fix (free, a few minutes of setup):
-1. Set a **fixed** `WEBHOOK_PATH` and `WEBHOOK_SECRET` as real Render env vars (see above) — without
-   a fixed path, it's a fresh random value every restart, so nothing external can reliably target it.
-2. Point a free uptime monitor (e.g. [UptimeRobot](https://uptimerobot.com/),
-   [cron-job.org](https://cron-job.org/)) at `https://<your-app>.onrender.com/<WEBHOOK_PATH>` on a
-   ~10 minute interval, configured to treat **any** response as "up" (not just 200). Telegram
-   webhooks only accept `POST`, so a monitor's `GET`/`HEAD` check will get back a `405` — that's
-   expected and fine, it's still real HTTP traffic reaching the port, which is all Render checks for
-   to keep a free service warm. (There's no supported way to bolt a separate `/health` route onto
-   python-telegram-bot's webhook server — it's a fixed single-route Tornado app internally — so
-   pinging the existing webhook path is the simplest option that doesn't touch PTB internals.)
-
-If losing an occasional message is unacceptable, the only complete fix is a paid Render plan
-(e.g. Starter) — those don't spin down.
+Only a paid Render plan (e.g. Starter) avoids spin-down entirely.
 
 ## Deployment
 
-Render is the only deployment tool this project uses — there's no separate CD pipeline. `render.yaml`
-in the repo root is a [Render Blueprint](https://render.com/docs/blueprint-spec): it declares one
-`web` service (`runtime: python`, `buildCommand: pip install -r requirements.txt`,
-`startCommand: python main.py`) plus the env var names it expects (values with `sync: false` are
-secrets you set once in the Render dashboard, not stored in the repo).
-
-Once the Render service is connected to this GitHub repo (via Render's GitHub App, set up from the
-Render dashboard when the service was first created), Render watches the branch it's configured to
-deploy from — normally `master` — and **auto-deploys on every push to that branch**: it pulls the
-new commit, re-runs `buildCommand`, and restarts the service with `startCommand`. Nothing needs to
-run on this side to trigger it; merging a PR into `master` is what ships it. `.github/workflows/ci.yml`
-(pytest + ruff) is a separate, unrelated check that runs on GitHub and does not deploy anything —
-it only gates PRs if you turn on branch protection requiring it to pass.
-
-If you ever need to check *which* commit is actually live, or force a redeploy without a new
-commit, that's done from the Render dashboard (Manual Deploy) or the Render CLI — not from GitHub.
+Render is the only deployment tool — no separate CD pipeline. `render.yaml` is a
+[Render Blueprint](https://render.com/docs/blueprint-spec) declaring the web service and the env var
+names it expects. Once connected to this repo (via Render's GitHub App), Render **auto-deploys on
+every push to `master`** — merging a PR is what ships it. `.github/workflows/ci.yml` (pytest + ruff)
+is a separate GitHub-only check; it doesn't deploy anything unless branch protection requires it.
 
 ## Costs
 
-Everything runs on Mistral's free tier except voice-message transcription (Voxtral,
-~$0.001/minute) — trivial for a small group, but worth knowing it's the one part of the bot that
-isn't strictly free. `bot/services/ai.py` logs a warning if daily API call volume climbs high
-enough to be worth a look at the Mistral console (`QUOTA_WARN_THRESHOLD` in `config.py`) — there's
-no hard cutoff, just visibility.
+Everything runs on Mistral's free tier except voice-message transcription (~$0.001/minute, already
+in use) and, if enabled, voice replies (~$0.016/1000 characters, off by default — see Setup). Every
+response also costs one extra free-tier moderation call. `bot/services/ai.py` logs a warning if daily
+call volume gets high enough to be worth a look at the Mistral console — no hard cutoff, just
+visibility (`QUOTA_WARN_THRESHOLD` in `config.py`).
 
 ## Development
 
@@ -183,59 +176,48 @@ pytest              # run the test suite
 ruff check .         # lint
 ```
 
-Tests cover the pure/near-pure logic (URL handling, context windowing, style-signal extraction,
-HTML metadata parsing, weather-query parsing) plus the AI/search services with a mocked Mistral
+Tests cover the pure/near-pure logic (URL handling, context windowing, style-signal extraction, HTML
+metadata parsing, weather-query parsing) plus the AI/search/speech services with a mocked Mistral
 client — nothing hits a live Telegram or Mistral connection.
 
 ## Architecture notes for future changes
 
 - `config.py` — every tunable constant lives here (rate limits, TTLs, prompts, keyword lists).
-- `bot/services/ai.py` — the Mistral client, main `query_ai()` entry point (streaming + blocking),
-  plus `summarize_conversation()`, `suggest_poll()`, and `classify_intent()`. Every call injects the
-  current date/day-of-week (Europe/Tallinn) into the system prompt, so date-relative reasoning
-  ("сегодня"/"завтра", how recent something actually is) is grounded instead of guessed.
-- `bot/services/intent.py` — decides whether a plain-language message means "run /summary" (etc.)
-  in three tiers: (1) a specific phrase match ("о чём говорили", "сделай опрос") resolves for free,
-  no LLM call; (2) no phrase match and no loose signal word either — the common case, plain chat —
-  returns `None` for free, same cost as today; (3) a loose signal word is present but no clean
-  phrase match (e.g. "дебат" appears but not in a recognized trigger) — spends one extra Mistral
-  call (`ai.classify_intent`) to disambiguate and to fill in a topic/claim a phrase match found the
-  trigger for but not the parameter (e.g. "давай поспорим" with no topic in the sentence). Phrase
-  matching first runs `bot/utils/helpers.py::mask_quoted_spans()` — a phrase in quotes is being
-  mentioned, not issued as a command (e.g. an announcement listing usage examples like «сделай
-  саммари» shouldn't itself trigger one) — and matches require a leading word boundary so a keyword
-  can't false-fire as a substring buried inside an unrelated word.
-- `bot/handlers/actions.py` — `do_summary()`/`do_debate()`/`do_factcheck()`/`do_poll_suggest()`, the
-  actual work behind those four commands, called both by `bot/handlers/commands.py`'s slash-command
-  handlers (parsing `context.args`) and by `messages.py`'s natural-language routing (parsing
-  `intent.py`'s output) — the logic exists exactly once regardless of how it was triggered.
-- `bot/services/search.py` — live web search. Uses Mistral's **Conversations/Agents API**
-  (`beta.conversations.start_async` with a `WebSearchTool`), *not* Chat Completions — Mistral's
-  `web_search` connector is only available there, which is why it's a separate call whose result
-  gets fed back into `query_ai()` as `referenced_content`, the same pattern used for weather data.
-  `is_search_trigger()` uses the same `mask_quoted_spans()` + word-boundary matching as
-  `intent.py`, for the same reason — a quoted example shouldn't fire a real (costly) search.
+- `bot/services/ai.py` — the Mistral client and `query_ai()`, the main entry point (streaming or
+  blocking), plus `summarize_conversation()`, `suggest_poll()`, `suggest_quiz()`, and
+  `classify_intent()`. Injects the current date/day-of-week (Europe/Tallinn) into the system prompt
+  on every call. All JSON-returning calls pass `response_format={"type": "json_object"}` (Mistral's
+  structured-output mode) rather than only asking for JSON in the prompt text. Takes a
+  `reasoning_effort` param ("none" through "xhigh" — Mistral Small 4 unifies fast chat and deep
+  reasoning via this one parameter); defaults to `"low"` for quick casual replies, `"medium"` for
+  debate mode and fact-checking.
+- `bot/services/intent.py` — natural-language routing for summary/debate/factcheck/poll/quiz, in
+  three tiers: (1) a specific phrase match resolves for free, no LLM call; (2) no phrase match and no
+  loose signal word — the common case, plain chat — returns `None` for free; (3) a loose signal word
+  without a clean phrase match spends one extra Mistral call (`ai.classify_intent`) to disambiguate
+  and fill in a topic/claim. Phrase matching runs `bot/utils/helpers.py::mask_quoted_spans()` first
+  (a quoted phrase is being mentioned, not commanded) and requires a word boundary so a keyword can't
+  false-fire as a substring inside an unrelated word.
+- `bot/handlers/actions.py` — the actual work behind `/summary`, `/debate`, `/factcheck`,
+  `/poll suggest`, and `/quiz`, called both by `commands.py`'s slash-command handlers and by
+  `messages.py`'s natural-language routing — the logic exists exactly once regardless of trigger.
+- `bot/services/search.py` — live web search via Mistral's Conversations/Agents API
+  (`beta.conversations.start_async` + `WebSearchTool`), not Chat Completions — the `web_search`
+  connector is only available there. Result flows back into `query_ai()` as `referenced_content`,
+  same pattern as weather data. `is_search_trigger()` uses the same quote-masking/word-boundary
+  matching as `intent.py`.
+- `bot/services/speech.py` — Voxtral TTS voice replies, see Setup. Off unless
+  `VOXTRAL_TTS_VOICE_ID` is set.
 - `bot/services/url_fetcher.py` — fetches shared links in three tiers: (1) `curl_cffi` with browser
-  TLS/JA3 impersonation (`IMPERSONATE_PROFILES` in `config.py`, tried in parallel, generic
-  `"chrome"`/`"safari"` aliases so they always track the latest supported browser fingerprint); (2) if
-  every profile fails or gets Cloudflare-block-detected, a best-effort fallback through
-  `bot/services/search.py`'s Mistral-mediated web search, asking it to open and summarize the URL
-  directly — different infra/IP than this process, so it clears a different class of bot-protection
-  (not guaranteed; paywalls and heavily JS-gated sites can still beat both); (3) a non-fetching
-  URL-heuristic string as the last resort so the model at least knows the URL exists.
-- `bot/services/memory.py` — all Redis reads/writes. Every write path refreshes its own key's TTL.
-  Per-user facts (`user:{id}:facts`) are global to the person, not scoped to a chat — the same
-  bucket is used whether they're in a DM or any group — which is why `/forget me` (any group
-  member, self-service) and admin-only bare `/forget` (the group's shared `group:{chat_id}:facts`
-  bucket) in `commands.py::forget_command` are two genuinely different operations.
+  TLS/JA3 impersonation, tried in parallel; (2) on failure or a detected Cloudflare block, a
+  best-effort fallback through `search.py`'s Mistral-mediated web search (different infra/IP, clears
+  a different class of bot-protection, not guaranteed); (3) a non-fetching URL-heuristic string as
+  the last resort.
+- `bot/services/memory.py` — all Redis reads/writes; every write refreshes its own key's TTL.
 - `bot/utils/context.py` — in-memory conversation window per `(chat_id, thread_id)`, with
-  role-merging and a simple age/turn-count-based compaction pass before sending to the API. Also
-  tracks `last_bot_reply_target` per `(chat_id, thread_id)` — who the bot's most recent reply there
-  was addressed to — so `messages.py` can tell `ai.py` when an unqualified follow-up is from a
-  *different* person than the last exchange, scoping the "implicit continuation" prompt rule
-  correctly instead of letting it bleed across unrelated conversations in a busy group.
-- `bot/handlers/messages.py` — the main pipeline: routing, natural-language action-intent routing
-  (`intent.py` → `actions.py`, short-circuits the rest of the pipeline on a match),
-  reply/forward/URL/photo parsing, weather and web-search pre-fetch, context assembly, the
+  role-merging and age/turn-count-based compaction. Also tracks `last_bot_reply_target` so
+  `messages.py` can scope the "implicit continuation" prompt rule to the right person.
+- `bot/handlers/messages.py` — the main pipeline: routing, natural-language action-intent short
+  circuit, reply/forward/URL/photo parsing, weather and web-search pre-fetch, context assembly, the
   `query_ai()` call, and post-processing.
 - `bot/handlers/observer.py` — handler group 1, runs on every group message unconditionally.

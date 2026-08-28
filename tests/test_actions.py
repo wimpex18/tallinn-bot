@@ -81,6 +81,7 @@ async def test_do_factcheck_replies_with_verdict(monkeypatch):
 
     update.message.reply_text.assert_called_once()
     assert update.message.reply_text.call_args.args[0] == "Похоже на правду"
+    assert ai_module.query_ai.call_args.kwargs["reasoning_effort"] == "medium"
 
 
 @pytest.mark.asyncio
@@ -108,6 +109,7 @@ async def test_do_poll_suggest_sends_poll(monkeypatch):
     context.bot.send_poll.assert_called_once()
     kwargs = context.bot.send_poll.call_args.kwargs
     assert kwargs["chat_id"] == 99
+    assert kwargs["allows_revoting"] is True
     assert kwargs["question"] == "Пицца или суши?"
 
 
@@ -129,6 +131,39 @@ async def test_do_poll_suggest_model_declines(monkeypatch):
     monkeypatch.setattr(ai_module, "suggest_poll", AsyncMock(return_value=None))
 
     await actions.do_poll_suggest(update, context)
+
+    update.message.reply_text.assert_called_once()
+    context.bot.send_poll.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_do_quiz_sends_quiz_poll(monkeypatch):
+    update, context = _make_update_context(chat_id=99, thread_id=None)
+    monkeypatch.setattr(
+        ai_module, "suggest_quiz",
+        AsyncMock(return_value={
+            "question": "Столица Эстонии?",
+            "options": ["Таллинн", "Тарту"],
+            "correct_option_id": 0,
+        }),
+    )
+
+    await actions.do_quiz(update, context, "Эстония")
+
+    context.bot.send_poll.assert_called_once()
+    kwargs = context.bot.send_poll.call_args.kwargs
+    assert kwargs["chat_id"] == 99
+    assert kwargs["type"] == "quiz"
+    assert kwargs["correct_option_id"] == 0
+    ai_module.suggest_quiz.assert_called_once_with("Эстония")
+
+
+@pytest.mark.asyncio
+async def test_do_quiz_model_declines(monkeypatch):
+    update, context = _make_update_context()
+    monkeypatch.setattr(ai_module, "suggest_quiz", AsyncMock(return_value=None))
+
+    await actions.do_quiz(update, context)
 
     update.message.reply_text.assert_called_once()
     context.bot.send_poll.assert_not_called()

@@ -83,6 +83,40 @@ def _parse_base64_image(data_url: str) -> dict | None:
         return None
 
 
+_MODERATION_MODEL = "mistral-moderation-2603"
+# Only the categories that map to the two real incidents this bot has had
+# (hostility/insults, and macho bravado with mock-threats) — deliberately not
+# a blanket filter, so normal colorful group-chat banter doesn't get flagged.
+_MODERATION_FLAG_CATEGORIES = {"hate_and_discrimination", "violence_and_threats", "sexual", "self_harm"}
+_MODERATION_FALLBACK = "Хм, перечитал свой ответ — что-то не то получилось. Спроси иначе?"
+
+
+async def _moderate_own_response(client: Mistral, text: str) -> bool:
+    """Check the bot's own generated reply before it's considered final.
+
+    Defense-in-depth on top of the system-prompt tone rules, after this bot
+    had two real incidents (hostility, then bravado/mock-threats) that
+    prompting alone didn't fully prevent. Fails OPEN: a moderation-API error
+    never blocks a response, it just skips the check for that message —
+    an outage here shouldn't make the whole bot go silent.
+    """
+    if not text:
+        return False
+    try:
+        result = await client.classifiers.moderate_async(
+            model=_MODERATION_MODEL, inputs=[text],
+        )
+        await record_call()
+        for entry in result.results:
+            categories = entry.categories or {}
+            if any(categories.get(cat) for cat in _MODERATION_FLAG_CATEGORIES):
+                return True
+        return False
+    except Exception as exc:
+        logger.warning(f"Moderation check failed, allowing response through: {exc}")
+        return False
+
+
 _DEBATE_SYSTEM_ADDENDUM = (
     'РЕЖИМ ДЕБАТОВ активен, тема: "{topic}". '
     'Твоя роль — вдумчивый оппонент, а не ассистент. Бери сторону, противоположную '
@@ -107,14 +141,25 @@ async def query_ai(
     telegram_message_id: int = None,
     debate_topic: str = None,
     last_reply_different_user: str = None,
+    reasoning_effort: str = "low",
 ) -> str:
     """Query Mistral with multi-turn context, memory, and optional streaming.
 
     If telegram_bot / telegram_chat_id / telegram_message_id are provided the
     response is streamed live into the already-sent Telegram message.
     The final cleaned text is always returned so callers can store it in context.
+
+    reasoning_effort: Mistral Small 4 unifies fast chat and deep reasoning in
+    one model via this parameter ("none"/"low"/"medium"/"high"/"xhigh").
+    Defaults to "low" to keep casual chat quick and match this bot's terse
+    persona; callers doing something that actually benefits from more
+    careful reasoning (fact-checking, debate) pass a higher value. Debate
+    mode bumps itself to "medium" below regardless of what's passed in,
+    since arguing a position well needs more than a quick reflex answer.
     """
     t0 = time.monotonic()
+    if debate_topic and reasoning_effort == "low":
+        reasoning_effort = "medium"
 
     # ── System prompt ─────────────────────────────────────────────
     _STATIC_SYSTEM = (
@@ -184,15 +229,19 @@ async def query_ai(
         'ищешь свежую инфу в интернете. По запросу (не обязательно командой, можно просто по-человечески '
         'попросить): пересказать разговор («о чём тут говорили?»), устроить дебаты по теме '
         '(«давай поспорим про...»), проверить факт («проверь, правда ли что...»), сделать опрос '
-        '(«сделай опрос»).\n\n'
+        '(«сделай опрос»), устроить викторину («устрой викторину про Таллинн»). Ещё можно попросить '
+        'ответить голосовым сообщением («ответь голосом»), если это настроено у владельца бота. Люди '
+        'могут сохранять смешные сообщения в книгу цитат командой /quote (ответом на сообщение) и '
+        'смотреть их через /quotes.\n\n'
         'НЕДАВНИЕ ОБНОВЛЕНИЯ (если спросят "что нового?", "какие у тебя обновления?", "расскажи про '
         'последние обновления" или похожее — отвечай по-человечески и честно, не отнекивайся и не '
         'говори что ничего не менялось, потому что на самом деле ты недавно ощутимо прокачался):\n'
         'Раньше ты не умел читать фото, голосовые и защищённые от ботов сайты — теперь умеешь. '
         'Научился помнить факты про людей и группу и подстраивать тон под собеседника. Появился живой '
         'поиск в интернете. Раньше на саммари/дебаты/фактчек/опрос нужны были команды — теперь можно '
-        'просто попросить по-человечески, без слэша. И теперь ты откликаешься не только на @упоминание '
-        'или reply, а и просто когда кто-то пишет твоё имя в сообщении.'
+        'просто попросить по-человечески, без слэша. Появились викторины и книга цитат для смешных '
+        'сообщений. И теперь ты откликаешься не только на @упоминание или reply, а и просто когда '
+        'кто-то пишет твоё имя в сообщении.'
     )
 
     now_tallinn = datetime.datetime.now(_TALLINN_TZ)
@@ -307,13 +356,21 @@ async def query_ai(
             answer = await _stream_response(
                 _client, messages,
                 telegram_bot, telegram_chat_id, telegram_message_id,
+                reasoning_effort=reasoning_effort,
             )
         else:
-            answer = await _blocking_response(_client, messages)
+            answer = await _blocking_response(_client, messages, reasoning_effort=reasoning_effort)
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         logger.info(f"Mistral responded in {elapsed_ms:.0f}ms ({len(answer)} chars)")
         await record_call()
+
+        if await _moderate_own_response(_client, answer):
+            logger.warning(f"Own response flagged by moderation, replacing: {answer[:200]!r}")
+            if streaming:
+                await _safe_edit(telegram_bot, telegram_chat_id, telegram_message_id, _MODERATION_FALLBACK)
+            return _MODERATION_FALLBACK
+
         return answer
 
     except Exception as exc:
@@ -337,13 +394,14 @@ async def query_ai(
         return err
 
 
-async def _blocking_response(client: Mistral, messages: list[dict]) -> str:
+async def _blocking_response(client: Mistral, messages: list[dict], reasoning_effort: str = "low") -> str:
     """Non-streaming Mistral call — returns the full response text."""
     response = await client.chat.complete_async(
         model=MISTRAL_MODEL,
         max_tokens=MISTRAL_MAX_TOKENS,
         temperature=MISTRAL_TEMPERATURE,
         messages=messages,
+        reasoning_effort=reasoning_effort,
     )
     text = response.choices[0].message.content or ""
     return _clean_response(text)
@@ -355,6 +413,7 @@ async def _stream_response(
     telegram_bot,
     chat_id: int,
     message_id: int,
+    reasoning_effort: str = "low",
 ) -> str:
     """Stream Mistral response and pipe chunks into Telegram via editMessageText."""
     accumulated = ""
@@ -365,6 +424,7 @@ async def _stream_response(
         max_tokens=MISTRAL_MAX_TOKENS,
         temperature=MISTRAL_TEMPERATURE,
         messages=messages,
+        reasoning_effort=reasoning_effort,
     )
     async with res as stream:
         async for event in stream:
@@ -479,6 +539,7 @@ async def suggest_poll(context_text: str) -> dict | None:
         response = await _client.chat.complete_async(
             model=MISTRAL_MODEL, max_tokens=250, temperature=0.4,
             messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
         )
         await record_call()
         raw = response.choices[0].message.content.strip() if response.choices else ""
@@ -497,12 +558,56 @@ async def suggest_poll(context_text: str) -> dict | None:
         return None
 
 
-_INTENT_ACTIONS = {"summary", "debate", "factcheck", "poll"}
+async def suggest_quiz(topic: str = None) -> dict | None:
+    """Ask the LLM to generate one native-Telegram-quiz question.
+
+    Returns {"question": str, "options": [str, ...], "correct_option_id": int}
+    or None if generation/parsing failed.
+    """
+    _client = mistral_client
+    if _client is None:
+        return None
+
+    topic_part = f" на тему: {topic}" if topic else " — на любую интересную тему, можно про Таллинн или Эстонию"
+    prompt = (
+        f"Придумай один вопрос для викторины{topic_part}.\n\n"
+        'Отвечай ТОЛЬКО валидным JSON: {"question": "...", "options": ["...", "...", "...", "..."], '
+        '"correct_option_id": 0}\n'
+        "Вопрос — до 250 символов, ровно 4 варианта ответа, каждый до 90 символов, "
+        "ровно один правильный (correct_option_id — его индекс от 0 до 3)."
+    )
+    try:
+        response = await _client.chat.complete_async(
+            model=MISTRAL_MODEL, max_tokens=250, temperature=0.5,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        await record_call()
+        raw = response.choices[0].message.content.strip() if response.choices else ""
+        data = json.loads(raw)
+        question = data.get("question")
+        options = data.get("options")
+        correct_id = data.get("correct_option_id")
+        if not question or not isinstance(options, list) or len(options) < 2:
+            return None
+        options = [str(o)[:90] for o in options[:10]]
+        if not isinstance(correct_id, int) or not (0 <= correct_id < len(options)):
+            return None
+        return {"question": str(question)[:250], "options": options, "correct_option_id": correct_id}
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        logger.warning("Quiz suggestion: model did not return valid JSON")
+        return None
+    except Exception as exc:
+        logger.warning(f"Quiz suggestion failed: {exc}")
+        return None
+
+
+_INTENT_ACTIONS = {"summary", "debate", "factcheck", "poll", "quiz"}
 
 
 async def classify_intent(question: str, conv_context: str = None) -> dict | None:
     """Tier-3 fallback: ask the LLM whether a message is a request to run one of
-    the group-chat actions (summarize/debate/factcheck/poll).
+    the group-chat actions (summarize/debate/factcheck/poll/quiz).
 
     Only called by bot/services/intent.py when its free keyword tiers see a
     loose signal word but can't tell on their own — most messages never reach
@@ -516,21 +621,23 @@ async def classify_intent(question: str, conv_context: str = None) -> dict | Non
     context_part = f"\n\nКонтекст чата:\n{conv_context}" if conv_context else ""
     prompt = (
         "Пользователь написал боту в групповом чате. Определи, просит ли он выполнить "
-        "одно из четырёх действий, или это обычный вопрос/болтовня.\n\n"
+        "одно из пяти действий, или это обычный вопрос/болтовня.\n\n"
         f"Сообщение: {question}{context_part}\n\n"
         'Действия:\n'
         '"summary" — пересказать/резюмировать обсуждение\n'
         '"debate" — устроить дебаты по теме (укажи тему в "topic")\n'
         '"factcheck" — проверить конкретное утверждение на достоверность (укажи его в "claim")\n'
         '"poll" — сделать опрос\n'
+        '"quiz" — устроить викторину (укажи тему в "topic", если есть)\n'
         '"none" — если это НЕ запрос ни одного из этих действий\n\n'
-        'Отвечай ТОЛЬКО валидным JSON: {"action": "summary"|"debate"|"factcheck"|"poll"|"none", '
+        'Отвечай ТОЛЬКО валидным JSON: {"action": "summary"|"debate"|"factcheck"|"poll"|"quiz"|"none", '
         '"topic": "..." или null, "claim": "..." или null}'
     )
     try:
         response = await _client.chat.complete_async(
             model=MISTRAL_MODEL, max_tokens=120, temperature=0.1,
             messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
         )
         await record_call()
         raw = response.choices[0].message.content.strip() if response.choices else ""

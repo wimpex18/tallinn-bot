@@ -37,6 +37,9 @@ from bot.handlers.commands import (
     memory_command,
     poll_command,
     quiet_command,
+    quiz_command,
+    quote_command,
+    quotes_command,
     remember_command,
     start_command,
     summary_command,
@@ -340,6 +343,9 @@ def main() -> None:
     application.add_handler(CommandHandler("debate", debate_command))
     application.add_handler(CommandHandler("factcheck", factcheck_command))
     application.add_handler(CommandHandler("poll", poll_command))
+    application.add_handler(CommandHandler("quiz", quiz_command))
+    application.add_handler(CommandHandler("quote", quote_command))
+    application.add_handler(CommandHandler("quotes", quotes_command))
     # ~filters.UpdateType.EDITED on the two handlers below: without it, PTB routes
     # Telegram's edited_message updates through the same handlers as new messages
     # (a typo fix would re-trigger a full second reply, and double-count style/
