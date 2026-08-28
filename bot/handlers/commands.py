@@ -274,5 +274,6 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         question=question,
         options=options,
         is_anonymous=False,
+        allows_revoting=True,
         message_thread_id=thread_id,
     )

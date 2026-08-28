@@ -47,7 +47,16 @@ def _make_fake_client(response_text="Тестовый ответ"):
     choice = MagicMock(message=message)
     response = MagicMock(choices=[choice])
     client.chat.complete_async = AsyncMock(return_value=response)
+    # Default: moderation allows everything through (no categories flagged).
+    moderation_entry = MagicMock(categories={})
+    moderation_result = MagicMock(results=[moderation_entry])
+    client.classifiers.moderate_async = AsyncMock(return_value=moderation_result)
     return client
+
+
+def _flag_moderation(client, category="violence_and_threats"):
+    entry = MagicMock(categories={category: True})
+    client.classifiers.moderate_async = AsyncMock(return_value=MagicMock(results=[entry]))
 
 
 @pytest.mark.asyncio
@@ -74,6 +83,53 @@ async def test_query_ai_no_client_returns_friendly_error(monkeypatch):
     monkeypatch.setattr(ai, "mistral_client", None)
     answer = await ai.query_ai(question="привет")
     assert "не готов" in answer.lower()
+
+
+@pytest.mark.asyncio
+async def test_query_ai_allows_clean_response_through(monkeypatch):
+    fake_client = _make_fake_client("Привет, как сам?")
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    answer = await ai.query_ai(question="привет")
+
+    assert answer == "Привет, как сам?"
+    fake_client.classifiers.moderate_async.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_query_ai_replaces_flagged_response(monkeypatch):
+    fake_client = _make_fake_client("что-то неприемлемое")
+    _flag_moderation(fake_client, category="violence_and_threats")
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    answer = await ai.query_ai(question="привет")
+
+    assert answer == ai._MODERATION_FALLBACK
+    assert answer != "что-то неприемлемое"
+
+
+@pytest.mark.asyncio
+async def test_query_ai_moderation_failure_fails_open(monkeypatch):
+    fake_client = _make_fake_client("нормальный ответ")
+    fake_client.classifiers.moderate_async = AsyncMock(side_effect=RuntimeError("moderation down"))
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    answer = await ai.query_ai(question="привет")
+
+    assert answer == "нормальный ответ"
+
+
+@pytest.mark.asyncio
+async def test_query_ai_ignores_irrelevant_moderation_categories(monkeypatch):
+    # A category outside the flagged set (e.g. "financial") shouldn't block
+    # a legitimate answer about money/prices.
+    fake_client = _make_fake_client("цена в среднем 8-10 евро")
+    _flag_moderation(fake_client, category="financial")
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    answer = await ai.query_ai(question="сколько стоит обед?")
+
+    assert answer == "цена в среднем 8-10 евро"
 
 
 @pytest.mark.asyncio
@@ -222,6 +278,8 @@ async def test_suggest_poll_parses_valid_json(monkeypatch):
 
     result = await ai.suggest_poll("обсуждение про еду")
     assert result == {"question": "Пицца или суши?", "options": ["Пицца", "Суши"]}
+    kwargs = client.chat.complete_async.call_args.kwargs
+    assert kwargs["response_format"] == {"type": "json_object"}
 
 
 @pytest.mark.asyncio
@@ -249,6 +307,8 @@ async def test_classify_intent_parses_debate_action(monkeypatch):
 
     result = await ai.classify_intent("не хочу дебатировать но всё же")
     assert result == {"action": "debate", "topic": "IPA vs lager", "claim": None}
+    kwargs = client.chat.complete_async.call_args.kwargs
+    assert kwargs["response_format"] == {"type": "json_object"}
 
 
 @pytest.mark.asyncio

@@ -68,7 +68,7 @@ A handful of behaviors worth knowing about for a busy multi-person chat:
 | `/summary`, `/tldr [N]` | Summarize the last N (default 30) buffered messages | "о чём тут говорили?" |
 | `/debate <topic>` | Bot takes an adversarial stance on `<topic>` for 30 minutes | "давай поспорим про X" |
 | `/factcheck` | Verify a claim (reply to a message, or `/factcheck <claim>`) via live web search | "проверь факт: X" |
-| `/poll Q \| A \| B \| C` | Send a native Telegram poll (manual only, no natural-language equivalent) | — |
+| `/poll Q \| A \| B \| C` | Send a native Telegram poll — revotable — (manual only, no natural-language equivalent) | — |
 | `/poll suggest` | Ask the bot to propose a poll from the recent discussion | "сделай опрос" |
 | `/remember <fact>` | Save a fact (per-user in DM, per-group in groups) | — |
 | `/forget` | Wipe saved facts. In a DM, wipes your own. In a group, wipes the *shared group* facts — admin-only | — |
@@ -86,6 +86,9 @@ The bot also responds to forwarded posts/photos (including forwards from channel
 cites the original source), shared links, images (menus, flyers, screenshots — anything), voice
 messages (in DMs or when replied to), and natural-language search triggers ("найди...", "search for...").
 
+**Voice replies** ("ответь голосом", "скажи голосом") get a synthesized voice message alongside the
+normal text reply — see "Voice replies (experimental)" under Setup; off unless configured.
+
 ## Setup
 
 1. Copy `.env.example` to `.env` and fill in:
@@ -99,6 +102,17 @@ messages (in DMs or when replied to), and natural-language search triggers ("н�
 2. `pip install -r requirements.txt` (or `requirements-dev.txt` to include test/lint tools)
 3. `python main.py` — runs with long polling locally; set `RENDER=true` + `WEBHOOK_URL` +
    `WEBHOOK_PATH` + `WEBHOOK_SECRET` for webhook mode (see `render.yaml`).
+
+### Voice replies (experimental)
+
+Off by default. To turn it on, set `VOXTRAL_TTS_VOICE_ID` to a voice id from your Mistral account
+(console.mistral.ai → Voices — a preset voice works, no cloning required) and the bot will send a
+synthesized voice message alongside the text reply whenever someone asks "ответь голосом" /
+"скажи голосом". Unlike everything else in this codebase, `bot/services/speech.py` hasn't been
+verified against a live API key (no network access to Mistral from the development environment this
+was built in) — the request/response shapes are built from the official docs and SDK introspection.
+It fails safely either way (falls back to text-only on any error), but treat the first real use as
+the actual test. Priced per minute like transcription, exact rate not published at time of writing.
 
 ### Redis hosting
 
@@ -170,10 +184,25 @@ commit, that's done from the Render dashboard (Manual Deploy) or the Render CLI 
 ## Costs
 
 Everything runs on Mistral's free tier except voice-message transcription (Voxtral,
-~$0.001/minute) — trivial for a small group, but worth knowing it's the one part of the bot that
-isn't strictly free. `bot/services/ai.py` logs a warning if daily API call volume climbs high
-enough to be worth a look at the Mistral console (`QUOTA_WARN_THRESHOLD` in `config.py`) — there's
-no hard cutoff, just visibility.
+~$0.001/minute) and, if you turn it on, voice replies (Voxtral TTS, priced per minute, exact rate
+not published) — trivial for a small group, but worth knowing these are the parts of the bot that
+aren't strictly free. Every response also gets one extra Mistral call for output moderation (see
+"Output safety check" below) — still free-tier, but it does count toward `QUOTA_WARN_THRESHOLD`.
+`bot/services/ai.py` logs a warning if daily API call volume climbs high enough to be worth a look
+at the Mistral console — there's no hard cutoff, just visibility.
+
+## Output safety check
+
+After the incidents documented in the git history (the bot going hostile, then swaggering — both
+patched via the system prompt), `bot/services/ai.py::query_ai()` now also runs the bot's own
+finished reply through Mistral's Moderation API (`client.classifiers.moderate_async`,
+`mistral-moderation-2603`) before treating it as final. It only checks categories relevant to those
+two failure modes (`hate_and_discrimination`, `violence_and_threats`, `sexual`, `self_harm`) —
+deliberately not a blanket filter, so normal colorful group-chat banter doesn't get flagged. A
+flagged reply gets replaced with a short, honest fallback instead of being sent. The check fails
+open: if the moderation call itself errors, the original reply goes through unchanged rather than
+the whole bot going silent over a moderation-API hiccup. This is on top of the system-prompt tone
+rules, not instead of them — prompting is still the first line of defense.
 
 ## Development
 
@@ -193,7 +222,13 @@ client — nothing hits a live Telegram or Mistral connection.
 - `bot/services/ai.py` — the Mistral client, main `query_ai()` entry point (streaming + blocking),
   plus `summarize_conversation()`, `suggest_poll()`, and `classify_intent()`. Every call injects the
   current date/day-of-week (Europe/Tallinn) into the system prompt, so date-relative reasoning
-  ("сегодня"/"завтра", how recent something actually is) is grounded instead of guessed.
+  ("сегодня"/"завтра", how recent something actually is) is grounded instead of guessed. Every
+  JSON-returning call (`suggest_poll`, `classify_intent`, and `memory.py`'s two fact-extraction
+  functions) passes `response_format={"type": "json_object"}` — Mistral's real structured-output
+  mode — instead of only asking for JSON in the prompt text and hoping; before this, the model would
+  occasionally wrap its JSON in a markdown code fence and break the naive `json.loads()` call (this
+  was an actual, observed production warning, not a hypothetical). The manual `json.loads()` +
+  except stays as a defensive fallback, but should rarely trigger now.
 - `bot/services/intent.py` — decides whether a plain-language message means "run /summary" (etc.)
   in three tiers: (1) a specific phrase match ("о чём говорили", "сделай опрос") resolves for free,
   no LLM call; (2) no phrase match and no loose signal word either — the common case, plain chat —
@@ -215,6 +250,9 @@ client — nothing hits a live Telegram or Mistral connection.
   gets fed back into `query_ai()` as `referenced_content`, the same pattern used for weather data.
   `is_search_trigger()` uses the same `mask_quoted_spans()` + word-boundary matching as
   `intent.py`, for the same reason — a quoted example shouldn't fire a real (costly) search.
+- `bot/services/speech.py` — experimental opt-in voice replies via Voxtral TTS, see "Voice replies
+  (experimental)" under Setup. Off unless `VOXTRAL_TTS_VOICE_ID` is set; `is_voice_reply_trigger()`
+  uses the same quote-masking pattern as intent/search matching.
 - `bot/services/url_fetcher.py` — fetches shared links in three tiers: (1) `curl_cffi` with browser
   TLS/JA3 impersonation (`IMPERSONATE_PROFILES` in `config.py`, tried in parallel, generic
   `"chrome"`/`"safari"` aliases so they always track the latest supported browser fingerprint); (2) if

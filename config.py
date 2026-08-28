@@ -49,6 +49,15 @@ MISTRAL_MAX_TOKENS = 1024
 MISTRAL_TEMPERATURE = 0.3
 VOXTRAL_MODEL = "voxtral-mini-latest"      # speech-to-text for voice messages
 
+# Text-to-speech voice replies — experimental, opt-in, priced per minute
+# (unlike everything else in this file, not verified against a live API key;
+# see bot/services/speech.py). Off unless VOXTRAL_TTS_VOICE_ID is set to a
+# voice id from your Mistral account (console.mistral.ai → Voices, preset or
+# custom) — there's no default, since the API requires a real voice id.
+VOXTRAL_TTS_MODEL = "voxtral-mini-tts-2603"
+VOXTRAL_TTS_VOICE_ID = os.getenv("VOXTRAL_TTS_VOICE_ID", "")
+VOICE_REPLY_TRIGGER_KEYWORDS = ["ответь голосом", "скажи голосом", "запиши голосовое", "voice reply"]
+
 # Usage observability: log a one-time warning once today's call count hits this
 # (no hard cutoff — just visibility so free-tier usage doesn't silently degrade)
 QUOTA_WARN_THRESHOLD = 300

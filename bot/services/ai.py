@@ -83,6 +83,40 @@ def _parse_base64_image(data_url: str) -> dict | None:
         return None
 
 
+_MODERATION_MODEL = "mistral-moderation-2603"
+# Only the categories that map to the two real incidents this bot has had
+# (hostility/insults, and macho bravado with mock-threats) — deliberately not
+# a blanket filter, so normal colorful group-chat banter doesn't get flagged.
+_MODERATION_FLAG_CATEGORIES = {"hate_and_discrimination", "violence_and_threats", "sexual", "self_harm"}
+_MODERATION_FALLBACK = "Хм, перечитал свой ответ — что-то не то получилось. Спроси иначе?"
+
+
+async def _moderate_own_response(client: Mistral, text: str) -> bool:
+    """Check the bot's own generated reply before it's considered final.
+
+    Defense-in-depth on top of the system-prompt tone rules, after this bot
+    had two real incidents (hostility, then bravado/mock-threats) that
+    prompting alone didn't fully prevent. Fails OPEN: a moderation-API error
+    never blocks a response, it just skips the check for that message —
+    an outage here shouldn't make the whole bot go silent.
+    """
+    if not text:
+        return False
+    try:
+        result = await client.classifiers.moderate_async(
+            model=_MODERATION_MODEL, inputs=[text],
+        )
+        await record_call()
+        for entry in result.results:
+            categories = entry.categories or {}
+            if any(categories.get(cat) for cat in _MODERATION_FLAG_CATEGORIES):
+                return True
+        return False
+    except Exception as exc:
+        logger.warning(f"Moderation check failed, allowing response through: {exc}")
+        return False
+
+
 _DEBATE_SYSTEM_ADDENDUM = (
     'РЕЖИМ ДЕБАТОВ активен, тема: "{topic}". '
     'Твоя роль — вдумчивый оппонент, а не ассистент. Бери сторону, противоположную '
@@ -314,6 +348,13 @@ async def query_ai(
         elapsed_ms = (time.monotonic() - t0) * 1000
         logger.info(f"Mistral responded in {elapsed_ms:.0f}ms ({len(answer)} chars)")
         await record_call()
+
+        if await _moderate_own_response(_client, answer):
+            logger.warning(f"Own response flagged by moderation, replacing: {answer[:200]!r}")
+            if streaming:
+                await _safe_edit(telegram_bot, telegram_chat_id, telegram_message_id, _MODERATION_FALLBACK)
+            return _MODERATION_FALLBACK
+
         return answer
 
     except Exception as exc:
@@ -479,6 +520,7 @@ async def suggest_poll(context_text: str) -> dict | None:
         response = await _client.chat.complete_async(
             model=MISTRAL_MODEL, max_tokens=250, temperature=0.4,
             messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
         )
         await record_call()
         raw = response.choices[0].message.content.strip() if response.choices else ""
@@ -531,6 +573,7 @@ async def classify_intent(question: str, conv_context: str = None) -> dict | Non
         response = await _client.chat.complete_async(
             model=MISTRAL_MODEL, max_tokens=120, temperature=0.1,
             messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
         )
         await record_call()
         raw = response.choices[0].message.content.strip() if response.choices else ""

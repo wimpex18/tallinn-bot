@@ -22,6 +22,7 @@ from bot.services.memory import (
     smart_extract_facts,
 )
 from bot.services.search import is_search_trigger, search_web
+from bot.services.speech import is_voice_reply_trigger, synthesize_speech
 from bot.services.style import get_style_summary
 from bot.services.url_fetcher import fetch_url_content
 from bot.services.weather import extract_weather_city, fetch_weather, is_weather_query
@@ -511,6 +512,21 @@ async def _process_message(
     await save_user_interaction(user_id, user_name, user.username)
 
     record_bot_replied(chat_id)
+
+    # Optional, opt-in: send the same answer as a synthesized voice message
+    # too, if the user explicitly asked for it and VOXTRAL_TTS_VOICE_ID is
+    # configured. Best-effort — a failure here never affects the text reply
+    # that already went out above.
+    if is_voice_reply_trigger(question):
+        audio_bytes = await synthesize_speech(answer)
+        if audio_bytes:
+            try:
+                await context.bot.send_voice(
+                    chat_id=chat_id, voice=audio_bytes, filename="reply.ogg",
+                    message_thread_id=thread_id,
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to send synthesized voice reply: {exc}")
 
     timer.checkpoint("reply_sent")
     timer.done()

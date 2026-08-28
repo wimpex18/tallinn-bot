@@ -96,5 +96,6 @@ async def do_poll_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         question=suggestion["question"],
         options=suggestion["options"],
         is_anonymous=False,
+        allows_revoting=True,
         message_thread_id=thread_id,
     )

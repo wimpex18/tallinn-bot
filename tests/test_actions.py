@@ -108,6 +108,7 @@ async def test_do_poll_suggest_sends_poll(monkeypatch):
     context.bot.send_poll.assert_called_once()
     kwargs = context.bot.send_poll.call_args.kwargs
     assert kwargs["chat_id"] == 99
+    assert kwargs["allows_revoting"] is True
     assert kwargs["question"] == "Пицца или суши?"
 
 

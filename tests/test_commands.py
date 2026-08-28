@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from bot.handlers.commands import forget_command
+from bot.handlers.commands import forget_command, poll_command
 from bot.services import memory as memory_module
 
 
@@ -82,3 +82,20 @@ async def test_forget_no_redis_reports_unavailable(monkeypatch):
     await forget_command(update, context)
 
     assert "не подключена" in update.message.reply_text.call_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_poll_command_manual_allows_revoting():
+    message = SimpleNamespace(message_thread_id=None, reply_text=AsyncMock())
+    update = SimpleNamespace(
+        message=message, effective_chat=SimpleNamespace(id=1, type="group"),
+    )
+    bot = SimpleNamespace(send_poll=AsyncMock())
+    context = SimpleNamespace(bot=bot, args=["Пицца или суши?", "|", "Пицца", "|", "Суши"])
+
+    await poll_command(update, context)
+
+    bot.send_poll.assert_called_once()
+    kwargs = bot.send_poll.call_args.kwargs
+    assert kwargs["allows_revoting"] is True
+    assert kwargs["is_anonymous"] is False

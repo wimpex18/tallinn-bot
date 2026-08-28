@@ -73,3 +73,61 @@ def test_extract_facts_from_response_regex_patterns():
     facts = memory.extract_facts_from_response("я живу в Таллинне и люблю кофе", "", "Иван")
     joined = " ".join(facts)
     assert "живёт" in joined or "любит" in joined
+
+
+def _make_fake_client(response_text: str):
+    client = MagicMock()
+    message = MagicMock(content=response_text)
+    choice = MagicMock(message=message)
+    response = MagicMock(choices=[choice])
+    client.chat.complete_async = AsyncMock(return_value=response)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_smart_extract_facts_uses_structured_json_output(monkeypatch):
+    from bot.services import ai as ai_module
+
+    client = _make_fake_client('{"facts": ["любит IPA"]}')
+    monkeypatch.setattr(ai_module, "mistral_client", client)
+
+    facts = await memory.smart_extract_facts(
+        question="какое пиво лучше?", answer="IPA конечно", user_name="Иван",
+    )
+
+    assert facts == ["Иван: любит IPA"]
+    kwargs = client.chat.complete_async.call_args.kwargs
+    assert kwargs["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_smart_extract_facts_handles_markdown_fenced_json(monkeypatch):
+    # The exact real-world failure this fix targets: the model wraps JSON in
+    # a markdown code fence, which response_format=json_object should prevent
+    # — but the fallback parsing must still degrade gracefully if it happens.
+    from bot.services import ai as ai_module
+
+    client = _make_fake_client('```json\n{"facts": ["любит IPA"]}\n```')
+    monkeypatch.setattr(ai_module, "mistral_client", client)
+
+    facts = await memory.smart_extract_facts(
+        question="какое пиво лучше?", answer="IPA конечно", user_name="Иван",
+    )
+
+    assert facts == []
+
+
+@pytest.mark.asyncio
+async def test_extract_facts_from_conversation_uses_structured_json_output(monkeypatch):
+    from bot.services import ai as ai_module
+
+    client = _make_fake_client('{"facts": ["Иван: любит IPA", "Мария: едет в Ригу"]}')
+    monkeypatch.setattr(ai_module, "mistral_client", client)
+
+    facts = await memory.extract_facts_from_conversation(
+        chat_id=1, messages=["Иван: люблю IPA", "Мария: еду в Ригу", "Иван: круто"],
+    )
+
+    assert facts == ["Иван: любит IPA", "Мария: едет в Ригу"]
+    kwargs = client.chat.complete_async.call_args.kwargs
+    assert kwargs["response_format"] == {"type": "json_object"}

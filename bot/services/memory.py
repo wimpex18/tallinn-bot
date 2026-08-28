@@ -151,6 +151,7 @@ async def smart_extract_facts(
             max_tokens=150,
             temperature=0.1,
             messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content.strip() if response.choices else ""
 
@@ -251,6 +252,7 @@ async def extract_facts_from_conversation(
             max_tokens=200,
             temperature=0.1,
             messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content.strip() if response.choices else ""
 
