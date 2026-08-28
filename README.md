@@ -65,6 +65,10 @@ the fallback that survives restarts.
 
 ## Commands
 
+The bot pushes this list to Telegram's `/` command menu itself on every startup
+(`set_my_commands` in `main.py`), so a new command shows up in clients automatically
+after deploy — no manual BotFather edit needed.
+
 | Command | Description | Also works by just asking |
 |---|---|---|
 | `/start`, `/help` | Intro and usage guide | — |
