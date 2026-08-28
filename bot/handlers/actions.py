@@ -68,7 +68,7 @@ async def do_factcheck(update: Update, context: ContextTypes.DEFAULT_TYPE, claim
     answer = await query_ai(
         question=f"Проверь это утверждение на достоверность и дай короткий вердикт: {claim}",
         referenced_content=search_result,
-        reasoning_effort="medium",
+        reasoning_effort="high",
     )
     await message.reply_text(answer, reply_parameters=ReplyParameters(message_id=message.message_id))
 
