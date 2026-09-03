@@ -18,6 +18,31 @@ def test_clean_response_empty_input():
     assert ai._clean_response(None) is None
 
 
+def test_extract_text_passes_through_plain_string():
+    assert ai._extract_text("Привет!") == "Привет!"
+
+
+def test_extract_text_handles_none_and_empty():
+    assert ai._extract_text(None) == ""
+    assert ai._extract_text([]) == ""
+
+
+def test_extract_text_joins_text_chunks_and_skips_thinking():
+    # reasoning_effort="high" (debate mode, /factcheck) returns content as a
+    # list: a ThinkChunk (internal reasoning, not for the user) plus one or
+    # more TextChunks (the actual answer) — confirmed live in production.
+    content = [
+        MagicMock(type="thinking", text="скрытые рассуждения модели"),
+        MagicMock(type="text", text="Похоже на правду."),
+    ]
+    assert ai._extract_text(content) == "Похоже на правду."
+
+
+def test_extract_text_joins_multiple_text_chunks():
+    content = [MagicMock(type="text", text="Часть 1. "), MagicMock(type="text", text="Часть 2.")]
+    assert ai._extract_text(content) == "Часть 1. Часть 2."
+
+
 def test_has_non_tallinn_location_detects_other_city():
     assert ai._has_non_tallinn_location("что посмотреть в берлине") is True
 
@@ -289,6 +314,81 @@ async def test_query_ai_respects_explicit_reasoning_effort(monkeypatch):
 
     kwargs = fake_client.chat.complete_async.call_args.kwargs
     assert kwargs["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_query_ai_blocking_handles_chunked_content(monkeypatch):
+    """Regression test for a real production crash (confirmed via Render logs):
+
+    with reasoning_effort="high" (/factcheck, debate mode), Mistral Small 4
+    returns message.content as a list of chunks (ThinkChunk + TextChunk)
+    instead of a plain string. _blocking_response used to hand that straight
+    to _clean_response's re.sub(), which requires a str, and crashed with
+    TypeError("expected string or bytes-like object, got 'list'") — every
+    /factcheck reply hit this and fell back to "Что-то пошло не так(".
+    """
+    fake_client = MagicMock()
+    content = [
+        MagicMock(type="thinking", text="internal reasoning"),
+        MagicMock(type="text", text="Похоже на правду."),
+    ]
+    message = MagicMock(content=content)
+    choice = MagicMock(message=message)
+    response = MagicMock(choices=[choice])
+    fake_client.chat.complete_async = AsyncMock(return_value=response)
+    moderation_entry = MagicMock(categories={})
+    fake_client.classifiers.moderate_async = AsyncMock(
+        return_value=MagicMock(results=[moderation_entry])
+    )
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    answer = await ai.query_ai(question="проверь факт", reasoning_effort="high")
+
+    assert answer == "Похоже на правду."
+
+
+class _FakeStream:
+    """Minimal async-context-manager + async-iterator fake for client.chat.stream_async."""
+
+    def __init__(self, events):
+        self._events = events
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    def __aiter__(self):
+        return self._iter()
+
+    async def _iter(self):
+        for event in self._events:
+            yield event
+
+
+@pytest.mark.asyncio
+async def test_stream_response_handles_chunked_delta_content():
+    """Same production bug as blocking (list content with a ThinkChunk before
+    the TextChunk), but on the streaming delta path used by debate mode."""
+    events = [
+        MagicMock(data=MagicMock(choices=[MagicMock(
+            delta=MagicMock(content=[MagicMock(type="thinking", text="reasoning...")])
+        )])),
+        MagicMock(data=MagicMock(choices=[MagicMock(
+            delta=MagicMock(content=[MagicMock(type="text", text="Финальный ответ.")])
+        )])),
+    ]
+    fake_client = MagicMock()
+    fake_client.chat.stream_async = AsyncMock(return_value=_FakeStream(events))
+    telegram_bot = MagicMock(edit_message_text=AsyncMock())
+
+    result = await ai._stream_response(
+        fake_client, [{"role": "user", "content": "test"}],
+        telegram_bot, chat_id=1, message_id=2, reasoning_effort="high",
+    )
+
+    assert result == "Финальный ответ."
 
 
 @pytest.mark.asyncio

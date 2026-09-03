@@ -13,7 +13,7 @@ from telegram.ext import ContextTypes
 
 from bot.utils.context import get_context_string
 from bot.utils.helpers import send_typing
-from config import DEBATE_MODE_TTL
+from config import DEBATE_MODE_TTL, FACTCHECK_CONTEXT_MESSAGES
 
 logger = logging.getLogger(__name__)
 
@@ -53,20 +53,42 @@ async def do_debate(update: Update, context: ContextTypes.DEFAULT_TYPE, topic: s
 
 
 async def do_factcheck(update: Update, context: ContextTypes.DEFAULT_TYPE, claim: str) -> None:
-    """Verify `claim` via live web search and reply with a verdict + sources."""
+    """Verify `claim` via live web search and reply with a verdict + sources.
+
+    When triggered as a reply, a claim discussed across several messages (not
+    just the one replied to) can lose its full picture if only that one
+    message is checked — so the last few chat messages are pulled in as
+    extra context for both the search and the verdict.
+    """
     message = update.message
-    await send_typing(context.bot, update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    await send_typing(context.bot, chat_id)
 
     from bot.services.ai import query_ai
+    from bot.services.memory import get_recent_chat_messages
     from bot.services.search import search_web
 
-    search_result = await search_web(f"Проверь факт: {claim}")
+    surrounding = ""
+    if message.reply_to_message:
+        thread_id = message.message_thread_id
+        recent = await get_recent_chat_messages(chat_id, FACTCHECK_CONTEXT_MESSAGES, thread_id=thread_id)
+        if recent:
+            surrounding = "\n".join(reversed(recent))
+
+    search_query = f"Проверь факт: {claim}"
+    question = f"Проверь это утверждение на достоверность и дай короткий вердикт: {claim}"
+    if surrounding:
+        context_block = f"Контекст обсуждения в чате перед этим сообщением:\n{surrounding}"
+        search_query = f"{search_query}\n\n{context_block}"
+        question = f"{question}\n\n{context_block}"
+
+    search_result = await search_web(search_query)
     if not search_result:
         await message.reply_text("Не получилось проверить — попробуй позже(")
         return
 
     answer = await query_ai(
-        question=f"Проверь это утверждение на достоверность и дай короткий вердикт: {claim}",
+        question=question,
         referenced_content=search_result,
         reasoning_effort="high",
     )

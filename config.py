@@ -105,6 +105,12 @@ INTENT_WEAK_QUIZ = ["викторин", "quiz"]
 # ── Debate mode ───────────────────────────────────────────────────────
 DEBATE_MODE_TTL = 1800   # 30 min — how long /debate keeps the adversarial persona active
 
+# ── Factcheck ─────────────────────────────────────────────────────────
+# A reply-based /factcheck often targets a claim spread across several
+# messages, not just the one replied to — pull in this many of the most
+# recent chat messages as extra context for the search + verdict.
+FACTCHECK_CONTEXT_MESSAGES = 6
+
 # ── Lighter engagement: emoji reactions instead of spontaneous text ──
 # Restricted to Telegram's standard (non-Premium) reaction emoji set.
 REACTION_EMOJI = ["👍", "😁", "🔥", "🤔", "😂", "👏"]

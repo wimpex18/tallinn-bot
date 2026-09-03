@@ -405,7 +405,7 @@ async def _blocking_response(client: Mistral, messages: list[dict], reasoning_ef
         messages=messages,
         reasoning_effort=reasoning_effort,
     )
-    text = response.choices[0].message.content or ""
+    text = _extract_text(response.choices[0].message.content)
     return _clean_response(text)
 
 
@@ -430,7 +430,7 @@ async def _stream_response(
     )
     async with res as stream:
         async for event in stream:
-            chunk = event.data.choices[0].delta.content
+            chunk = _extract_text(event.data.choices[0].delta.content)
             if chunk:
                 accumulated += chunk
                 now = time.monotonic()
@@ -455,6 +455,27 @@ async def _safe_edit(telegram_bot, chat_id, message_id, text: str) -> None:
         )
     except Exception as exc:
         logger.debug(f"edit_message_text skipped: {exc}")
+
+
+def _extract_text(content) -> str:
+    """Normalize a Mistral message/delta `content` field to plain text.
+
+    The SDK types `content` as `str | list[ContentChunk]` — with
+    reasoning_effort="high" the model returns a list: a ThinkChunk (its
+    internal reasoning, type="thinking", not meant for the user) followed by
+    the actual answer as one or more TextChunks (type="text"). Confirmed live
+    in production: reasoning_effort="none" (plain chat) always returns a
+    plain string, but "high" (debate mode, /factcheck) returned a list and
+    crashed _clean_response's re.sub with
+    TypeError("expected string or bytes-like object, got 'list'").
+    """
+    if isinstance(content, str):
+        return content
+    if not content:
+        return ""
+    return "".join(
+        getattr(chunk, "text", "") for chunk in content if getattr(chunk, "type", None) == "text"
+    )
 
 
 def _clean_response(text: str) -> str:

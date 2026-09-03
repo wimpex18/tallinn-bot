@@ -96,6 +96,44 @@ async def test_do_factcheck_search_fails(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_do_factcheck_reply_includes_surrounding_messages(monkeypatch):
+    """A reply-based /factcheck should pull in recent chat messages as extra
+    context — a claim discussed across several messages, not just the one
+    replied to, needs the full picture to check properly."""
+    update, context = _make_update_context(chat_id=7, thread_id=3)
+    update.message.reply_to_message = SimpleNamespace(text="то самое сообщение")
+    monkeypatch.setattr(
+        memory_module, "get_recent_chat_messages",
+        AsyncMock(return_value=["Bob: а что если нет", "Alice: в Таллинне живёт 500 тысяч"]),
+    )
+    monkeypatch.setattr(search_module, "search_web", AsyncMock(return_value="[WEB SEARCH: ...] verdict"))
+    monkeypatch.setattr(ai_module, "query_ai", AsyncMock(return_value="Похоже на правду"))
+
+    await actions.do_factcheck(update, context, "в Таллинне живёт 500 тысяч человек")
+
+    memory_module.get_recent_chat_messages.assert_called_once_with(7, 6, thread_id=3)
+    search_query = search_module.search_web.call_args.args[0]
+    assert "Alice: в Таллинне живёт 500 тысяч" in search_query
+    assert "Bob: а что если нет" in search_query
+    question = ai_module.query_ai.call_args.kwargs["question"]
+    assert "Alice: в Таллинне живёт 500 тысяч" in question
+
+
+@pytest.mark.asyncio
+async def test_do_factcheck_inline_claim_skips_recent_messages(monkeypatch):
+    """A directly typed /factcheck <claim> (no reply) doesn't need surrounding
+    chat context — the user already spelled out the full claim."""
+    update, context = _make_update_context()
+    monkeypatch.setattr(memory_module, "get_recent_chat_messages", AsyncMock())
+    monkeypatch.setattr(search_module, "search_web", AsyncMock(return_value="[WEB SEARCH: ...] verdict"))
+    monkeypatch.setattr(ai_module, "query_ai", AsyncMock(return_value="Похоже на правду"))
+
+    await actions.do_factcheck(update, context, "в Таллинне живёт 500 тысяч человек")
+
+    memory_module.get_recent_chat_messages.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_do_poll_suggest_sends_poll(monkeypatch):
     update, context = _make_update_context(chat_id=99, thread_id=None)
     monkeypatch.setattr(actions, "get_context_string", lambda chat_id, thread_id: "обсуждали еду")

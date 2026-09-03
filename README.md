@@ -74,7 +74,7 @@ after deploy — no manual BotFather edit needed.
 | `/start`, `/help` | Intro and usage guide | — |
 | `/summary`, `/tldr [N]` | Summarize the last N (default 30) buffered messages | "о чём тут говорили?" |
 | `/debate <topic>` | Bot takes an adversarial stance on `<topic>` for 30 minutes | "давай поспорим про X" |
-| `/factcheck` | Verify a claim (reply to a message, or `/factcheck <claim>`) via live web search | "проверь факт: X" |
+| `/factcheck` | Verify a claim (reply to a message, or `/factcheck <claim>`) via live web search — a reply also pulls in the last few chat messages for context, since a claim is often spread across several messages, not just the one replied to | "проверь факт: X" |
 | `/poll Q \| A \| B \| C` | Send a native, revotable Telegram poll (manual only) | — |
 | `/poll suggest` | Propose a poll from the recent discussion | "сделай опрос" |
 | `/quiz [topic]` | Native Telegram quiz question with a marked correct answer | "устрой викторину про Таллинн" |
