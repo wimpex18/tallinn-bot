@@ -113,8 +113,11 @@ FACTCHECK_CONTEXT_MESSAGES = 6
 
 # ── Lighter engagement: emoji reactions instead of spontaneous text ──
 # Restricted to Telegram's standard (non-Premium) reaction emoji set.
+# Only considered for messages that address the bot (@mention, reply to it,
+# or its name) — NOT ambient chat; see the should_respond() gate in
+# bot/handlers/observer.py. Even then it's a chance, not guaranteed.
 REACTION_EMOJI = ["👍", "😁", "🔥", "🤔", "😂", "👏"]
-REACTION_PROBABILITY = 0.05      # small chance per message, default ON (unlike text replies)
+REACTION_PROBABILITY = 0.05      # chance per message that addresses the bot
 REACTION_KEYWORD_BOOST = 0.10    # extra chance when INTERESTING_TOPICS keywords are present
 
 # Daily fun/icebreaker prompt (JobQueue), skipped for quiet-mode chats.

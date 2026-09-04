@@ -40,6 +40,7 @@ async def synthesize_speech(text: str) -> bytes | None:
         return None
 
     try:
+        await ai_service.throttle_call()
         response = await client.audio.speech.complete_async(
             model=VOXTRAL_TTS_MODEL,
             input=text[:_MAX_TTS_CHARS],

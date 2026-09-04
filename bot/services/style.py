@@ -153,6 +153,7 @@ async def generate_style_summary_llm(
     )
 
     try:
+        await ai_service.throttle_call()
         response = await ai_service.mistral_client.chat.complete_async(
             model=MISTRAL_MODEL,
             max_tokens=100,

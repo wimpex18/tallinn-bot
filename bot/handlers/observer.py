@@ -182,7 +182,14 @@ async def observe_and_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             logger.info(f"[spontaneous] Replied in chat {chat_id}: {comment[:60]}...")
         return
 
-    # Lightweight emoji reaction — the default, much less spammy engagement.
+    # Lightweight emoji reaction — only for messages that actually address the
+    # bot (@mention, reply to it, or its name in text), not ambient chat.
+    # Previously fired on any group message at REACTION_PROBABILITY, which
+    # read as the bot randomly reacting to unrelated conversation.
+    from bot.handlers.messages import should_respond
+    if not should_respond(update, BOT_USERNAME, bot_id=context.bot.id):
+        return
+
     reaction_probability = REACTION_PROBABILITY
     if has_keyword:
         reaction_probability += REACTION_KEYWORD_BOOST
@@ -242,6 +249,7 @@ async def _generate_spontaneous_comment(
     )
 
     try:
+        await ai_service.throttle_call()
         response = await ai_service.mistral_client.chat.complete_async(
             model=MISTRAL_MODEL,
             max_tokens=80,

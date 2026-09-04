@@ -197,6 +197,7 @@ async def smart_extract_facts(
 Отвечай ТОЛЬКО валидным JSON: {{"facts": ["факт 1", "факт 2"]}} или {{"facts": []}} если фактов нет."""
 
     try:
+        await ai_service.throttle_call()
         response = await ai_service.mistral_client.chat.complete_async(
             model=MISTRAL_MODEL,
             max_tokens=150,
@@ -298,6 +299,7 @@ async def extract_facts_from_conversation(
 Отвечай ТОЛЬКО валидным JSON: {{"facts": ["Имя: факт", "Имя: факт"]}} или {{"facts": []}} если фактов нет."""
 
     try:
+        await ai_service.throttle_call()
         response = await ai_service.mistral_client.chat.complete_async(
             model=MISTRAL_MODEL,
             max_tokens=200,
