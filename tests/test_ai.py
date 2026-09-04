@@ -37,6 +37,26 @@ def test_is_error_response_false_for_real_answers():
     assert not ai.is_error_response(ai._MODERATION_FALLBACK)
 
 
+def test_log_rate_limit_headers_logs_the_header_dict(caplog):
+    """Mistral's actual rate-limit dimension (RPS/TPM/monthly) and reset time
+    live in response headers (x-ratelimit-*, retry-after), not the generic
+    {"message":"Rate limit exceeded"} body we were already logging — this is
+    what lets us see the real reason on the next 429 instead of guessing."""
+    exc = Exception("rate limited")
+    exc.headers = {"retry-after": "30", "x-ratelimit-remaining-requests": "0"}
+    with caplog.at_level("WARNING"):
+        ai._log_rate_limit_headers(exc)
+    assert "retry-after" in caplog.text
+    assert "30" in caplog.text
+
+
+def test_log_rate_limit_headers_handles_missing_headers_attr(caplog):
+    exc = Exception("rate limited")
+    with caplog.at_level("WARNING"):
+        ai._log_rate_limit_headers(exc)
+    assert "no .headers attribute" in caplog.text
+
+
 def test_extract_text_passes_through_plain_string():
     assert ai._extract_text("Привет!") == "Привет!"
 
@@ -689,3 +709,20 @@ async def test_query_ai_gives_up_after_max_429_retries(monkeypatch):
 
     assert "429" in answer
     assert fake_client.chat.complete_async.call_count == ai._MAX_429_RETRIES + 1
+
+
+@pytest.mark.asyncio
+async def test_query_ai_surfaces_rate_limit_headers_on_final_failure(monkeypatch, caplog):
+    fake_client = MagicMock()
+    rate_limit_error = Exception("rate limited")
+    rate_limit_error.status_code = 429
+    rate_limit_error.headers = {"x-ratelimit-remaining-tokens-minute": "0", "retry-after": "60"}
+    fake_client.chat.complete_async = AsyncMock(side_effect=rate_limit_error)
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+    monkeypatch.setattr(ai, "_429_RETRY_DELAY", 0.0)
+
+    with caplog.at_level("WARNING"):
+        await ai.query_ai(question="привет")
+
+    assert "x-ratelimit-remaining-tokens-minute" in caplog.text
+    assert "retry-after" in caplog.text
