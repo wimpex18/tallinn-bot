@@ -16,7 +16,7 @@ from telegram.ext import ContextTypes
 
 from bot.handlers.messages import _extract_and_save_facts
 from bot.handlers.observer import record_bot_replied
-from bot.services.ai import query_ai
+from bot.services.ai import is_error_response, query_ai
 from bot.services.memory import (
     get_debate_topic,
     get_group_facts,
@@ -108,7 +108,8 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     set_rate_limit(user_id)
-    add_to_context(chat_id, "assistant", "bot", answer, thread_id=thread_id)
+    if not is_error_response(answer):
+        add_to_context(chat_id, "assistant", "bot", answer, thread_id=thread_id)
     await save_user_interaction(user_id, user_name, user.username)
     record_bot_replied(chat_id)
 

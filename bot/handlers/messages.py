@@ -9,7 +9,7 @@ from telegram.ext import ContextTypes
 from bot.handlers import actions as action_handlers
 from bot.handlers.observer import record_bot_replied
 from bot.middleware.timing import Timer
-from bot.services.ai import query_ai
+from bot.services.ai import is_error_response, query_ai
 from bot.services.intent import detect_action_intent
 from bot.services.memory import (
     extract_facts_from_response,
@@ -508,8 +508,11 @@ async def _process_message(
 
     # ── Post-processing ──────────────────────────────────────────
     set_rate_limit(user_id)
-    # User message was already added to context before the API call.
-    add_to_context(chat_id, "assistant", "bot", answer, thread_id=thread_id)
+    # User message was already added to context before the API call. Skip a
+    # failed reply (query_ai's own error fallback, e.g. after a 429) — saving
+    # it would resend it as fake assistant history on every later request.
+    if not is_error_response(answer):
+        add_to_context(chat_id, "assistant", "bot", answer, thread_id=thread_id)
     if update.effective_chat.type != "private":
         set_last_bot_reply_target(chat_id, user_id, user_name or "", thread_id=thread_id)
     await save_user_interaction(user_id, user_name, user.username)

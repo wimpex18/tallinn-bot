@@ -18,6 +18,25 @@ def test_clean_response_empty_input():
     assert ai._clean_response(None) is None
 
 
+def test_is_error_response_recognizes_all_query_ai_fallbacks():
+    """Regression coverage: a failed query_ai() reply used to get saved into
+    conversation context as if it were a real answer, then resent as fake
+    assistant history on every following request (confirmed live — a 429's
+    error text showed up twice in the very next request's message log)."""
+    assert ai.is_error_response(ai._ERR_NOT_READY)
+    assert ai.is_error_response(ai._ERR_AUTH)
+    assert ai.is_error_response(ai._ERR_RATE_LIMIT)
+    assert ai.is_error_response(ai._ERR_BAD_REQUEST)
+    assert ai.is_error_response(ai._ERR_UNEXPECTED)
+    assert ai.is_error_response(f"{ai._ERR_SERVER_PREFIX}503)")
+
+
+def test_is_error_response_false_for_real_answers():
+    assert not ai.is_error_response("Таллинн — столица Эстонии.")
+    assert not ai.is_error_response("")
+    assert not ai.is_error_response(ai._MODERATION_FALLBACK)
+
+
 def test_extract_text_passes_through_plain_string():
     assert ai._extract_text("Привет!") == "Привет!"
 
