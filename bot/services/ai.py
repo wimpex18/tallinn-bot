@@ -421,7 +421,7 @@ async def query_ai(
             logger.error("Mistral API authentication failed (401)")
             err = "Ошибка авторизации API — проверь MISTRAL_API_KEY)"
         elif status == 429:
-            logger.warning("Mistral API rate limit hit (429)")
+            logger.warning(f"Mistral API rate limit hit (429): {exc}")
             err = "Слишком много запросов, подожди минутку (429)"
         elif status == 400:
             logger.error(f"Mistral API bad request (400): {exc}")
