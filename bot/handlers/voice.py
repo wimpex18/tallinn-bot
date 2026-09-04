@@ -113,10 +113,11 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await save_user_interaction(user_id, user_name, user.username)
     record_bot_replied(chat_id)
 
-    conv_context_str = "\n".join(
-        f"{m['role']}: {m['content']}" for m in conv_context_msgs
-    ) if conv_context_msgs else ""
-    asyncio.create_task(_extract_and_save_facts(
-        question=transcript, answer=answer, user_name=user_name,
-        conv_context=conv_context_str, chat_id=chat_id, user_id=user_id,
-    ))
+    if not is_error_response(answer):
+        conv_context_str = "\n".join(
+            f"{m['role']}: {m['content']}" for m in conv_context_msgs
+        ) if conv_context_msgs else ""
+        asyncio.create_task(_extract_and_save_facts(
+            question=transcript, answer=answer, user_name=user_name,
+            conv_context=conv_context_str, chat_id=chat_id, user_id=user_id,
+        ))

@@ -537,12 +537,16 @@ async def _process_message(
     timer.checkpoint("reply_sent")
     timer.done()
 
-    # Fire-and-forget: background fact extraction
-    # Build a flat string for fact extraction (doesn't need multi-turn)
-    conv_context_str = "\n".join(
-        f"{m['role']}: {m['content']}" for m in conv_context_msgs
-    ) if conv_context_msgs else ""
-    asyncio.create_task(_extract_and_save_facts(
-        question=question, answer=answer, user_name=user_name,
-        conv_context=conv_context_str, chat_id=chat_id, user_id=user_id,
-    ))
+    # Fire-and-forget: background fact extraction. Skipped on a failed reply —
+    # there's nothing to learn from query_ai()'s own error text, and it would
+    # otherwise burn another Mistral call (and, during an outage, add to
+    # whatever's already blocking requests) trying to extract "facts" from it.
+    if not is_error_response(answer):
+        # Build a flat string for fact extraction (doesn't need multi-turn)
+        conv_context_str = "\n".join(
+            f"{m['role']}: {m['content']}" for m in conv_context_msgs
+        ) if conv_context_msgs else ""
+        asyncio.create_task(_extract_and_save_facts(
+            question=question, answer=answer, user_name=user_name,
+            conv_context=conv_context_str, chat_id=chat_id, user_id=user_id,
+        ))
