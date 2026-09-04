@@ -392,6 +392,21 @@ async def test_stream_response_handles_chunked_delta_content():
 
 
 @pytest.mark.asyncio
+async def test_stream_response_throttles_before_calling(monkeypatch):
+    fake_client = MagicMock()
+    fake_client.chat.stream_async = AsyncMock(return_value=_FakeStream([]))
+    throttle_mock = AsyncMock()
+    monkeypatch.setattr(ai, "throttle_call", throttle_mock)
+
+    await ai._stream_response(
+        fake_client, [{"role": "user", "content": "test"}],
+        MagicMock(edit_message_text=AsyncMock()), chat_id=1, message_id=2,
+    )
+
+    throttle_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_summarize_conversation_empty_messages():
     result = await ai.summarize_conversation([])
     assert "нечего" in result.lower()
@@ -558,3 +573,100 @@ async def test_classify_intent_empty_question_returns_none(monkeypatch):
 
     result = await ai.classify_intent("")
     assert result is None
+
+
+# ── Rate limiting (throttle_call) ─────────────────────────────────────
+# Regression coverage for a real production incident: every reply started
+# failing with "Слишком много запросов, подожди минутку (429)" because the
+# free tier caps at ~1 request/s and this process makes 2+ Mistral calls per
+# reply (completion + moderation) under concurrent_updates=True.
+
+@pytest.mark.asyncio
+async def test_throttle_call_does_not_wait_when_interval_elapsed(monkeypatch):
+    monkeypatch.setattr(ai, "_last_call_at", 0.0)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(ai.asyncio, "sleep", sleep_mock)
+
+    await ai.throttle_call()
+
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_throttle_call_waits_when_called_too_soon(monkeypatch):
+    # Pin _last_call_at to "now" (real monotonic time — patching the global
+    # time.monotonic breaks asyncio's own internal scheduling) so the very
+    # next call falls well inside the minimum interval and must wait.
+    import time as real_time
+    monkeypatch.setattr(ai, "_last_call_at", real_time.monotonic())
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(ai.asyncio, "sleep", sleep_mock)
+
+    await ai.throttle_call()
+
+    sleep_mock.assert_awaited_once()
+    waited = sleep_mock.call_args.args[0]
+    assert 0 < waited <= ai._MISTRAL_MIN_CALL_INTERVAL
+
+
+@pytest.mark.asyncio
+async def test_blocking_response_throttles_before_calling(monkeypatch):
+    fake_client = _make_fake_client("ответ")
+    throttle_mock = AsyncMock()
+    monkeypatch.setattr(ai, "throttle_call", throttle_mock)
+
+    await ai._blocking_response(fake_client, [{"role": "user", "content": "привет"}])
+
+    throttle_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_moderate_own_response_throttles_before_calling(monkeypatch):
+    fake_client = _make_fake_client()
+    throttle_mock = AsyncMock()
+    monkeypatch.setattr(ai, "throttle_call", throttle_mock)
+
+    await ai._moderate_own_response(fake_client, "какой-то ответ")
+
+    throttle_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_query_ai_retries_once_on_429_then_succeeds(monkeypatch):
+    fake_client = _make_fake_client("успешный ответ после ретрая")
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+    monkeypatch.setattr(ai, "_429_RETRY_DELAY", 0.0)
+
+    rate_limit_error = Exception("rate limited")
+    rate_limit_error.status_code = 429
+    call_count = 0
+    real_complete = fake_client.chat.complete_async
+
+    async def flaky(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise rate_limit_error
+        return await real_complete(*args, **kwargs)
+
+    fake_client.chat.complete_async = AsyncMock(side_effect=flaky)
+
+    answer = await ai.query_ai(question="привет")
+
+    assert answer == "успешный ответ после ретрая"
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_query_ai_gives_up_after_max_429_retries(monkeypatch):
+    fake_client = MagicMock()
+    rate_limit_error = Exception("rate limited")
+    rate_limit_error.status_code = 429
+    fake_client.chat.complete_async = AsyncMock(side_effect=rate_limit_error)
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+    monkeypatch.setattr(ai, "_429_RETRY_DELAY", 0.0)
+
+    answer = await ai.query_ai(question="привет")
+
+    assert "429" in answer
+    assert fake_client.chat.complete_async.call_count == ai._MAX_429_RETRIES + 1

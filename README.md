@@ -43,9 +43,10 @@ the fallback that survives restarts.
   replies to the bot, plain-text mentions of the bot's name (`BOT_DISPLAY_NAMES` in `config.py` —
   "Sam"/"Сэм" by default), or private-chat messages.
 - **Group 1** (silent observer): runs on every group message regardless of whether the bot was
-  addressed — stores it into Redis, updates the sender's style profile, and at a small default
-  probability reacts with an emoji. A spontaneous-text-reply path exists but is disabled by default
-  (too noisy for this group).
+  addressed — stores it into Redis and updates the sender's style profile. It also *considers* an
+  emoji reaction, but only for messages that address the bot (@mention, reply to it, or its name);
+  even then it's a small per-message chance (`REACTION_PROBABILITY`), not guaranteed. A
+  spontaneous-text-reply path exists but is disabled by default (too noisy for this group).
 
 ### Scheduled jobs
 
@@ -101,7 +102,10 @@ Setup, off by default.
    - `MISTRAL_API_KEY` — from [console.mistral.ai](https://console.mistral.ai/api-keys). The free
      "Experiment" tier is enough for a small group; consider opting out of data-training use for
      your account in the Mistral Admin Console → Privacy (opt-out is more manual on the free tier
-     than paid, but available).
+     than paid, but available). The free tier caps requests at ~1/second — `bot/services/ai.py`'s
+     `throttle_call()` serializes every Mistral call process-wide with a minimum gap to stay under
+     that, since a single reply can involve 2+ calls (the main completion + the moderation check)
+     and requests are processed concurrently.
    - `BOT_USERNAME` — your bot's username, without `@`
    - `REDIS_URL` — see below
 2. `pip install -r requirements.txt` (or `requirements-dev.txt` to include test/lint tools)

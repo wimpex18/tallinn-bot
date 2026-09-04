@@ -44,6 +44,7 @@ async def search_web(query: str) -> str | None:
         return None
 
     try:
+        await ai_service.throttle_call()
         response = await client.beta.conversations.start_async(
             inputs=query,
             model=MISTRAL_MODEL,

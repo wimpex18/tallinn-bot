@@ -1,5 +1,6 @@
 """Mistral API client: chat, streaming, summarization, and poll suggestions."""
 
+import asyncio
 import datetime
 import json
 import logging
@@ -17,6 +18,32 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── Rate limiting (free "Experiment" tier caps at ~1 request/second) ──
+# This process handles Telegram updates concurrently (concurrent_updates=True
+# in main.py) and a single reply can involve 2+ Mistral calls (the main
+# completion + the moderation check), so under real group-chat traffic it's
+# easy to burst past 1 req/s and get 429'd — confirmed live via Render logs,
+# every reply failing with "Слишком много запросов, подожди минутку (429)".
+# throttle_call() serializes every raw Mistral API call process-wide with a
+# minimum gap between them; call it immediately before each one.
+_MISTRAL_MIN_CALL_INTERVAL = 1.1  # seconds, with a small margin over 1/s
+_throttle_lock = asyncio.Lock()
+_last_call_at = 0.0
+
+
+async def throttle_call() -> None:
+    global _last_call_at
+    async with _throttle_lock:
+        wait = _last_call_at + _MISTRAL_MIN_CALL_INTERVAL - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_call_at = time.monotonic()
+
+
+# Safety net for a 429 that slips through the throttle above.
+_MAX_429_RETRIES = 2
+_429_RETRY_DELAY = 2.0
 
 _TALLINN_TZ = zoneinfo.ZoneInfo("Europe/Tallinn")
 _RU_WEEKDAYS = [
@@ -103,6 +130,7 @@ async def _moderate_own_response(client: Mistral, text: str) -> bool:
     if not text:
         return False
     try:
+        await throttle_call()
         result = await client.classifiers.moderate_async(
             model=_MODERATION_MODEL, inputs=[text],
         )
@@ -354,14 +382,26 @@ async def query_ai(
     streaming = bool(telegram_bot and telegram_chat_id and telegram_message_id)
 
     try:
-        if streaming:
-            answer = await _stream_response(
-                _client, messages,
-                telegram_bot, telegram_chat_id, telegram_message_id,
-                reasoning_effort=reasoning_effort,
-            )
-        else:
-            answer = await _blocking_response(_client, messages, reasoning_effort=reasoning_effort)
+        for attempt in range(_MAX_429_RETRIES + 1):
+            try:
+                if streaming:
+                    answer = await _stream_response(
+                        _client, messages,
+                        telegram_bot, telegram_chat_id, telegram_message_id,
+                        reasoning_effort=reasoning_effort,
+                    )
+                else:
+                    answer = await _blocking_response(_client, messages, reasoning_effort=reasoning_effort)
+                break
+            except Exception as exc:
+                # A stray 429 can still slip through the throttle above (e.g. a
+                # brief overlap between old/new Render instances during a
+                # deploy, each throttling independently) — retry a couple
+                # times with backoff before surfacing it to the user.
+                if getattr(exc, "status_code", None) != 429 or attempt == _MAX_429_RETRIES:
+                    raise
+                logger.warning(f"Mistral 429 on attempt {attempt + 1}, retrying in {_429_RETRY_DELAY}s")
+                await asyncio.sleep(_429_RETRY_DELAY)
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         logger.info(f"Mistral responded in {elapsed_ms:.0f}ms ({len(answer)} chars)")
@@ -398,6 +438,7 @@ async def query_ai(
 
 async def _blocking_response(client: Mistral, messages: list[dict], reasoning_effort: str = "none") -> str:
     """Non-streaming Mistral call — returns the full response text."""
+    await throttle_call()
     response = await client.chat.complete_async(
         model=MISTRAL_MODEL,
         max_tokens=MISTRAL_MAX_TOKENS,
@@ -421,6 +462,7 @@ async def _stream_response(
     accumulated = ""
     last_edit_time = 0.0
 
+    await throttle_call()
     res = await client.chat.stream_async(
         model=MISTRAL_MODEL,
         max_tokens=MISTRAL_MAX_TOKENS,
@@ -529,6 +571,7 @@ async def summarize_conversation(messages: list[str], topic: str = None) -> str:
         f"{conversation}"
     )
     try:
+        await throttle_call()
         response = await _client.chat.complete_async(
             model=MISTRAL_MODEL, max_tokens=400, temperature=0.2,
             messages=[{"role": "user", "content": prompt}],
@@ -559,6 +602,7 @@ async def suggest_poll(context_text: str) -> dict | None:
         'Если предложить нечего — {"question": null, "options": []}'
     )
     try:
+        await throttle_call()
         response = await _client.chat.complete_async(
             model=MISTRAL_MODEL, max_tokens=250, temperature=0.4,
             messages=[{"role": "user", "content": prompt}],
@@ -600,6 +644,7 @@ async def suggest_quiz(topic: str = None) -> dict | None:
         "ровно один правильный (correct_option_id — его индекс от 0 до 3)."
     )
     try:
+        await throttle_call()
         response = await _client.chat.complete_async(
             model=MISTRAL_MODEL, max_tokens=250, temperature=0.5,
             messages=[{"role": "user", "content": prompt}],
@@ -657,6 +702,7 @@ async def classify_intent(question: str, conv_context: str = None) -> dict | Non
         '"topic": "..." или null, "claim": "..." или null}'
     )
     try:
+        await throttle_call()
         response = await _client.chat.complete_async(
             model=MISTRAL_MODEL, max_tokens=120, temperature=0.1,
             messages=[{"role": "user", "content": prompt}],

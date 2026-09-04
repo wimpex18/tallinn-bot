@@ -21,6 +21,7 @@ async def transcribe_audio(audio_bytes: bytes, file_name: str = "voice.ogg") -> 
         return None
 
     try:
+        await ai_service.throttle_call()
         response = await client.audio.transcriptions.complete_async(
             model=VOXTRAL_MODEL,
             file=File(file_name=file_name, content=audio_bytes),
