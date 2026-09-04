@@ -45,6 +45,24 @@ async def throttle_call() -> None:
 _MAX_429_RETRIES = 2
 _429_RETRY_DELAY = 2.0
 
+# query_ai()'s own infrastructure-failure fallback strings (as opposed to a
+# real, if unhelpful, model answer). Callers use is_error_response() to avoid
+# saving these into conversation context as if they were legitimate replies —
+# otherwise a failed reply gets resent as fake assistant history on every
+# following request.
+_ERR_NOT_READY = "Бот не готов, попробуй чуть позже("
+_ERR_AUTH = "Ошибка авторизации API — проверь MISTRAL_API_KEY)"
+_ERR_RATE_LIMIT = "Слишком много запросов, подожди минутку (429)"
+_ERR_BAD_REQUEST = "Ошибка запроса к Mistral (400) — проверь логи Render"
+_ERR_SERVER_PREFIX = "Сервер перегружен, попробуй через минуту ("
+_ERR_UNEXPECTED = "Что-то пошло не так("
+_ERROR_RESPONSES = {_ERR_NOT_READY, _ERR_AUTH, _ERR_RATE_LIMIT, _ERR_BAD_REQUEST, _ERR_UNEXPECTED}
+
+
+def is_error_response(text: str) -> bool:
+    """True if `text` is one of query_ai()'s own error fallbacks, not a real answer."""
+    return text in _ERROR_RESPONSES or text.startswith(_ERR_SERVER_PREFIX)
+
 _TALLINN_TZ = zoneinfo.ZoneInfo("Europe/Tallinn")
 _RU_WEEKDAYS = [
     "понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье",
@@ -377,7 +395,7 @@ async def query_ai(
     _client = mistral_client
     if _client is None:
         logger.error("mistral_client is not initialised — check main.py post_init")
-        return "Бот не готов, попробуй чуть позже("
+        return _ERR_NOT_READY
 
     streaming = bool(telegram_bot and telegram_chat_id and telegram_message_id)
 
@@ -419,19 +437,19 @@ async def query_ai(
         status = getattr(exc, "status_code", None)
         if status == 401:
             logger.error("Mistral API authentication failed (401)")
-            err = "Ошибка авторизации API — проверь MISTRAL_API_KEY)"
+            err = _ERR_AUTH
         elif status == 429:
-            logger.warning("Mistral API rate limit hit (429)")
-            err = "Слишком много запросов, подожди минутку (429)"
+            logger.warning(f"Mistral API rate limit hit (429): {exc}")
+            err = _ERR_RATE_LIMIT
         elif status == 400:
             logger.error(f"Mistral API bad request (400): {exc}")
-            err = "Ошибка запроса к Mistral (400) — проверь логи Render"
+            err = _ERR_BAD_REQUEST
         elif status and status >= 500:
             logger.warning(f"Mistral API server error ({status})")
-            err = f"Сервер перегружен, попробуй через минуту ({status})"
+            err = f"{_ERR_SERVER_PREFIX}{status})"
         else:
             logger.error(f"Unexpected error querying Mistral [{type(exc).__name__}]: {exc!r}", exc_info=True)
-            err = "Что-то пошло не так("
+            err = _ERR_UNEXPECTED
         await _safe_edit(telegram_bot, telegram_chat_id, telegram_message_id, err)
         return err
 
