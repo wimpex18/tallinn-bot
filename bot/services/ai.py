@@ -63,6 +63,25 @@ def is_error_response(text: str) -> bool:
     """True if `text` is one of query_ai()'s own error fallbacks, not a real answer."""
     return text in _ERROR_RESPONSES or text.startswith(_ERR_SERVER_PREFIX)
 
+
+def _log_rate_limit_headers(exc: Exception) -> None:
+    """Log every response header on a 429.
+
+    The mistralai SDK's MistralError carries the full httpx.Response headers
+    (see mistralai/client/errors/mistralerror.py), but our own logging only
+    ever surfaced the formatted message (status + body) — never the headers.
+    Providers commonly return x-ratelimit-limit-*/x-ratelimit-remaining-*/
+    retry-after headers that reveal WHICH specific limit (requests/second,
+    tokens/minute, tokens/month) was actually hit and when it resets, which
+    the generic {"message":"Rate limit exceeded",...} body alone never says.
+    """
+    headers = getattr(exc, "headers", None)
+    if headers:
+        logger.warning(f"Mistral 429 response headers: {dict(headers)}")
+    else:
+        logger.warning("Mistral 429: exception carried no .headers attribute")
+
+
 _TALLINN_TZ = zoneinfo.ZoneInfo("Europe/Tallinn")
 _RU_WEEKDAYS = [
     "понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье",
@@ -419,6 +438,7 @@ async def query_ai(
                 if getattr(exc, "status_code", None) != 429 or attempt == _MAX_429_RETRIES:
                     raise
                 logger.warning(f"Mistral 429 on attempt {attempt + 1}, retrying in {_429_RETRY_DELAY}s")
+                _log_rate_limit_headers(exc)
                 await asyncio.sleep(_429_RETRY_DELAY)
 
         elapsed_ms = (time.monotonic() - t0) * 1000
@@ -440,6 +460,7 @@ async def query_ai(
             err = _ERR_AUTH
         elif status == 429:
             logger.warning(f"Mistral API rate limit hit (429): {exc}")
+            _log_rate_limit_headers(exc)
             err = _ERR_RATE_LIMIT
         elif status == 400:
             logger.error(f"Mistral API bad request (400): {exc}")
