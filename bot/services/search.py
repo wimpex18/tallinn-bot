@@ -13,7 +13,7 @@ import re
 
 from mistralai.client.models.websearchtool import WebSearchTool
 
-from bot.utils.helpers import mask_quoted_spans
+from bot.utils.helpers import current_tallinn_date_context, mask_quoted_spans
 from config import MISTRAL_MODEL, SEARCH_TRIGGER_KEYWORDS
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,12 @@ async def search_web(query: str) -> str | None:
             inputs=query,
             model=MISTRAL_MODEL,
             tools=[WebSearchTool()],
+            # Without this, the search agent gets no system prompt at all and
+            # has no idea what "today" is — a claim like "Завтра солнце в
+            # 6:47" was being checked with "завтра" left unanchored to any
+            # actual date (confirmed live: the agent hedged with "у меня нет
+            # актуальных данных" instead of resolving it).
+            instructions=current_tallinn_date_context(),
         )
         await ai_service.record_call()
 

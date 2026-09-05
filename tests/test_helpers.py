@@ -1,10 +1,14 @@
+import datetime
 import time
 from types import SimpleNamespace
 
 from bot.utils.context import user_last_query
 from bot.utils.helpers import (
+    RU_WEEKDAYS,
+    TALLINN_TZ,
     check_rate_limit,
     clean_url,
+    current_tallinn_date_context,
     extract_question,
     extract_url_info,
     extract_urls,
@@ -16,6 +20,15 @@ from bot.utils.helpers import (
     mentions_bot_by_name,
     set_rate_limit,
 )
+
+
+def test_current_tallinn_date_context_includes_date_weekday_and_time():
+    now = datetime.datetime.now(TALLINN_TZ)
+    context = current_tallinn_date_context()
+    assert now.strftime("%d.%m.%Y") in context
+    assert RU_WEEKDAYS[now.weekday()] in context
+    assert now.strftime("%H:%M") in context
+    assert "Таллинн" in context
 
 
 def test_extract_urls_finds_plain_links():

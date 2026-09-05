@@ -6,10 +6,10 @@ import json
 import logging
 import re
 import time
-import zoneinfo
 
 from mistralai.client import Mistral
 
+from bot.utils.helpers import current_tallinn_date_context
 from config import (
     MISTRAL_MAX_TOKENS,
     MISTRAL_MODEL,
@@ -81,11 +81,6 @@ def _log_rate_limit_headers(exc: Exception) -> None:
     else:
         logger.warning("Mistral 429: exception carried no .headers attribute")
 
-
-_TALLINN_TZ = zoneinfo.ZoneInfo("Europe/Tallinn")
-_RU_WEEKDAYS = [
-    "понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье",
-]
 
 # Module-level client — set by main.py post_init
 mistral_client: Mistral = None
@@ -314,12 +309,7 @@ async def query_ai(
         'кто-то пишет твоё имя в сообщении.'
     )
 
-    now_tallinn = datetime.datetime.now(_TALLINN_TZ)
-    date_context = (
-        f"Сегодня {now_tallinn.strftime('%d.%m.%Y')} "
-        f"({_RU_WEEKDAYS[now_tallinn.weekday()]}), сейчас "
-        f"{now_tallinn.strftime('%H:%M')} по времени Таллинна."
-    )
+    date_context = current_tallinn_date_context()
 
     dynamic_parts = [_STATIC_SYSTEM, date_context]
     if user_facts:

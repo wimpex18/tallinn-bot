@@ -205,9 +205,11 @@ async def test_query_ai_system_prompt_includes_current_date(monkeypatch):
 
     system_text = fake_client.chat.complete_async.call_args.kwargs["messages"][0]["content"]
     import datetime
-    now = datetime.datetime.now(ai._TALLINN_TZ)
+
+    from bot.utils.helpers import RU_WEEKDAYS, TALLINN_TZ
+    now = datetime.datetime.now(TALLINN_TZ)
     assert now.strftime("%d.%m.%Y") in system_text
-    assert ai._RU_WEEKDAYS[now.weekday()] in system_text
+    assert RU_WEEKDAYS[now.weekday()] in system_text
 
 
 @pytest.mark.asyncio

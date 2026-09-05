@@ -1,15 +1,41 @@
 """URL extraction, rate limiting, and misc helpers."""
 
 import base64
+import datetime
 import logging
 import re
 import time
+import zoneinfo
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from bot.utils.context import user_last_query
 from config import BOT_DISPLAY_NAMES, RATE_LIMIT_SECONDS, USERNAME_TO_NAME
 
 logger = logging.getLogger(__name__)
+
+TALLINN_TZ = zoneinfo.ZoneInfo("Europe/Tallinn")
+RU_WEEKDAYS = [
+    "понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье",
+]
+
+
+def current_tallinn_date_context() -> str:
+    """"Today is <date> (<weekday>), it's <time> in Tallinn" — in Russian.
+
+    Anchors relative date words ("сегодня"/"завтра"/etc.) for anything that
+    doesn't otherwise know the current date. query_ai() injects this into its
+    own system prompt; search_web() needs it too — Mistral's Conversations API
+    (used for live web search) gets no system prompt otherwise, so a claim
+    like "Завтра солнце в 6:47" was being checked with no idea what day
+    "завтра" actually refers to (confirmed live: the web-search agent hedged
+    with "у меня нет актуальных данных" instead of resolving the date).
+    """
+    now = datetime.datetime.now(TALLINN_TZ)
+    return (
+        f"Сегодня {now.strftime('%d.%m.%Y')} "
+        f"({RU_WEEKDAYS[now.weekday()]}), сейчас "
+        f"{now.strftime('%H:%M')} по времени Таллинна."
+    )
 
 _BOT_NAME_RE = re.compile(
     r'\b(?:' + '|'.join(re.escape(name) for name in BOT_DISPLAY_NAMES) + r')\b',

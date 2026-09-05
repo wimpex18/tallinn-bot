@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from bot.services import ai, search
+from bot.utils.helpers import current_tallinn_date_context
 
 
 def test_is_search_trigger_positive():
@@ -61,6 +62,25 @@ async def test_search_web_formats_answer_with_sources(monkeypatch):
     assert "[WEB SEARCH: джаз концерты сегодня]" in result
     assert "концерт джаза" in result
     assert "https://example.com/event" in result
+
+
+@pytest.mark.asyncio
+async def test_search_web_passes_current_date_as_instructions(monkeypatch):
+    """Regression coverage: search_web() sent no system prompt at all to the
+    Conversations API, so a relative date word in a claim (e.g. "Завтра
+    солнце в 6:47") had no anchor for what "today" is — confirmed live, the
+    search agent hedged with "у меня нет актуальных данных" instead of
+    resolving it. The current Tallinn date/time must now be passed as
+    `instructions` on every call."""
+    client = MagicMock()
+    response = _make_response(["Ответ."])
+    client.beta.conversations.start_async = AsyncMock(return_value=response)
+    monkeypatch.setattr(ai, "mistral_client", client)
+
+    await search.search_web("Завтра солнце в 6:47")
+
+    kwargs = client.beta.conversations.start_async.call_args.kwargs
+    assert kwargs["instructions"] == current_tallinn_date_context()
 
 
 @pytest.mark.asyncio
