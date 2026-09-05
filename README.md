@@ -13,11 +13,13 @@ vision-capable, 256k context), Redis for persistent memory, deployed on [Render]
 ### Persona & tone
 
 The system prompt (`bot/services/ai.py::_STATIC_SYSTEM`) defines a specific character, not a generic
-assistant: short, informal replies in Russian, witty and warm rather than encyclopedic — a sharp
-friend in the chat, not a customer-service bot. Two rules sit above everything else and can't be
-overridden by per-user style adaptation:
+assistant: short, informal, precise replies in Russian — a friend in the chat giving only the
+information actually needed, not a customer-service bot and not a comedian. Three rules sit above
+everything else and can't be overridden by per-user style adaptation:
 - **No hostility** — no anger, contempt, or insults toward anyone in the chat.
 - **No bravado** — no tough-guy posturing, no mock-threats (physical or sexual) even as jokes.
+- **No unprompted jokes** — informal and friendly, but not cracking jokes unless asked to; per-user
+  style adaptation mentioning a person's own humor is not license to joke back at them.
 
 Per-user tone adaptation (`bot/services/style.py`) tracks each person's own casual register — slang,
 mild profanity, message length — and nudges the bot to match it, but explicitly scoped to *manner of
