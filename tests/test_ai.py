@@ -205,9 +205,11 @@ async def test_query_ai_system_prompt_includes_current_date(monkeypatch):
 
     system_text = fake_client.chat.complete_async.call_args.kwargs["messages"][0]["content"]
     import datetime
-    now = datetime.datetime.now(ai._TALLINN_TZ)
+
+    from bot.utils.helpers import RU_WEEKDAYS, TALLINN_TZ
+    now = datetime.datetime.now(TALLINN_TZ)
     assert now.strftime("%d.%m.%Y") in system_text
-    assert ai._RU_WEEKDAYS[now.weekday()] in system_text
+    assert RU_WEEKDAYS[now.weekday()] in system_text
 
 
 @pytest.mark.asyncio
@@ -223,7 +225,7 @@ async def test_query_ai_system_prompt_allows_sharing_sources(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_query_ai_system_prompt_defines_witty_not_thuggish_persona(monkeypatch):
+async def test_query_ai_system_prompt_defines_precise_not_thuggish_persona(monkeypatch):
     fake_client = _make_fake_client()
     monkeypatch.setattr(ai, "mistral_client", fake_client)
 
@@ -232,6 +234,18 @@ async def test_query_ai_system_prompt_defines_witty_not_thuggish_persona(monkeyp
     system_text = fake_client.chat.complete_async.call_args.kwargs["messages"][0]["content"]
     assert "ТВОЙ ХАРАКТЕР" in system_text
     assert "бравад" in system_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_query_ai_system_prompt_discourages_unprompted_jokes(monkeypatch):
+    fake_client = _make_fake_client()
+    monkeypatch.setattr(ai, "mistral_client", fake_client)
+
+    await ai.query_ai(question="привет")
+
+    system_text = fake_client.chat.complete_async.call_args.kwargs["messages"][0]["content"]
+    assert "не шути" in system_text.lower()
+    assert "точност" in system_text.lower()
 
 
 @pytest.mark.asyncio
